@@ -1,0 +1,607 @@
+<!--meta
+{
+  "lead": "Where a consumer can fail — while deserializing a record or while processing it — and how to stop one bad record from blocking a partition forever. Covers the ErrorHandlingDeserializer wrapper, DefaultErrorHandler, FixedBackOff and ExponentialBackOffWithMaxRetries retry strategies, recoverers, the Dead Letter Topic (DLT) and what happens internally when a failed record is published there.",
+  "date": "Saturday, 14 March 2026",
+  "related": [
+    { "n": 6, "why": "The basic consumer setup and poll loop that this chapter adds error handling to." },
+    { "n": 7, "why": "JSON deserialization, __TypeId__ headers and type mapping — where deserialization errors come from." },
+    { "n": 9, "why": "More consumer configuration: offsets, commits and polling." },
+    { "n": 13, "why": "The Outbox pattern — another way to keep events from being lost." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="two-places"><span class="sec-num">1</span>Where Exceptions Happen in a Consumer</h2>
+<p>A consumer processes events in a loop. There are <strong>2 places</strong> where an exception can come:</p>
+<ol class="steps">
+  <li><strong>During deserialization</strong> of the key or the value.</li>
+  <li><strong>During processing</strong> of the record (the event) inside the listener.</li>
+</ol>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">High-level consumer flow and the two failure points</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["poll()"] --> B["deserialize() each record"]
+    B --> C["For each record, invoke the listener and process the record"]
+    C --> D["Commit offset"]
+    D --> A
+    B -.- X1["1st place: exception during deserialization of key or value"]
+    C -.- X2["2nd place: exception while processing the record (event)"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class A,B,C,D step
+    class X1,X2 bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Every <code>poll()</code> returns a batch of raw records. Each one is <strong>deserialized</strong> (bytes → key/value objects), then <strong>handed to the listener</strong>, and finally the offset is <strong>committed</strong>. A failure in either of the first two stages stops the record from reaching the commit step. Let's first look at the 1st place: deserialization.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="infinite-loop"><span class="sec-num">2</span>Problem: Deserialization Error Causes an Infinite Loop</h2>
+<p>The producer sends a plain <strong>String</strong> value to <code>order-events</code>, but the consumer expects <strong>JSON</strong> (an <code>Order</code>). The bad record sits at <strong>offset 2</strong>.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Problem: a poison record at offset 2</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    P["Producer · Value = String"] --> B["Broker · next offset to read: 2"]
+    B -- "Poll() fetches event at offset 2" --> C["Consumer · expecting value = JSON"]
+    C --> E["Deserialization exception"]
+    E --> L["Print the error stack trace"]
+    L -- "offset never committed" --> B
+    classDef node1 fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class P,B,C node1
+    class E,L bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Why it never ends</h4>
+    <p>The exception is thrown <strong>before</strong> the listener runs, so the offset of record 2 is <strong>never committed</strong>. The next <code>poll()</code> asks for offset 2 again, fails again, and so on: an <strong>infinite loop</strong>.</p>
+    <p>Even if we stop the consumer and restart it, it will again start from offset 2 (the last committed position) and again get stuck in the infinite loop.</p>
+  </div>
+</div>
+
+<h3 id="broker-log">Logs in the broker</h3>
+<p>Dump the partition's segment to see what is actually stored:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump the order-events-0 segment — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-events-0/00000000000000000000.log</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump the order-events-0 segment — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-events-0/00000000000000000000.log</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka-dump-log output (order-events-0)</span><span class="lang">log</span></div>
+<pre><code data-lang="log">Dumping /tmp/broker1-logs/order-events-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 1000 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774021256443 size: 245 magic: 2 compresscodec: snappy crc: 676649371 isvalid: true
+| offset: 0 CreateTime: 1774021256443 keySize: 6 valueSize: 115 sequence: 0 headerKeys: [__TypeId__] key: O-2111 payload: {"orderId":"O-2111","customerId":"CUST-2","productId":"PROD-3","quantity":1,"totalAmount":99.99,"status":"CREATED"}
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: 1 lastSequence: 1 producerId: 1000 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 245 CreateTime: 1774021558338 size: 245 magic: 2 compresscodec: snappy crc: 1570887049 isvalid: true
+| offset: 1 CreateTime: 1774021558338 keySize: 6 valueSize: 115 sequence: 1 headerKeys: [__TypeId__] key: O-2111 payload: {"orderId":"O-2111","customerId":"CUST-2","productId":"PROD-3","quantity":1,"totalAmount":99.99,"status":"CREATED"}
+baseOffset: 2 lastOffset: 2 count: 1 baseSequence: 0 lastSequence: 0 producerId: 1001 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 490 CreateTime: 1774022125204 size: 114 magic: 2 compresscodec: snappy crc: 139564955 isvalid: true
+| offset: 2 CreateTime: 1774022125204 keySize: 6 valueSize: 18 sequence: 0 headerKeys: [] key: O-2111 payload: this is not a json</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">order-events-0</span>
+    <div class="cells">
+      <span class="cell new">offset 0<small>value is JSON</small></span><span class="cell new">offset 1<small>value is JSON</small></span><span class="cell bad">offset 2<small>value is String</small></span>
+    </div>
+    <span class="ptr">offset 2 is the buggy message</span>
+  </div>
+</div>
+<p>Offset 2 also came from a different producer (<code>producerId: 1001</code>) with no <code>__TypeId__</code> header and only 18 bytes of value: the plain text <code>this is not a json</code>.</p>
+
+<h3 id="group-status">Consumer group offset status</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe the consumer group — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group order-consumer-group</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe the consumer group — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-consumer-groups.bat --bootstrap-server localhost:9092 --describe --group order-consumer-group</code></pre>
+</div>
+</div>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">output — stuck at offset 2</span><span class="lang">text</span></div>
+<pre><code data-lang="text">GROUP                TOPIC         PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID                                                            HOST
+order-consumer-group order-events  0          2               3               1    consumer-order-consumer-group-1-d93bdb57-d81d-4360-a75a-29acf8bf8a3a  /127.0.0.1
+order-consumer-group order-events  1          0               0               0    consumer-order-consumer-group-1-d93bdb57-d81d-4360-a75a-29acf8bf8a3a  /127.0.0.1
+order-consumer-group order-events  2          0               0               0    consumer-order-consumer-group-2-1c7b3ce9-f442-4efe-a137-44f8ea804229  /127.0.0.1</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Column (partition 0)</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>CURRENT-OFFSET</code></td><td>2</td><td>Next offset the consumer will read</td></tr>
+      <tr><td><code>LOG-END-OFFSET</code></td><td>3</td><td>Total number of offsets in this partition (0, 1, 2)</td></tr>
+      <tr><td><code>LAG</code></td><td>1</td><td>1 offset is yet to be read — the poison record</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="consumer-log">Consumer log</h3>
+<p>The consumer is not able to deserialize the offset 2 event. The important lines of the repeated stack trace:</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka-consumer-service — repeated on every poll</span><span class="lang">log</span></div>
+<pre><code data-lang="log">    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.run(KafkaMessageListenerContainer.java:1387) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run(CompletableFuture.java:1804) ~[na:na] &lt;1 internal line&gt;
+Caused by: org.apache.kafka.common.errors.RecordDeserializationException: Error deserializing VALUE for partition order-events-0 at offset 2. If needed, please seek past the record to continue consumption.
+    at org.apache.kafka.clients.consumer.internals.CompletedFetch.newRecordDeserializationException(CompletedFetch.java:346) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.CompletedFetch.parseRecord(CompletedFetch.java:330) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.CompletedFetch.fetchRecords(CompletedFetch.java:284) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.FetchCollector.fetchRecords(FetchCollector.java:169) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.FetchCollector.collectFetch(FetchCollector.java:135) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.Fetcher.collectFetch(Fetcher.java:146) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.ClassicKafkaConsumer.pollForFetches(ClassicKafkaConsumer.java:672) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.ClassicKafkaConsumer.poll(ClassicKafkaConsumer.java:623) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.ClassicKafkaConsumer.poll(ClassicKafkaConsumer.java:596) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.KafkaConsumer.poll(KafkaConsumer.java:874) ~[kafka-clients-3.9.1.jar:na]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.pollConsumer(KafkaMessageListenerContainer.java:1692) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.doPoll(KafkaMessageListenerContainer.java:1667) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.pollAndInvoke(KafkaMessageListenerContainer.java:1445) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.run(KafkaMessageListenerContainer.java:1335) ~[spring-kafka-3.3.10.jar:3.3.10]
+    ... 2 common frames omitted
+Caused by: org.apache.kafka.common.errors.SerializationException: Can't deserialize data  from topic [order-events]
+    at org.springframework.kafka.support.serializer.JsonDeserializer.deserialize(JsonDeserializer.java:603) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.apache.kafka.common.serialization.Deserializer.deserialize(Deserializer.java:81) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.consumer.internals.CompletedFetch.parseRecord(CompletedFetch.java:327) ~[kafka-clients-3.9.1.jar:na]
+    ... 14 common frames omitted
+Caused by: com.fasterxml.jackson.core.JsonParseException: Unrecognized token 'this': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')
+ at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); line: 1, column: 6]
+    at com.fasterxml.jackson.core.JsonParser._constructError(JsonParser.java:2596) ~[jackson-core-2.19.2.jar:2.19.2]
+    at com.fasterxml.jackson.core.JsonParser._constructReadException(JsonParser.java:2622) ~[jackson-core-2.19.2.jar:2.19.2]
+    at com.fasterxml.jackson.core.JsonParser._constructReadException(JsonParser.java:2630) ~[jackson-core-2.19.2.jar:2.19.2]
+    at com.fasterxml.jackson.core.base.ParserMinimalBase._reportError(ParserMinimalBase.java:830) ~[jackson-core-2.19.2.jar:2.19.2]
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser._reportInvalidToken(UTF8StreamJsonParser.java:3662) ~[jackson-core-2.19.2.jar:2.19.2]
+    at com.fasterxml.jackson.core.json.UTF8StreamJsonParser._reportInvalidToken(UTF8StreamJsonParser.java:3635) ~[jackson-core-2.19.2.jar:2.19.2]</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#128269;</span><div><p><strong>Reading the trace bottom-up:</strong> Jackson fails at <code>line: 1, column: 6</code> because the first token, <code>this</code>, is not valid JSON. <code>JsonDeserializer</code> wraps that in a <code>SerializationException</code>, and the Kafka client wraps it again in a <code>RecordDeserializationException</code> for <strong>partition order-events-0 at offset 2</strong>. The failure happens inside <code>KafkaConsumer.poll()</code> itself, so Spring never gets a record to hand to an error handler. Kafka's own hint is to “seek past the record”.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="solution"><span class="sec-num">3</span>Solution: ErrorHandlingDeserializer + Error Handler</h2>
+<p>Put a <strong>wrapper above the deserialization logic</strong>. The wrapper catches the exception, so <code>poll()</code> succeeds and the failed record can be passed to an <strong>ErrorHandler</strong>.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Wrapper above deserialization</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    W["Wrapper above deserialization · ErrorHandlingDeserializer"] --> D["Deserialization logic · delegate class"]
+    D --> Q{"Exception?"}
+    Q -- "No" --> L["For each record, invoke listener and process the record"]
+    Q -- "Yes" --> H["ErrorHandler is invoked"]
+    H --> N["Default config: 0 retry (fatal) · no DLT · just error logging"]
+    N --> C["Commit offset"]
+    L --> C
+    classDef wrap fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    class W,D wrap
+    class L ok
+    class H,N bad
+    class Q,C step
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Default behaviour</h4>
+    <ul>
+      <li><strong>0 retry</strong>, as it is a <strong>fatal</strong> exception — no matter how many times you retry, the same bytes will fail again.</li>
+      <li><strong>No failure event stored</strong> in a DLT.</li>
+      <li><strong>Just error logging</strong>, then the offset is committed and the consumer moves on.</li>
+    </ul>
+  </div>
+</div>
+
+<h3 id="add-wrapper">Add the wrapper</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Consumer: application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">#Use wrapper
+spring.kafka.consumer.key-deserializer=org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+#wrapper above actual class
+spring.kafka.consumer.properties.spring.deserializer.key.delegate.class=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.properties.spring.deserializer.value.delegate.class=org.springframework.kafka.support.serializer.JsonDeserializer</code></pre>
+</div>
+<p>The real deserializers move to the <code>delegate.class</code> properties; <code>ErrorHandlingDeserializer</code> calls them and catches anything they throw. At this point we are <strong>not</strong> adding an error handler and rely on the default one. That's it — the wrapper and the rest is handled by the framework.</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">consumer log with the wrapper</span><span class="lang">log</span></div>
+<pre><code data-lang="log"> INFO 3751 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.a.k.c.c.internals.ConsumerUtils        : Setting offset for partition order-events-0 to the committed offset FetchPosition{...}
+ INFO 3751 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.s.k.l.KafkaMessageListenerContainer    : order-consumer-group: partitions assigned: [order-events-0, order-events-1]
+ INFO 3751 --- [kafka-consumer-service-1] [ntainer#0-1-C-1] o.s.k.l.KafkaMessageListenerContainer    : order-consumer-group: partitions assigned: [order-events-2]
+ERROR 3751 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.s.kafka.listener.DefaultErrorHandler   : Backoff FixedBackOff{interval=0, currentAttempts=1, maxAttempts=0} exhausted for ...
+
+org.springframework.kafka.listener.ListenerExecutionFailedException: Listener failed
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.decorateException(KafkaMessageListenerContainer.java:2998) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.checkDeser(KafkaMessageListenerContainer.java:3046) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.invokeOnMessage(KafkaMessageListenerContainer.java:2860) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.doInvokeRecordListener(KafkaMessageListenerContainer.java:2777) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.doInvokeWithRecords(KafkaMessageListenerContainer.java:2614) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.invokeRecordListener(KafkaMessageListenerContainer.java:2503) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.invokeListener(KafkaMessageListenerContainer.java:2152) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.invokeIfHaveRecords(KafkaMessageListenerContainer.java:1528) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.pollAndInvoke(KafkaMessageListenerContainer.java:1466) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.listener.KafkaMessageListenerContainer$ListenerConsumer.run(KafkaMessageListenerContainer.java:1335) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at java.base/java.util.concurrent.CompletableFuture$AsyncRun.run(CompletableFuture.java:1804) ~[na:na] &lt;1 internal line&gt;
+Caused by: org.springframework.kafka.support.serializer.DeserializationException: failed to deserialize</code></pre>
+</div>
+<p><code>DefaultErrorHandler</code> got invoked, and for this deserialization error the retry strategy used is <strong><code>FixedBackOff</code> with <code>maxAttempts = 0</code></strong>: do not retry once it fails. Notice the trace now goes through <code>checkDeser</code> — the container found the <code>DeserializationException</code> stored by the wrapper, instead of <code>poll()</code> blowing up.</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka-consumer-groups --describe — after the wrapper</span><span class="lang">text</span></div>
+<pre><code data-lang="text">GROUP                TOPIC         PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID
+order-consumer-group order-events  0          8               8               0    consumer-order-consumer-group-1-058c78a2-3495-423e-b76c-13ed1b920f5e
+order-consumer-group order-events  1          0               0               0    consumer-order-consumer-group-1-058c78a2-3495-423e-b76c-13ed1b920f5e
+order-consumer-group order-events  2          0               0               0    consumer-order-consumer-group-2-03f53717-5613-4660-a32a-bcd5c3d55db8</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p><strong>No lag — but the event is lost.</strong> The consumer committed the offset of the record that failed deserialization, so the loop is gone. But in production we should <strong>not rely on DefaultErrorHandler</strong>. Instead, we should have our own error handler that stores the failed event in a <strong>DLT</strong>, so that after a fix it can be replayed or some other action can be taken on it.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="retry-strategies"><span class="sec-num">4</span>Error Handler Bean: Retry Strategies</h2>
+<h3 id="fixed-backoff">1. FixedBackOff</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaConsumerConfig.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public DefaultErrorHandler errorHandler() {
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(
+            new FixedBackOff(1000L, 2));
+
+    return handler;
+}</code></pre>
+</div>
+<p>Wait <strong>1000 ms (1 s)</strong> before retrying again, and do at most <strong>2 retries</strong>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">FixedBackOff(1000L, 2) timeline</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    A1["Attempt 1 · fail"] -- "wait 1 s" --> A2["Attempt 2 (Retry-1) · fail"] -- "wait 1 s" --> A3["Attempt 3 (Retry-2) · fail"] --> R["Retries exhausted"]
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef end1 fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class A1,A2,A3 bad
+    class R end1
+</div>
+  </div>
+  <div class="diagram-explain"><p>The second argument counts <strong>retries</strong>, not attempts: <code>FixedBackOff(1000L, 2)</code> means 1 original attempt + 2 retries = <strong>3 attempts</strong> in total.</p></div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Spring Kafka classifies <code>DeserializationException</code> as <strong>not retryable</strong> by default (the same bytes can never succeed), which is why the log above showed <code>maxAttempts=0</code>. The retry settings on this page take effect for retryable failures such as processing exceptions; a deserialization failure goes straight to the recoverer.</p></div></div>
+
+<h3 id="exponential-backoff">2. ExponentialBackOffWithMaxRetries</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaConsumerConfig.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public DefaultErrorHandler errorHandler() {
+
+    ExponentialBackOffWithMaxRetries backOff = new ExponentialBackOffWithMaxRetries(5);
+    backOff.setInitialInterval(1000L);
+    backOff.setMultiplier(2.0);
+    backOff.setMaxInterval(10000L);
+    DefaultErrorHandler handler = new DefaultErrorHandler(backOff);
+    return handler;
+}</code></pre>
+</div>
+<div class="grid grid-2">
+  <div>
+    <ul class="points">
+      <li>The first retry happens after a <strong>1 s</strong> delay.</li>
+      <li>Each subsequent retry <strong>doubles</strong> the wait time (×2).</li>
+      <li>The max delay is <strong>10 s</strong>: if the doubled delay goes above 10 s, 10 s is used.</li>
+      <li>At most <strong>5 retries</strong>.</li>
+    </ul>
+  </div>
+  <div class="table-wrap" style="margin:0">
+    <table>
+      <thead><tr><th>Retry</th><th>Wait before it</th></tr></thead>
+      <tbody>
+        <tr><td>Retry 1</td><td>1 s</td></tr>
+        <tr><td>Retry 2</td><td>2 s</td></tr>
+        <tr><td>Retry 3</td><td>4 s</td></tr>
+        <tr><td>Retry 4</td><td>8 s</td></tr>
+        <tr><td>Retry 5</td><td>10 s (16 s capped at maxInterval)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="recoverer"><span class="sec-num">5</span>Recoverer: What to Do After All Retries</h2>
+<p>Retry is now part of the error handler — but if all the retries finish, what then? That's where the <strong>Recoverer</strong> comes into the picture.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Recoverer type hierarchy</span><span class="db">class diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+classDiagram
+    class ConsumerRecordRecoverer {
+        &lt;&lt;functional interface&gt;&gt;
+        +accept(T t, U u) void
+    }
+    class ConsumerAwareRecordRecoverer {
+        &lt;&lt;functional interface&gt;&gt;
+        +accept(ConsumerRecord record, Exception exception) void
+    }
+    class DeadLetterPublishingRecoverer {
+        +accept(ConsumerRecord record, Exception exception) void
+    }
+    ConsumerRecordRecoverer &lt;|-- ConsumerAwareRecordRecoverer : extends
+    ConsumerAwareRecordRecoverer &lt;|.. DeadLetterPublishingRecoverer : implements
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p><code>ConsumerRecordRecoverer</code> is a functional interface (a <code>BiConsumer</code>: <code>void accept(T t, U u)</code>). <code>ConsumerAwareRecordRecoverer</code> extends it with <code>accept(ConsumerRecord&lt;?, ?&gt; record, Exception exception)</code>. One implementation, <strong><code>DeadLetterPublishingRecoverer</code></strong>, is already provided by the framework, and its <code>accept</code> method takes care of <strong>inserting the failed event into the DLT</strong>.</p>
+    <p>If we want our own recoverer, we can write one too — for example to <strong>insert the failed record in a DB</strong> instead of a DLT, or to <strong>send an alert</strong>. We will see that below.</p>
+  </div>
+</div>
+<p>To set both a recoverer and a retry strategy we use this constructor of the error handler:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">DefaultErrorHandler (Spring Kafka)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public DefaultErrorHandler(ConsumerRecordRecoverer recoverer, BackOff backOff) {
+    ...
+}</code></pre>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="dlt"><span class="sec-num">6</span>Add the DLT to the Error Handler</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaConsumerConfig.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public NewTopic orderDltEventsTopic() {
+    return TopicBuilder.name("order-events-dlt").build();
+}
+
+@Bean
+public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(KafkaTemplate&lt;Object, Object&gt; template) {
+    return new DeadLetterPublishingRecoverer(template);
+}
+
+@Bean
+public DefaultErrorHandler errorHandler(DeadLetterPublishingRecoverer recoverer) {
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(recoverer,
+            new FixedBackOff(1000L, 2));
+
+    return handler;
+}</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Bean</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>orderDltEventsTopic</code></td><td>Creates the DLT, <code>order-events-dlt</code>, in which failed events will be stored.</td></tr>
+      <tr><td><code>deadLetterPublishingRecoverer</code></td><td>This framework class has all the code to push records whose deserialization failed to the DLT. All we need to provide is a <code>KafkaTemplate</code> object, built from the <code>spring.kafka.producer.*</code> properties in application.properties (key serializer, value serializer, etc.).</td></tr>
+      <tr><td><code>errorHandler</code></td><td>Now has <strong>both</strong> the retry feature and the DLT. After all retries finish, it invokes the <code>DeadLetterPublishingRecoverer</code> <code>accept</code> method and passes the <code>ConsumerRecord</code> and <code>Exception</code> objects.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="dlt-internals">How the DLT works internally</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">From poison record to order-events-dlt</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:dltInternalFlow-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ol class="steps">
+      <li>The broker returns the record as <strong>topic, partition, raw key bytes[] and raw value bytes[]</strong>.</li>
+      <li>Deserialization fails. The <strong>wrapper intercepts</strong> it and creates a <code>DeserializationException</code> object with the complete exception details.</li>
+      <li>A <code>ConsumerRecord</code> is still created: <strong>Value = null</strong> if the value failed (else the data), <strong>Key = null</strong> if the key failed (else the data). The <strong>headers</strong> carry the exception and the raw bytes — <code>springDeserializerExceptionKey</code> for the key, <code>springDeserializerExceptionValue</code> for the value. Whichever part failed (key, value or both), its raw bytes go into its header.</li>
+      <li>The <strong>ErrorHandler</strong> calls <code>accept(ConsumerRecord, exception)</code>.</li>
+      <li><strong>DeadLetterPublishingRecoverer</strong> inserts the record into the <code>&lt;topicName&gt;-dlt</code> topic.</li>
+    </ol>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The same flow as a sequence</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant B as Broker (order-events)
+    participant W as ErrorHandlingDeserializer
+    participant D as Delegate (JsonDeserializer)
+    participant EH as DefaultErrorHandler
+    participant R as DeadLetterPublishingRecoverer
+    participant DLT as order-events-dlt
+    B->>W: poll() returns raw key bytes[] + raw value bytes[]
+    W->>D: deserialize(value bytes)
+    D--xW: exception
+    Note over W: create DeserializationException &lt;br/&gt; value = null &lt;br/&gt; header springDeserializerExceptionValue = raw bytes
+    W->>EH: ConsumerRecord (value null) + exception
+    Note over EH: retries per BackOff &lt;br/&gt; (skipped: not retryable)
+    EH->>R: accept(record, exception)
+    R->>DLT: send ProducerRecord via KafkaTemplate
+    EH-->>B: commit offset, move on
+</div>
+  </div>
+  <div class="diagram-explain"><p>The listener is never called for the failed record. The offset is committed only after the recoverer has handled it, so the event is <strong>kept in the DLT</strong> instead of being lost.</p></div>
+</div>
+
+<h3 id="accept-conceptual">Conceptual internal working of <code>accept</code></h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">DeadLetterPublishingRecoverer.accept (conceptual)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public void accept(ConsumerRecord&lt;?, ?&gt; record, Exception exception) {
+
+    // 1. Find the raw bytes from the exception
+    byte[] rawKeyBytes = ((DeserializationException) exception).getHeader("springDeserializerExceptionKey");
+    byte[] rawValueBytes = ((DeserializationException) exception).getHeader("springDeserializerExceptionValue");
+
+    // 2. Create a NEW record for the DLT topic
+    ProducerRecord&lt;Object, Object&gt; dltRecord = new ProducerRecord&lt;&gt;(
+            record.topic() + "-dlt",                               // destination topic
+            record.key() != null ? record.key() : rawKeyBytes,     // key could be null: if key deserialization failed, add raw bytes
+            record.value() != null ? record.value() : rawValueBytes); // value could be null: if value deserialization failed, add raw bytes
+
+    // 3. send it
+    kafkaTemplate.send(dltRecord);
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>This is a simplified model, not the framework source. The notes had small typos (<code>DeserializationExceptionexception</code>, <code>record.getTopic()-"dlt"</code>); they are fixed above to valid Java: a cast <code>(DeserializationException) exception</code> and <code>record.topic() + "-dlt"</code>. By default the real recoverer also publishes to <code>&lt;topic&gt;-dlt</code> on the <strong>same partition number</strong> as the original record, so the DLT should have at least as many partitions as the source topic.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="dlt-serializers"><span class="sec-num">7</span>Brainstorming: Which Serializer Does the DLT Producer Need?</h2>
+<p>The DLT record is sent with the <strong>producer's</strong> serializers. Whether the key or value is raw bytes depends on which part failed.</p>
+<div class="vs">
+  <div class="side a">
+    <h4>Use case 1: value deserialization failed</h4>
+    <div class="sb">
+      <p>ConsumerRecord: <code>Value = null</code>, <code>Key = O-111</code>, header <code>springDeserializerExceptionValue</code> : value bytes[]</p>
+<pre class="mini"><code>new ProducerRecord&lt;&gt;("order-events-dlt", "O-111", valueBytes);</code></pre>
+      <p>Serializers needed:</p>
+<pre class="mini"><code># for Key
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# for value
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.ByteArraySerializer</code></pre>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Use case 2: key deserialization failed</h4>
+    <div class="sb">
+      <p>ConsumerRecord: <code>Value = Order object</code>, <code>Key = null</code>, header <code>springDeserializerExceptionKey</code> : key bytes[]</p>
+<pre class="mini"><code>new ProducerRecord&lt;&gt;("order-events-dlt", keyBytes, order);</code></pre>
+      <p>Serializers needed:</p>
+<pre class="mini"><code># for Key
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.ByteArraySerializer
+# for value
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer</code></pre>
+    </div>
+  </div>
+</div>
+<p>The two use cases need <strong>opposite</strong> serializers — that's challenging.</p>
+<div class="callout tip"><span class="ci">&#128161;</span><div>
+  <b class="ct">My take</b>
+  <p>In most scenarios the key is a String, so there is very little chance of a key deserialization issue. Deserialization issues mostly come with the value (JSON serialization and deserialization), and when they do, raw <code>bytes[]</code> are published. So this works fine:</p>
+</div></div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — common case (String key)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># for Key
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# for value
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.ByteArraySerializer</code></pre>
+</div>
+<p>But if your key is also an object, the deserialization issue could be with <strong>only the key</strong>, <strong>only the value</strong>, or <strong>both</strong>. Then it is hard to choose between <code>ByteArraySerializer</code> and <code>JsonSerializer</code>.</p>
+<p><strong>Answer:</strong> override the <code>createProducerRecord</code> method so that key and value are <strong>always bytes</strong>, and use <code>ByteArraySerializer</code> for both:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — object keys</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># for Key
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.ByteArraySerializer
+# for value
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.ByteArraySerializer</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaConsumerConfig.java — key and value always bytes</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public DeadLetterPublishingRecoverer deadLetterPublishingRecoverer(KafkaTemplate&lt;Object, Object&gt; template,
+                                                                   ObjectMapper objectMapper) {
+
+    DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template) {
+        @Override
+        protected ProducerRecord&lt;Object, Object&gt; createProducerRecord(ConsumerRecord&lt;?, ?&gt; record,
+                TopicPartition tp, Headers headers, byte[] key, byte[] value) {
+            try {
+                // key / value are the raw bytes when that part failed to deserialize, otherwise null
+                Object finalKey = (key != null) ? key : objectMapper.writeValueAsBytes(record.key());
+                Object finalValue = (value != null) ? value : objectMapper.writeValueAsBytes(record.value());
+                return new ProducerRecord&lt;&gt;(tp.topic(), tp.partition(), finalKey, finalValue, headers);
+            } catch (JsonProcessingException e) {
+                throw new IllegalStateException("Could not convert record to bytes for the DLT", e);
+            }
+        }
+    };
+    return recoverer;
+}
+
+@Bean
+public DefaultErrorHandler errorHandler(DeadLetterPublishingRecoverer recoverer) {
+    DefaultErrorHandler handler = new DefaultErrorHandler(recoverer, new FixedBackOff(1000L, 2));
+    return handler;
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>Compared with the notes: the extra <code>)</code> after <code>record.key()</code> is removed, <code>objectMapper</code> is injected as a bean parameter, and <code>writeValueAsBytes</code> is wrapped in <code>try/catch</code> because it throws the checked <code>JsonProcessingException</code>, which an overriding method cannot declare. <code>tp</code> is the destination partition the recoverer already resolved (<code>order-events-dlt</code>, same partition number).</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="custom-recoverer"><span class="sec-num">8</span>Custom Recoverer in the Error Handler</h2>
+<p>Because <code>ConsumerRecordRecoverer</code> is a functional interface, a lambda is enough. Here the failed record is just printed — in real code this is where you would save it to a DB or send an alert:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaConsumerConfig.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public DefaultErrorHandler errorHandler() {
+
+    DefaultErrorHandler handler = new DefaultErrorHandler(
+            (record, exception) -&gt; {
+                System.out.println("Failed record: " + record);
+            },
+            new FixedBackOff(1000L, 2));
+
+    return handler;
+}</code></pre>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">consumer log — custom recoverer</span><span class="lang">log</span></div>
+<pre><code data-lang="log">2026-03-21T12:46:01.543+05:30  INFO 12685 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.a.k.c.c.internals.ConsumerUtils        : Setting offset for partition order-events-1 to the committed offset FetchPosition{offset=0, offsetEpoch=Optional.empty, currentLeader=LeaderAndEpoch{leader=Optional[localhost:9192 (id: 4 rack: null)], epoch=0}}
+2026-03-21T12:46:01.543+05:30  INFO 12685 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.a.k.c.c.internals.ConsumerUtils        : Setting offset for partition order-events-0 to the committed offset FetchPosition{offset=16, offsetEpoch=Optional.empty, currentLeader=LeaderAndEpoch{leader=Optional[localhost:9092 (id: 3 rack: null)], epoch=0}}
+2026-03-21T12:46:01.544+05:30  INFO 12685 --- [kafka-consumer-service-1] [ntainer#0-0-C-1] o.s.k.l.KafkaMessageListenerContainer    : order-consumer-group: partitions assigned: [order-events-0, order-events-1]
+2026-03-21T12:46:01.544+05:30  INFO 12685 --- [kafka-consumer-service-1] [ntainer#0-1-C-1] o.s.k.l.KafkaMessageListenerContainer    : order-consumer-group: partitions assigned: [order-events-2]
+Failed record: ConsumerRecord(topic = order-events, partition = 0, leaderEpoch = 0, offset = 16, CreateTime = 1774077360135, serialized key size = 5, serialized value size = 117, headers = RecordHeaders(headers = [RecordHeader(key = springDeserializerExceptionKey, value = [-84, -19, 0, 5, 115, 114, 0, 69, 111, 114, 103, 46, 115, 112, 114, 105, 110, 103, 102, 114, 97, 109, 101, 119, 111, 114, 107, 46, 107, 97, 102, 107, 97, 46, 115, 117, 112, 112, 111, 114, 116, 46, 115, 101, 114, 105, 97, 108, 105, 122, 101, 114, 46, 68, 101, 115, 101, 114, 105, 97, 108, 105, 122, 97, 116, 105, 111, 110, 69, 120, 99, 101, 112, 116, 105, 111, 110, ... ])], isReadOnly = false), key = null, value = Order{orderId='Z-010101', customerId='CUST-2', productId='PROD-3', quantity=1, totalAmount=99.99, status='CREATED'})</code></pre>
+</div>
+<div class="callout key"><span class="ci">&#128269;</span><div>
+  <b class="ct">Reading the “Failed record” line</b>
+  <ul style="margin:6px 0 0">
+    <li>This time the <strong>key</strong> failed: <code>key = null</code>, while the value deserialized fine into an <code>Order</code>.</li>
+    <li>The header <code>springDeserializerExceptionKey</code> holds the exception bytes. They start with <code>-84, -19</code> (<code>0xAC 0xED</code>, the Java serialization magic number), followed by the class name <code>org.springframework.kafka.support.serializer.DeserializationException</code> spelled out in ASCII codes (111 = <code>o</code>, 114 = <code>r</code>, 103 = <code>g</code> …). The byte list is shortened above.</li>
+    <li>The recoverer ran for offset 16 of partition 0, so after it returns, that offset is committed and the record is not redelivered.</li>
+  </ul>
+</div></div>
+
+<!-- ======================================================= -->
+<h2 id="processing-exception"><span class="sec-num">9</span>Exceptions While Processing the Record</h2>
+<p>What if the exception comes during <strong>processing</strong> of the record, for example a <code>NullPointerException</code> inside the listener?</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Processing failure path</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    P["Producer"] --> B["Broker"]
+    B -- "Poll()" --> C["Consumer"]
+    C --> D["Deserialized"]
+    D --> E["Process record · NullPointerException"]
+    E --> H["Default Error Handler catches the exception"]
+    H --> H1["Log it"]
+    H --> H2["Commit the offset"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class P,B,C step
+    class D ok
+    class E,H,H1,H2 bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li>For <strong>deserialization</strong> issues we have to add the <strong>wrapper</strong>, so that the error reaches the Default Error Handler.</li>
+      <li>For exceptions <strong>during processing</strong>, the default error handler is <strong>provided by default</strong>: it logs the error and commits the offset.</li>
+    </ul>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Unlike deserialization errors, a processing exception is retryable. Spring Kafka's default <code>DefaultErrorHandler</code> uses <code>FixedBackOff(0, 9)</code>: up to <strong>9 immediate retries</strong> (10 delivery attempts) before it logs the failure and commits.</p></div></div>
+<p>Now, if we want <strong>retry</strong> and, after all retries finish, a <strong>recoverer</strong> (like the DLT), everything is the same as what we did for deserialization: the same <code>DefaultErrorHandler(recoverer, backOff)</code> bean handles both kinds of failure.</p>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>A record that can't be deserialized blocks its partition forever unless <strong><code>ErrorHandlingDeserializer</code></strong> wraps the real deserializer.</li>
+    <li>The default error handler skips and commits, and the event is lost — so define your own <strong><code>DefaultErrorHandler</code></strong>.</li>
+    <li>Choose a <strong>BackOff</strong>: <code>FixedBackOff</code> or <code>ExponentialBackOffWithMaxRetries</code>.</li>
+    <li>Choose a <strong>recoverer</strong>: <code>DeadLetterPublishingRecoverer</code> to <code>&lt;topic&gt;-dlt</code>, or your own lambda (DB, alert).</li>
+    <li>Make the DLT producer's serializers match what is published (raw bytes for the failed part).</li>
+  </ul>
+</div></div>

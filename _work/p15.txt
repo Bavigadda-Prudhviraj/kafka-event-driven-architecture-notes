@@ -1,0 +1,736 @@
+ Kafka Stream Architecture
+
+   Friday, 19 June 2026 12:14PM
+Print
+
+                                                                    #1 Pre-requisite:
+                        Kafka Consumer Setup - Part1 | Setup and Internal working of Kafka Consumer with Demo
+
+  Kafka Streams reuses much of Kafka's Consumer architecture and underlying framework. So if we're already comfortable with how
+  Kafka Consumers work, learning Kafka Streams becomes much easier.
+
+                                                                                                                      Kafka Consumer architecture and framework flow
+
+                                                                        #2 Pre-requisite:
+                                                     What is Kafka Stream and Need for Kafka Stream
+
+                                                       Kafka Stream:
+       Stream:
+
+Print  In simple term, Stream has no start and no end, events keep arriving.
+
+       order-events:
+       [Order1] ----> [Order2] ----> [Order3] ----> [Order4] ----> . . . ----> [never ends]
+
+       Stream Processing:
+
+       Processing events as they arrive, continuously in real-time.
+
+       Kafka Steam
+
+        · is just a CLIENT LIBRARY for building stream processing application on top of kafka.
+
+                                   · Its not a separate cluster or infrastructure.
+                                   · It's a JAR file we add in our application.
+
+                                             Topology:
+
+       · It's a logical flow of how data moves and get processed from source Topics to sink Topics.
+       · This flow is like a DAG (Directed Acyclic Graph), data flow in one direction, no loops and cycles.
+       · We defined it once during application startup, after that Kafka Stream execute it forever.
+
+                                    Stateless Processing:
+
+       like raw material            Source:                · Entry point, read records from 1 or more Kafka Topics
+                                                           · No parent processor
+                                    Topic "order-events"   · Deserialize bytes to Key-value pairs
+                                                           · Forward records to its child processors
+       like                         PROCESSORS
+        · cut,                                             · Business logic where transformation happens.
+        · paint,                                           · Receive record from parent processor and process them
+        · package etc.                                     · Forward results to child processors
+
+like Shipping of finished material      Sink:               · Exit point, writes records to a Kafka Topic
+                                    Output Topic            · No child processor
+                                                            · Serialize key-value to bytes
+                                                            · Write to output topic
+
+                                    Stateful Processing:                               For stateful processing, Kafka Streams stores data
+                                                                                       locally in RocksDB and keeps it fault-tolerant through
+                                           Source:                                     changelog topics
+                                    Topic "order-events"
+                                                           State Store in
+                                       PROCESSORS          RocksDB
+
+                                               Sink:
+                                          Output Topic
+
+                                                           Different examples of Topology:
+Print                                  Simple linear Topology:
+
+       SOURCE(order-events) ----> FILTER ----> MAP ----> SINK(filtered-orders)
+
+                                        Branching Topology:
+
+       SOURCE(order-events) ---->       FILTER (>=1000) ----> SINK (high-value-orders)
+                                         FILTER (<1000) ----> SINK (low-value-orders )
+
+                                       Multi-Source Join Topology:
+
+                SOURCE(order-events)    JOIN ----> SINK (enriched-orders )
+                SOURCE(payment-events)
+
+       Note:
+
+       At this point, lets not worry about:
+        · How to create source stream
+        · What are different processor like filter, map etc.
+        · How to put the result in sink stream
+       Etc.
+
+       Agenda here is to understand the architecture, in next part will cover the above topics.
+
+                                          TASK:
+
+       · It's a unit of parallelism.
+       · Each task has complete topology.
+       · No of tasks = no of Partitions
+       · Each task runs 1 partitions
+
+                                          Topic "order-events"
+
+                                                         P0
+                                                          P1
+
+                Task1                                 Task2
+
+                         Source                 Source
+                 Topic "order-events"   Topic "order-events"
+
+                      Partition: P0          Partition: P1
+
+       RocksDB  Processors                                      Processors                       RocksDB
+
+                Sink                                            Sink
+Print
+
+                                                    Each task has complete topology.
+
+                                                    Actually this is not fully true, why?
+
+                                                      Now lets go 1 level more deep:
+
+                                                    Sub-Topology:
+
+               Sometimes we need re-partition. In that case 1 big topology is internally divided amount multiple sub topologies.
+                What re-partition means?
+               Lets understand with the below use case:
+                · Read order event
+
+                                                 Key: orderId
+                                                 Value: Order
+
+                                                              {
+                                                               "orderId":
+                                                               "customerId":
+                                                               "productId":
+                                                            }
+
+                · Need to find out, product wise order count
+                   Like:
+                        · P1 : 50 orders
+                        · P2 : 100 orders etc.
+
+                                                           Problem: If there is no re-partition
+
+                  Events are distributed across topic partitions.
+                  So for example:
+                  Product "P-1" orders are distributed across 2 partitions of Topic "order-events"
+
+                                Kafka Cluster
+
+{                        Topic "order-events"           {
+   "orderId": "O-1"                                        "orderId": "O-2"
+   "customerId": "C-1"              P0                     "customerId": "C-2"
+   "productId": "P-1"                P1                    "productId": "P-1"
+
+},                                                      }
+{
+
+    "orderId": "O-3"
+    "customerId": "C-3"
+   "productId": "P-1"
+}
+
+         Task1                                          Task2
+
+                  Source                                         Source
+          Topic "order-events"                           Topic "order-events"
+
+               Partition: P0                                  Partition: P1
+
+RocksDB       Processors                       RocksDB       Processors
+         selectKey(productId)                           selectKey(productId)
+P-1 2                                          P-1 1
+             Group by Key                                   Group by Key
+                Count                                          Count
+
+         Sink                                           Sink
+                                                              Count is distributed across multiple tasks
+
+Print
+
+                   So we need re-partition based on Product ID.
+                   So that all orders related to same product id goes to same partition and ultimately to same task.
+
+                                                                        TOPOLOGY:
+
+                                                                                     Source
+                                                                             Topic "order-events"
+
+                                                                                 Processors
+                                                                            selectKey(productId)
+
+                                                                                Group by Key
+                                                                                    Count
+
+                                                                                     Sink
+                                                                                     Topic:
+                                                                           "product-order-counts"
+
+Key: orderId              Sub-Topology 0:            Sub-Topology 1:
+Value: order
+                                 Source                        Source
+                         Topic "order-events"        Topic "repartition-topic"
+
+                              Processors                    Processors
+                         selectKey(productId)             Group by Key
+
+Key: productId                      Sink                     Count
+Value: order             Topic "repartition-topic"
+                                                               Sink
+                                                              Topic:
+                                                    "product-order-counts"
+
+We just create TOPOLOGY, based on Processor (if repartition required) framework internally automatically creates REPARTITION
+topic and create Sub-topologies.
+
+And configuration (like number of partitions, ISR etc) of Repartition topic is same as Source topic.
+
+{                        Topic "order-events"       Key: P-1                              All events                  Topic "repartition-topic"
+    "orderId": "O-1"                                Value: Order                          goes to same
+    "customerId": "C-1"             P0                                                    partition                                P0
+    "productId": "P-1"               P1                           {
+                                                                     "orderId": "O-1"                                               P1
+},                                                                   "customerId": "C-1"
+{                                                                    "productId": "P-1"
+
+    "orderId": "O-3"                                              }
+    "customerId": "C-3"
+   "productId": "P-1"                               Key: P-1
+}                                                   Value: Order
+
+                         {                                       {
+                            "orderId": "O-2"                         "orderId": "O-2"
+                            "customerId": "C-2"                      "customerId": "C-2"
+                            "productId": "P-1"                       "productId": "P-1"
+
+                         }                                       }
+
+                                                    Key: P-1
+                                                    Value: Order
+
+                                                                  {
+                                                                     "orderId": "O-3"
+                                                                     "customerId": "C-3"
+                                                                     "productId": "P-1"
+
+                                                                  }
+
+                                   Now, lets come to TASK again:
+
+                         · It's a unit of parallelism.
+                         · Each task has complete topology sub-topology for a specific partition.
+                         · No of tasks = for each partition of a source topic in sub-topology, 1 task is created
+                                                                   Kafka Cluster
+
+Print
+
+                                                       Topic "order-events"
+
+                                                  P0
+                                                  P1
+
+                          TOPOLOGY:
+
+                                                      Source
+                                              Topic "order-events"
+
+                           Processors
+                      selectKey(productId)
+
+                          Group by Key
+                             Count
+
+                               Sink
+                                                      Topic:
+
+                                            "product-order-counts"
+
+                      Kafka Cluster
+
+Topic "order-events"                                                              Topic "repartition-topic"
+
+           P0                                                                                  P0
+            P1
+                                                                                                P1
+
+  Sub-Topology 0:                                                                 Sub-Topology 1:
+
+                                Source                                                                          Source
+                        Topic "order-events"                                                          Topic "repartition-topic"
+
+     Processors                                                                        Processors
+selectKey(productId)                                                                 Group by Key
+
+         Sink                                                                            Count
+                     Topic "repartition-topic"
+                                                                                           Sink
+                                                                                                                 Topic:
+
+                                                                                                       "product-order-counts"
+
+         Total 4 tasks will be created
+
+Task00:                                                                           Task01:
+Sub-Topology:0                                                                    Sub-Topology:0
+Partition:0                                                                       Partition:1
+
+                 Source                                                                                   Source
+         Topic "order-events"                                                                     Topic "order-events"
+
+              Partition: P0                                                                           Partition: P1
+
+RocksDB       Processors       RocksDB                                                 Processors
+         selectKey(productId)                                                     selectKey(productId)
+
+         Sink                                                                     Sink
+                   Topic "repartition-topic"                                                Topic "repartition-topic"
+           Task10:                                                            Task11:
+                                                                              Sub-Topology:1
+           Sub-Topology:1                                                     Partition:1
+
+Print      Partition:0
+
+                                                           Source                                               Source
+                                                 Topic "repartition-topic"                            Topic "repartition-topic"
+
+                                                        Partition: P0                                        Partition: P1
+
+           RocksDB                   Processors                       RocksDB             Processors
+                                   Group by Key                                         Group by Key
+
+                                       Count                                                Count
+
+                                          Sink                                           Sink
+                                                                 Topic:                                         Topic:
+
+                                                      "product-order-counts"                         "product-order-counts"
+
+           Now these 4 tasks will be distributed to our Stream
+           application instances.
+
+                                                 Spring boot application
+
+                                                 num.stream.threads=2
+
+                                   Thread-1                                   Thread-2
+
+                                   Task00        RocksDB                      Task01     RocksDB
+
+                                   Task10         RocksDB                     Task11     RocksDB
+
+                                               Now 1 doubt might have comes:
+
+       RocksDB is nothing but a Key-value file(database) store
+       on Disk.
+       and
+       Each Kafka Task maintained its own RocksDB state.
+
+       Now a doubt might have come is, what happens when
+
+       machine dies or rebalance occurs?
+
+       Since RocksDB is local to a particular machine, the
+
+       task may get assigned to another instance that does
+
+       not have that local state.                 Then?
+
+                                   That's where changelog Topic comes into the picture.
+
+       So, whenever a Task update its RocksDB. It also publish an
+       event in changelog topic, this topic is internally created by
+       Kafka Stream framework itself.
+
+       So when the task moves to another instance (due to
+       rebalance) or original machine is lost, Kafka Stream create
+       a new RocksDB store and restore its state by replaying
+       records from the changelog topic.
+
+                                   Kafka Cluster
+
+           Topic "order-events"            Topic "repartition-topic"           Topic "order-store-changelog"  Topic "Count-store-changelog"
+
+                                           P0                                   P0                              P0
+
+       P0                                                                        P1                              P1
+
+       P1                                  P1
+Print
+
+       Task00:                                                    Task01:                                     Task10:                                        Task11:
+       Sub-Topology:0                                             Sub-Topology:0                              Sub-Topology:1                                 Sub-Topology:1
+       Partition:0                                                Partition:1                                 Partition:0                                    Partition:1
+
+                                                    Source                                      Source                                        Source                                        Source
+                                            Topic "order-events"                        Topic "order-events"                        Topic "repartition-topic"                     Topic "repartition-topic"
+
+                                                Partition: P0                               Partition: P1                                  Partition: P0                                 Partition: P1
+
+ RocksDB          Processors                RocksDB                    Processors       RocksDB          Processors                          RocksDB        Processors
+             selectKey(productId)                                 selectKey(productId)                 Group by Key                                       Group by Key
+Order-store                                 Order-store                                 Count-store                                          Count-store
+                                                                                                           Count                                              Count
+
+             Sink                                                 Sink                                                                                       Sink
+                       Topic "repartition-topic"                            Topic "repartition-topic"                                                                                Topic:
+
+Task00, Order-store RocksDB, hold state of                                                             Sink                                                               "product-order-counts"
+Partition P0 of Order-events topic                                                                                            Topic:
+
+                                                                                                                   "product-order-counts"
+
+                                            Task00, Order-store RocksDB, hold state of
+                                            Partition P1 of Order-events topic
+
+                                                                                        Task10, Count-store RocksDB, hold state of    Task11, Count-store RocksDB, hold state of
+                                                                                        Partition P0 of Repartition-topic             Partition P1 of Repartition-topic
+
+             Awesome, not we know the Architecture of Kafka Stream,
+             lets see the complete flow (exactly same as Kafka
+             Consumer)
+
+                                                                                                                                                                Active
+                                                                                                                                                                Controller
+
+                                                                                                                                             Give me metadata:                    Metadata response
+
+                                                                                                                                                          Broker-1 (any broker)
+
+                                                                                                                                             Give me metadata:                    Metadata response
+                                                                                                                                             Broker vs partition (leader)
+
+                                                              Step1:                                                    Step2:               Step3:                                          Metadata:
+                                            Stream Starts and want to join Group
+                                                                                        Finds the Partition number of topic                                     Stream application requests  topic: _consumer_offsets
+                                                group.id = "stream-analytics"           "_consumer_offsets"
+                                                                                                                                                                                  metadata
+                                                                                                                                                                             (first time or refresh) partition 0:
+                                                                                                                                                                                                     leader = Broker 1
+
+                                                                                                                                                                                             partition 2
+
+                                                                                        hash("stream-analytics")%50 = 23                                                                             leader = Broker 2
+                                                                                        Partition 23 of topic _consumer_offsets
+                                                                                                                                                                                             partition 23
+
+                                                                                                                                                                                                     leader = Broker 3
+
+                              Step9:                              Step8:                                         Step6:                                                    Step4:
+                                                                                        Consumer feRtochcklsaDstBoffset for
+             Check the metadata and invokes Leader Broker ofRestore                                                                                       Invokes Broker3 (Group Coordinator)
+                               Topic "order-events"                                              Using ChangeLToogpic "order-events"                               and request to join the "stream-analytics" group
+                                                                                                                        Partition-2
+                                    Partition-2
+
+       Fetch from offset 101                                                                                                                                               Join group        Task0_2
+
+                                            Return 101 - 501
+       Max bytes send me : 200bytes offset events                                                                                   P2: 100
+                                                                                  Get metadata, till where offset is processed
+
+             Step10:                                                                                      Step7:                                                            Step5:                                        Group Coordinator waits for all members to join group.initial.rebalance.delay.ms=3000ms
+                                                                                        Broker3 (Group coordinator)                                       Broker3 (Group coordinator)                                     Picks one Stream App Instance as Group Leader
+                                            Broker2 (Leader of)                         Looks at "_consumer_offsets"                                                                                                      Group leader will run StreamsPartitionAssignor
+                                            Topic "order-events"                        Partition P2 : offset 100                                         Group: stream-analytics
+                                                                                                                                                                                                                       Discover Topology
+                                                 Partition-2                                                                                              Topic: order-events,                                         Create Sub-topology
+                                                                                                                                                          Partitions: P0, P1, P2                                       Create Tasks
+                                                                                                                                                          Stream Instances: S1, S2                                     Auto Create internal topics like: repartition, changelogs
+                                                                                                                                                                                                                       Distributed Tasks to Stream instances
+                                                                                                                                                          Runs "StreamsPartitionAssignor"                          Assume we have only 1 sub-topology (no repartition):
+                                                                                                                                                                                                                   (S1) StreamThread-1 : Task0_0(P0), Task0_1(P1)
+                                                                                                                                                                                                                   (S2) StreamThread-2 : Task0_2(P2)
+    Print                                                                                                                          Group leader send this distribution info to Group
+                                                                                                                                   Coordinator
+       Step11:                                                                                                                     Group Coordinator distributed to all members
+Stream app process Task
+whichhas subtopology            Step12:                                                    Step14:
+                         Stream app commits offset
+                                                                                  Continuous Polling and move
+                                                                                  to step 9
+
+                         Commit  ACK
+
+                             Step13:
+
+                         Broker3 (Group Coordinator)
+
+                         Writes to:
+                         _consumer_offsets, Partition23:
+                         (group, topic, partition)
+                         offset processed till = 501
+
+                                         Setup:
+
+                                   Dependency
+
+                         <dependency>
+                         <groupId>org.springframework.kafka</groupId>
+                         <artifactId>spring-kafka</artifactId>
+                         </dependency>
+                         <dependency>
+                         <groupId>org.apache.kafka</groupId>
+                         <artifactId>kafka-streams</artifactId>
+                         </dependency>
+
+                                                    application.properties  No of stream processing instances
+                                                                                  Where RocksDB file will be stored on local disk
+server.port=8090
+spring.application.name=kafka-streams-demo
+
+spring.kafka.streams.application-id=order-
+analytics
+
+spring.kafka.streams.bootstrap-
+servers=localhost:9092
+
+spring.kafka.streams.properties[num.stream.thr
+eads]=2
+
+spring.kafka.streams.properties[state.dir]=/tmp
+/kafka-streams
+
+                                      Enable Kafka Streams
+
+                         @SpringBootApplication
+                         @EnableKafkaStreams
+                         public class KafkaStreamsDemoApplication {
+
+                            public static void main(String[] args) {
+                                 SpringApplication.run(KafkaStreamsDemoApplicati
+                                 on.class, args);
+
+                             }
+                                              }
+
+Print
+
+                                                 Define Topology
+
+                           OrderStreamTopology.java (Configuration)                           Order.java (POJO)
+
+package com.eda.streams.config;                                                           public class Order{
+import com.eda.streams.model.Order;                                                       private String orderId;
+import com.fasterxml.jackson.databind.ObjectMapper;                                       private String customerId;
+import org.apache.kafka.common.serialization.Deserializer;                                private String productId;
+import org.apache.kafka.common.serialization.Serde;                                       private Integer quantity;
+import org.apache.kafka.common.serialization.Serdes;                                      private Double totalAmount;
+import org.apache.kafka.common.serialization.Serializer;                                  private String status;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.*;                                                    //getters and setters
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;                              }
+
+@Configuration
+public class OrderStreamTopology {
+private static final ObjectMapper objectMapper = new
+ObjectMapper();
+
+@Bean
+public void orderCountTopology(StreamsBuilder builder) {
+
+         // SOURCE: read from "order-events" as raw JSON
+         strings
+         KStream<String, String> orderStream =
+         builder.stream("order-events",
+         Consumed.with(Serdes.String(), Serdes.String()));
+
+         // FILTER: only orders with totalAmount > 100
+         KStream<String, String> highValueOrders =
+         orderStream.filter((key, value) -> {
+         try {
+
+                  Order order = objectMapper.readValue(value,
+                  Order.class);
+                  return order.getTotalAmount() != null &&
+                  order.getTotalAmount() > 100;
+                  } catch (Exception e) {
+
+                      return false;
+                  }
+             });
+
+         // Re-key by productId
+         // This will trigger a REPARTITION topic
+         KStream<String, String> productKeyedOrders =
+
+                  highValueOrders.selectKey((oldKey, value) -> {
+                  try {
+
+                           Order order =
+                           objectMapper.readValue(value,
+                           Order.class);
+                           return order.getProductId();
+                      } catch (Exception e) {
+                           return "UNKNOWN";
+                      }
+             });
+
+      //RocksDB store name
+      KTable<String, Long> productCounts =
+
+                   productKeyedOrders
+               .groupByKey(Grouped.with(
+
+                        Serdes.String(),
+                        Serdes.String()))
+               .count(Materialized.as("product-count-store"));
+
+      //output topic
+      productCounts
+
+               .toStream().mapValues(String::valueOf)
+               .to("product-counts",
+               Produced.with(Serdes.String(), Serdes.String()));
+
+   }                                             Expectation:
+
+}
+
+           Kafka Cluster                                             Topic: order-events  Kafka Cluster                          Changelog Topic:       Output Topic:
+                                                                                                                         product-count-store-changelog  product-counts
+      Topic: order-events                                                       P0                   Topic: repartition
+                                                                                P1                             P0            P0
+                     P0                                                         P2                             P1            P1
+                     P1                                                                                        P2
+                     P2                                                                                                      P2
+
+      Topology                                                    Sub-Topology 0
+
+   Source: order-events                                           Source: order-events
+
+                                                                                          Task0_0                        Task0_1  Task0_2
+         Filter>100                     Filter>100                             Sub-Topology 0        Sub-Topology 0        Sub-Topology 0
+
+Print Repartition based on         Repartition based on                        Source: order-events  Source: order-events  Source: order-events
+    Product ID                     Product ID                                  Partition: P0         Partition: P1         Partition: P2
+
+Group by key                       Output topic: repartition
+
+Count         RocksDB              Sub-Topology 1
+              product-count-store
+                                   Source: Repartition
+Output topic: product-counts
+
+                                   Group by key                                    Task1_0               Task1_1               Task1_2
+
+                                   COUNT                 RocksDB               Sub-Topology 1        Sub-Topology 1        Sub-Topology 1
+                                                        product-count-store
+                                                                               Source: Repartition   Source: Repartition   Source: Repartition
+                                                                               Partition: P0         Partition: P1         Partition: P2
+
+                                   Output topic: product-counts
+
+                                          Lets Test:
+
+                                   Start the Kafka Cluster with 2 Brokers
+                                   Start the Kafka Producer App
+
+               bin/kafka-topics.sh --bootstrap-server localhost:9092 --
+               describe --topic order-events
+
+                                   Order-events topic:
+                                   --------------------------
+                                   Broker with id=3 -> Partition 0 and 2
+                                   Broker with id=4 -> Partitions 1
+
+       Also validate what all topics present at this point of time:
+                  bin/kafka-topics.sh --bootstrap-server localhost:9092 --
+                  list
+
+                              Only 2 topics present:
+                                  __consumer_offsets (internally get created)
+                                  Order-events (our producer app has created)
+Print
+
+                                         Start the Kafka Stream Application
+
+                                        Also validate what all topics present at this point of time:
+                                      bin/kafka-topics.sh --bootstrap-server localhost:9092 --
+                                      list
+
+                                   Only 4 topics present:
+                                       __consumer_offsets (internally get created)
+                                       order-events (our producer app has created)
+                                       order-analytics-product-count-store-changelog
+                                       (changelog topic internally get created)
+                                       order-analytics-product-count-store-
+                                       repartition(repartition topic internally get created)
+
+                                  Lets check which Task assigned to which Instance.
+
+    bin/kafka-consumer-groups.sh --bootstrap-server
+    localhost:9092 --group order-analytics --describe
+
+                                                 Thread1 owns Task:
+                                                     order-events P0
+                                                     order-events P2
+                                                     order-analytics-product-count-store-repartition P0
+
+                                                 Thread2 owns Task:
+                                                     order-events P1
+                                                     order-analytics-product-count-store-repartition P1
+                                                     order-analytics-product-count-store-repartition P2
+
+                                                        Lets publish an event:
+Print
+
+                                                           Producer application logs:
+
+                                               Partition P0 leader is Broker1 with id=3
+              bin/kafka-dump-log.sh --deep-iteration --print-data-
+              log --files /tmp/broker1-logs/order-events-
+              0/00000000000000000000.log
+
+                                                   Lets order-events Topic, key is order ID
+
+                                                     Lets check Repartition Topic, key is now PRODUCT ID
+
+                                                     Now lets check RocksDB local
+                                          Each Tasks maintain its own local RocksDB state.
+
+ T
+
+                                                      Now lets check changelog topic
+bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-
+logs/order-analytics-product-count-store-changelog-
+0/00000000000000000000.log
+
+    Print
+
+                                                             Now lets check output topic:
+
+          bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker2-
+          logs/product-counts-0/00000000000000000000.log

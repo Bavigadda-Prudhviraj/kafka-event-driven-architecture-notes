@@ -1,0 +1,570 @@
+12. Consumer Setup - Part2
+
+Saturday, 14 March 2026 9:25PM
+
+                              In Part-1, already seen how to setup basic consumer.
+
+Till now in Basic Consumer setup, we have seen, how to create a Consumer and how it can read from a Topic.
+
+But what if:
+
+    -> 1 consumer request to join more than 1 topic?
+    -> multiple consumers in a group request to join different topic?
+    -> multiple consumers in a group request to join same topic?
+
+How to achieve this? And this is where things get interesting.
+
+                                 In Basic Consumer setup:
+
+@Component                                                       server.port=8082
+public class OrderEventListener {                                spring.application.name=kafka-consumer-service
+                                                                 spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+@KafkaListener(topics="order-events")                            spring.kafka.consumer.group-id=order-consumer-group
+public void consume (Order order) {                              spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+                                                                 spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+          //business logic                                       spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+          System.out.println("Received:" + order.getOrderId());
+  }
+}
+
+                                                                 What we saw before is:
+
+Spring boot application startup
+
+KafkaAutoConfiguration Triggered by spring-kafka on class path
+
+                                                                 Creates Bean: ConsumerFactory reads spring.kafka.consumer.* props, stores as Map
+
+                                                                 Creates Bean: ConcurrentKafkaListenerContainerFactory  holds reference of ConsumerFactory,
+                                                                                                                        no Kafka Consumer object created as of now.
+
+@EnableKafka
+                KafkaListenerAnnotationBeanPostProcessor
+                         Scan @KafkaListener
+
+                         For each @KafkaListener, ask
+                         ConcurrentKafkaListenerContainerFactory to create
+                         KafkaListenerContainer bean
+
+                                       KafkaListenerContainer gets
+                                       KafkaConsumer object from Consumer Factory
+
+                                                           Poll loop starts
+
+Let say: "order-events" topic has 3 partition (P0, P1 and P2), so with above Basic consumer setup, what we achieve is:
+
+Topic: order-events      Consumer Group 1
+          P0
+          P1                                             C1           (since only 1 consumer, all 3 partitions of
+         P2                                                           "order-events" assigned to C1)
+                                                    Reads P0, P1, P2
+
+Partition Leader Broker
+
+P0  B1
+
+P1  B2
+
+P2  B1
+
+    Internally, each consumer might be doing:                         C1           Broker1                         Broker2
+
+while (true) {                                                            FetchRequest for                                  Sends 1 request per broker and
+        ConsumerRecords records = consumer.poll();                        (P0, P2)
+                                                                                                                            FetchRequest looks like:
+        for (ConsumerRecord record : records) {                                             FetchRequest for                     Topic: order-events
+                     //business logic                                                       (P1)                                   Partition: P0
+                                                                                                                                       � Offset: X
+         }                                                                FetchResponse                                            Partition: P2
+}                                                                         from B1                                                      � Offset: Y
+
+                                                                                            FetchResponse                   FetchResponse looks like:
+                                                                                            from B2                                   Topic: order-events
+                                                                                                                                        Partition: P0
+                                                    Merge the                                                                                � Records
+                                                    Response                                                                            Partition: P2
+                                                                                                                                             � Records
+
+                                                    Create ConsumerRecords Object
+
+                                                                      Topic: order-events
+                                                                      Partition: P0
+
+                                                                                     Consumer Record(offset=10, value=A)
+                                                                                     Consumer Record (offset=11, value=B)
+
+                                                                      Topic: order-events
+                                                                      Partition: P1
+
+                                                                                       Consumer Record (offset=5, value=C)
+
+                                                                      Topic: order-events
+                                                                      Partition: P1
+
+                                                                                      Consumer Record(offset=20, value=D)
+                                                                                      Consumer Record (offset=21, value=E)
+
+    1st: how to set up, 1 consumer request to join more than 1 topic?
+
+    Topic: order-events                             Consumer Group 1
+                                   P0                                          C1
+
+            Topic: payment-events
+                      P0
+
+                                   Approach 1 : Manually taking care of Json to object mapping
+
+                                                      application.properties                       Now this consumer handles more than 1 topic, so I will
+                                                                                                   handle the
+server.port=8082                                                                                   Deserialization like if its order-events -> convert it to Order object
+spring.application.name=kafka-consumer-service                                                     If its payment-events -> convert it to Payment object.
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group                                                So, that's why here I am using StringDeserializer. As I need to
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer    control the deserialization.
+spring.kafka.consumer.value-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+
+@Component                                                        Like this we can provide the list of topics which a Consumer wanted to
+public class OrderEventListener {                                 subscribe.
+
+@Autowired
+ObjectMapper objectMapper;
+
+@KafkaListener(topics= {"order-events", "payment-events"})                                         here in parameter, I accept the record as it is and
+public void consume (ConsumerRecord<String, String> record) {                                      Deserialization task I am taking care of.
+
+         If("order-events".equals(record.topic())) {
+
+           Order order = objectMapper.readValue(record.value(), Order.class);
+
+               // business logic for order
+
+}
+else if("payment-events".equals(record.topic())) {
+
+            Payment payment = objectMapper.readValue(record.value(), Payment.class);
+
+            // business logic for order
+
+         }
+    }
+}
+
+                                   Approach 2: AUTO Mapping Json to object conversion
+
+But before that first understand the very important JSON DESERIALIZATION FLOW, where many of us get confused:
+
+                                   At PRODUCER side (during JSON Serialization):
+
+   @Service                                                                                  application.properties
+   public class OrderProducerService {
+                                                           .
+   @Autowired                                              .
+   private KafkaTemplate<String, Order> kafkaTemplate;     .
+                                                           #---------------SERIALIZER-------------
+   public void sendWithKey(Order order) {                  # Key needs to be String
+                                                           spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+           String key = order.getOrderId();
+                                                           # Value: JsonSerializer, auto-converts Java objects to JSON bytes
+          kafkaTemplate.send("order-events", key, order);  spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer
+                                                           spring.kafka.producer.properties.spring.json.add.type.headers=true
+    }                                                      .
+}                                                          .
+                                                           .
+
+            By-default this (json.add.type.headers) is true only
+With this, when producer send the event:
+
+                  kafkaTemplate.send("order-events", order);
+
+It will also add _TypeId_ = com.eda.producer.model.Order in Event header
+
+                                                                                         Type id value is hidden but now its added in event header
+
+           But, its not always 100% sure that Producer will add "_TypeID_" or not, even when its true (which is default)
+
+Like till now, we have seen, headerKeys were empty , even though spring.kafka.producer.properties.spring.json.add.type.headers=true (Default)
+
+    Why because we are using KafkaTemplate<String, Order> kafkaTemplate. Specific value type Order is used, so it did not add _TypeId_
+
+   @Service
+   public class OrderProducerService {
+   @Autowired
+   private KafkaTemplate<String, Order> kafkaTemplate;
+   public void sendWithKey(Order order) {
+
+        
+           String key = order.getOrderId();
+
+          kafkaTemplate.send("order-events", key, order);
+    }
+}
+
+  But if I use KafkaTemplate<String, Object> kafkaTemplate.
+
+  I used Object instead of Order, Now you will notice that Producer will add _TypeId_ in header.
+
+That's internal logic of Kafka producer client, but we have to understand that when Value uses JSON SERIALIZER then by-default below config is true:
+spring.kafka.producer.properties.spring.json.add.type.headers=true
+So producer will add _TypeId_ in event header.
+
+_TypeId_ = com.eda.producer.model.Order
+
+At CONSUMER side (during JSON Deserialization):
+
+          Per Kafka Consumer Record (bytes + headers)
+
+                                                                              No
+
+                                               Is JsonDeserializer?
+
+This config means, does consumer               Yes
+has to read _TypeId_ in header or not
+                                               Is below
+                               True (default)
+                                               config true/false?
+
+                                               spring.kafka.consumer.properties.  false
+
+                                               spring.json.use.type.headers
+
+                                                                                         spring.kafka.consumer.properties.spring.json.value.
+                                                                                         default.type=com.eda.consumer.model.Order
+                                       Is _TypeId_                 No
+
+                                       Header present?                                            Default type Config              Deserialize JSON -> Object  @KafkaListener
+                                                                                                                                                               Method Invoke
+
+      Let say:                              Yes
+
+      _TypeId_ = com.producer.Order
+
+spring.kafka.consumer.properties.      Mapping present?        No
+
+spring.json.type.mapping=
+
+com.producer.Order:com.consumer.Order
+
+from                       to          Yes                                                                                         When _TypeId_ info comes with event and if
+                                                                                                                                   Mapping information is not present, then it will force
+                                       Use the "to" classes                                                                        Consumer to load the class which Producer has
+                                                                                                                                   provided for ex:
+                                                                       Load Class                 Yes         Trusted Package?     com.producer.Order
+
+                                                                       From _TypeId_                                   No          What if hacker passed malicious header:
+                                                                                                       IllegalArgumentException,   com.fake.hack.Order and your Consumer will try to
+                                   Deserialize JSON -> Object  Yes          Class exists in            not in trusted package      load this class.
+                                                                               Consumer
+                                       @KafkaListener                            class                                             So this is a security step before consumer actually
+                                       Method Invoke                              path                                             try to load the class.
+
+                                                                                       No                                          spring.kafka.consumer.properties.spring.
+                                                                                                                                   json.trusted.packages=com.producer
+                                                                       Class Not Found Exception
+                                                                                                                                   means you are trusting all the classes within this
+                                                                                                                                   package
+
+                                                                                                                                   spring.kafka.consumer.properties.spring.
+                                                                                                                                   json.trusted.packages=*
+                                                                                                                                   trust everything
+
+                                   Now flow is clear, lets move back to AUTO Mapping (Json to object conversion)
+                                                                       Producer:
+
+                                              Producer will add _TypeId_ in the event header                                       POJO Classes in Consumer
+
+                                                                    Consumer:
+
+                           server.port=8082
+                           spring.application.name=kafka-consumer-service
+                           spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+                           spring.kafka.consumer.group-id=order-consumer-group
+                           spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+                           spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+                           spring.kafka.consumer.properties.spring.json.type.mapping=
+
+                                                                   com.eda.producer.model.Order:com.eda.consumer.model.Order,
+                                                                   com.eda.producer.model.Payment:com.eda.consumer.model.Payment
+
+                           spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+@Component
+public class OrderEventListener {
+
+@KafkaListener(topics= {"order-events", "payment-events"})
+public void consume (ConsumerRecord<String, String> record) {
+
+         If("order-events".equals(record.topic())) {
+
+           Order order = (Order) record.value();               Now no manual
+                                                               mapping is required
+               // business logic for order
+
+}
+else if("payment-events".equals(record.topic())) {
+
+            Payment payment = (Payment ) record.value();
+
+            // business logic for order
+
+         }
+    }
+}
+
+            2nd: how to set up, multiple consumers in a group request to join different topic?
+
+                                    Topic: order-events        Consumer Group 1
+                                               P0                       C1
+
+                                   Topic: payment-events                 C2
+                                             P0
+
+                                            Approach 1: 2 different consumer application
+
+            The most simple is, create 2 different Consumer application and whatever we have seen in basic consumer setup, that will work, as it
+            creates 1 Consumer per application.
+
+                                   Approach 2: in 1 application itself we need 2 consumer
+
+            Spring boot application startup
+                                      KafkaAutoConfiguration Triggered by spring-kafka on class path
+                                                                   Creates Bean: ConsumerFactory reads spring.kafka.consumer.* props, stores as Map
+
+                                                               Creates Bean: ConcurrentKafkaListenerContainerFactory  holds reference of ConsumerFactory,
+                                                                                                                      no Kafka Consumer object created as of now.
+
+                                   @EnableKafka
+                                                   KafkaListenerAnnotationBeanPostProcessor
+                                                                   Scan @KafkaListener
+                                                                  For each @KafkaListener, ask
+For each Kafka Listener,          ConcurrentKafkaListenerContainerFactory to create
+1 KafkaConsumer is created        KafkaListenerContainer bean
+
+                                                KafkaListenerContainer gets
+                                                KafkaConsumer object from Consumer Factory
+
+                                                                    Poll loop starts
+
+                                  2 way:
+
+                           _TypeId_ + Mapping                                                                          Use Header = false
+
+          @Component                                                                                      @Component
+          public class EventListener {                                                                    public class EventListener {
+
+               @KafkaListener(topics="order-events")                                                           @KafkaListener(topics="order-events")
+               public void consumeOrder (Order order) {                                                        public void consumeOrder (Order order) {
+
+                    //business logic                                                                                //business logic
+                    System.out.println("Received:" + order.getOrderId());                                           System.out.println("Received:" + order.getOrderId());
+               }                                                                                              }
+               @KafkaListener(topics="payment-events")                                                         @KafkaListener(topics="payment-events")
+               public void consumePayment (Payment payment) {                                                  public void consumePayment (Payment payment) {
+                    //business logic                                                                                //business logic
+                    System.out.println("Received:" + payment.getPaymentId());                                       System.out.println("Received:" + payment.getPaymentId());
+               }                                                                                               }
+          }                                                                                               }
+
+                                          application.properties                                                                             application.properties
+server.port=8082
+spring.application.name=kafka-consumer-service                                                          server.port=8082
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192                                            spring.application.name=kafka-consumer-service
+spring.kafka.consumer.group-id=order-consumer-group                                                     spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer         spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer  spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.properties.spring.json.type.mapping=                                              spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+
+                                        com.eda.producer.model.Order:com.eda.consumer.model.Order,      spring.kafka.consumer.properties.spring.json.use.type.headers=false
+                                        com.eda.producer.model.Payment:com.eda.consumer.model.Payment
+                                                                                                        spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+This works fine and recommended.                                                                           This will not work, when payment event is sent:
+                                                                                                             � Consumer will consume it
+                                                                                                             � Use header = false
+                                                                                                             � Go to default type config, which is
+                                                                                                                spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+                                                                                                                                             Exception will come:
+
+                                                                                                        Caused by: org.springframework.messaging.converter.MessageConversionException: Cannot convert
+                                                                                                        from [com.eda.consumer.model.Order] to [com.eda.consumer.model.Payment] for GenericMessage
+                                                                                                        [payload=Order{orderId='null', customerId='CUST-2', productId='null', quantity=null, totalAmount=99.99,
+                                                                                                        status='CREATED'}, headers={kafka_offset=0,
+
+                                                                                                                                How to resolve this?
+
+                            This issue comes because we have only 1 consumer Factory object which is created from properties defined in application.properties file.
+So in this ConsumerFactory Object, "default Type" is what we set in application.properties i.e .
+
+                            spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+    Spring boot application startup
+
+                               KafkaAutoConfiguration Triggered by spring-kafka on class path
+
+                                                            Creates Bean: ConsumerFactory reads spring.kafka.consumer.* props, stores as Map
+
+                            Creates Bean: ConcurrentKafkaListenerContainerFactory     holds reference of ConsumerFactory,
+                                                                                      no Kafka Consumer object created as of now.
+
+                            @EnableKafka
+                                            KafkaListenerAnnotationBeanPostProcessor
+                                                            Scan @KafkaListener
+
+For each Kafka Listener,    For each @KafkaListener, ask
+1 KafkaConsumer is created  ConcurrentKafkaListenerContainerFactory to create
+                            KafkaListenerContainer bean
+
+                            KafkaListenerContainer gets
+                            KafkaConsumer object from Consumer Factory
+
+                            Poll loop starts
+
+ And now Same ConsumerFactory object is used to create both KafkaConsumer:
+
+  � KafkaConsumer for Order events.
+  � KafkaConsumer for Payment event.
+
+ And since same ConsumerFactory object is used, both KafkaConsumer has "default Type" =
+
+ spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+ So if we get this, then solution is very simple, have different ConsumerFactory for each event type with default type is specific to each
+ event.
+
+                                                                        Kafka Consumer Config
+
+package com.eda.consumer.config;
+import com.eda.consumer.model.Order;
+import com.eda.consumer.model.Payment;
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+import java.util.Map;
+@Configuration
+
+    public class ConsumerConfig {
+
+    @Bean
+    public ConsumerFactory<String, Order> orderConsumerFactory(KafkaProperties props) {
+
+            Map<String, Object> config = props.buildConsumerProperties();
+            config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, Order.class.getName());
+            return new DefaultKafkaConsumerFactory<>(config);
+    }
+
+    @Bean
+    public ConsumerFactory<String, Payment> paymentConsumerFactory(KafkaProperties props) {
+
+        Map<String, Object> config = props.buildConsumerProperties();
+        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, Payment.class.getName());
+        return new DefaultKafkaConsumerFactory<>(config);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Order> orderKafkaListenerFactory(ConsumerFactory<String, Order> orderConsumerFactory) {
+        ConcurrentKafkaListenerContainerFactory<String, Order> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(orderConsumerFactory);
+        return factory;
+
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Payment> paymentKafkaListenerFactory(ConsumerFactory<String, Payment> paymentConsumerFactory) {
+
+        ConcurrentKafkaListenerContainerFactory<String, Payment> factory = new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(paymentConsumerFactory);
+        return factory;
+    }
+}
+
+                                             @Component
+                                             public class EventListener {
+
+                                                 @KafkaListener(topics="order-events", containerFactory="orderKafkaListenerFactory")
+                                                 public void consumeOrder (Order order) {
+
+                                                     //business logic
+                                                     System.out.println("Received:" + order.getOrderId());
+                                                  }
+
+                                                 @KafkaListener(topics="payment-events", containerFactory="paymentKafkaListenerFactory")
+                                                 public void consumePayment (Payment payment) {
+
+                                                     //business logic
+                                                     System.out.println("Received:" + payment.getPaymentId());
+                                                  }
+                                             }
+
+                                             server.port=8082
+                                             spring.application.name=kafka-consumer-service
+                                             
+                                             spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+                                             
+                                             spring.kafka.consumer.group-id=order-consumer-group
+                                             
+                                             spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+                                             
+                                             spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+                                             
+                                             spring.kafka.consumer.properties.spring.json.use.type.headers=false
+                                             
+                                             spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+3rd: how to set up, multiple consumers in a group request to join same topic?
+
+Topic: order-events                           Consumer Group 1
+          P0                                           C1
+
+          P1                                            C2
+
+@Component
+public class EventListener {
+
+    @KafkaListener(topics="order-events",)
+    public void consumeOrder (Order order) {
+        //business logic
+        System.out.println("Received:" + order.getOrderId());
+    }
+}
+
+server.port=8082
+spring.application.name=kafka-consumer-service
+
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+spring.kafka.consumer.group-id=order-consumer-group
+
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+spring.kafka.listener.concurrency=3
+
+Spring boot application startup                                                           This concurrency property will be set
+                          KafkaAutoConfiguration Triggered by spring-kafka on class path  In ConcurrentKafkaListenerContainerFactory
+
+Creates Bean: ConsumerFactory reads spring.kafka.consumer.* props, stores as Map
+
+Creates Bean: ConcurrentKafkaListenerContainerFactory                                     holds reference of ConsumerFactory,
+                                                                                          no Kafka Consumer object created as of now.
+
+@EnableKafka                                                                                            Then for each KafkaListener,
+                KafkaListenerAnnotationBeanPostProcessor                                                It will create N number of KafkaListenerContainer
+                                Scan @KafkaListener
+                                                                                                        and thus N number of KafkaConsumer
+                               For each @KafkaListener, ask
+                               ConcurrentKafkaListenerContainerFactory to create
+                               bean
+
+                                              KafkaListenerContainer gets
+                                              KafkaConsumer object from Consumer Factory
+
+                                                                  Poll loop starts
+

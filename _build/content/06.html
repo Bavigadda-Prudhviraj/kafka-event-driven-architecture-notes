@@ -1,0 +1,425 @@
+<!--meta
+{
+  "lead": "Set up a Spring Boot Kafka consumer — dependency, application.properties, POJO and @KafkaListener — and then go one level deeper: the plain KafkaConsumer poll loop that Spring writes for us, what poll() does on the first and later calls, how offsets are committed, and exactly which Spring beans (ConsumerFactory, ListenerContainerFactory, KafkaListenerContainer) are created at start-up.",
+  "date": "Saturday, 14 March 2026",
+  "related": [
+    { "n": 2, "why": "The complete consumer read flow, consumer groups and __consumer_offsets in depth." },
+    { "n": 4, "why": "The producer that publishes the Order events consumed here." },
+    { "n": 7, "why": "Part 2 — going beyond the basic consumer." },
+    { "n": 8, "why": "What happens when processing a record throws an exception." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">Recap first</b>
+    <p>The overall consumer workflow was already covered in <a href="02-kafka-architecture.html#read-flow">Kafka Architecture — Complete Consumer Read Flow</a>. Here is the same flow again as a refresher, because the Spring Boot consumer we build in this chapter performs exactly these steps for us.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="read-flow"><span class="sec-num">1</span>Complete Consumer Read Flow (Recap)</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Complete consumer read flow — step boxes (as in the source notes)</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:consumerReadFlowBoxes-->
+  </div>
+  <div class="diagram-explain">
+    <h4>How to read it</h4>
+    <p>Follow the black arrows from <strong>Step1</strong> to <strong>Step13</strong>: left to right along the top row, down to Step4, right to left along the second row, then down the left edge to Step10. The <span style="color:#2563eb;font-weight:600">blue arrow pairs</span> are request/response round trips (metadata, join group, offset fetch, record fetch, commit), and the red notes are the details of each call. Step13 loops back to Step8 — that is the continuous poll loop. The same flow is shown as a sequence diagram below, with a step-by-step explanation.</p>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Consumer join, offset fetch, read and commit</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant C as Consumer
+    participant B1 as Broker-1&lt;br/&gt;(any broker)
+    participant AC as Active&lt;br/&gt;Controller
+    participant B3 as Broker3&lt;br/&gt;(Group Coordinator,&lt;br/&gt;leader of P23)
+    participant F as Broker1, Broker2&lt;br/&gt;(P23 followers)
+    participant L as Broker2&lt;br/&gt;(Leader of&lt;br/&gt;order-events P-2)
+    Note over C: Step1 - Start, join&lt;br/&gt;group.id = notification-service
+    Note over C: Step2 - hash(group id) % 50&lt;br/&gt;= 23
+    C->>B1: Step3 - Give me metadata
+    B1->>AC: Give me metadata
+    AC-->>B1: Metadata response
+    B1-->>C: __consumer_offsets - P0 Broker 1,&lt;br/&gt;P2 Broker 2, P23 Broker 3
+    C->>B3: Step4 - Join the notification-service group
+    Note over B3: Step5 - group notification-service&lt;br/&gt;topic order-events&lt;br/&gt;Consumer1 P0, Consumer2 P1,&lt;br/&gt;Consumer3 P2
+    F->>B3: Followers poll and ack the group update
+    B3-->>C: Partition-2 assigned for topic order-events
+    C->>B3: Step6 - Fetch last offset for order-events Partition-2
+    Note over B3: Step7 - key&lt;br/&gt;notificationGroupId_order-events_Partition-2&lt;br/&gt;value offset 100
+    B3-->>C: Return 100
+    C->>L: Step8-9 - Fetch from offset 101,&lt;br/&gt;max bytes 200
+    L-->>C: Return offsets 101 - 501
+    Note over C: Step10 - Process events
+    C->>B3: Step11 - Commit offset (manual, batch wise)
+    Note over B3: Step12 - write __consumer_offsets&lt;br/&gt;P23, processed till 501
+    B3-->>C: Commit ACK
+    Note over C,L: Step13 - Continuous polling, go back to Step 8
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li><strong>Consumer starts</strong> and wants to join group <code>group.id = "notification-service"</code>.</li>
+      <li><strong>Finds the partition number of topic <code>__consumer_offsets</code></strong>: <code>hash("notification-service-group-id") % 50 = 23</code> &rarr; Partition 23.</li>
+      <li><strong>Requests metadata</strong> (first time or refresh) through any broker, which asks the Active Controller. Response: <code>__consumer_offsets</code> partition 0 &rarr; Broker 1, partition 2 &rarr; Broker 2, <strong>partition 23 &rarr; Broker 3</strong>.</li>
+      <li><strong>Invokes Broker3</strong> — the leader of Partition 23 acts as the <strong>Group Coordinator</strong> — and requests to join the “notification-service” group.</li>
+      <li><strong>Broker3 (Group Coordinator)</strong> records the assignment for group <em>Notification-service</em>, topic <em>order-events</em>: Consumer1 &rarr; Partition-0, Consumer2 &rarr; Partition-1, Consumer3 &rarr; Partition-2. Broker3 waits for all followers (Broker1, Broker2 — Partition 23 followers, which poll continuously) to update the events in <code>__consumer_offsets</code> partition 23. There is no option to provide <code>ack=0/1/all</code> here — internally the consumer acts like <strong>Ack=All</strong>. Once all followers have the update, the coordinator responds: <strong>Partition-2 assigned</strong> for topic “order-events”.</li>
+      <li><strong>Consumer fetches the last offset</strong> for topic “order-events”, Partition-2.</li>
+      <li><strong>Broker3 looks at <code>__consumer_offsets</code></strong>, builds the key <code>group.id_topic_Partition</code> = <code>"notificationGroupId_order-events_Partition-2"</code> and finds value <strong>offset 100</strong>, which it returns.</li>
+      <li><strong>Consumer checks the metadata and invokes the leader broker</strong> of topic “order-events” Partition-2.</li>
+      <li><strong>Broker2 (leader)</strong> receives “fetch from offset 101, max bytes send me: 200 bytes” and returns the events at offsets 101 – 501.</li>
+      <li><strong>Consumer processes the events.</strong></li>
+      <li><strong>Consumer commits the offset</strong> (manual, batch wise).</li>
+      <li><strong>Broker3 (Group Coordinator)</strong> writes to <code>__consumer_offsets</code>, Partition 23: (group, topic, partition) &rarr; offset processed till = 501, and sends the commit ACK.</li>
+      <li><strong>Continuous polling</strong> — move back to step 8.</li>
+    </ol>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p><strong>Note:</strong> consumer offset details are <strong>not</strong> cluster metadata. They are stored like normal topic data (in <code>__consumer_offsets</code>), not in the controller nodes. And for writes to <code>__consumer_offsets</code> there is no option to choose <code>acks=0/1/all</code> — internally the consumer acts like <strong>acks=all</strong>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="dependency"><span class="sec-num">2</span>Step 1: Dependency</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">pom.xml</span><span class="lang">xml</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.kafka&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-kafka&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+<p>The same single dependency as the producer: <strong>spring-kafka = Spring wrapper layer + Kafka client</strong>. On the consumer side the Spring layer gives us <code>@KafkaListener</code>, the consumer factory and the listener containers.</p>
+
+<!-- ======================================================= -->
+<h2 id="properties"><span class="sec-num">3</span>Step 2: application.properties</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (consumer)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+# Which group the consumer needs to join
+spring.kafka.consumer.group-id=order-consumer-group
+
+# Should be the same as what we selected at the producer
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+
+# Since we selected the JSON deserializer, tell it the default type the JSON is converted to
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Property</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>server.port=8082</code></td><td>Runs next to the producer service (8081) on the same machine.</td></tr>
+      <tr><td><code>bootstrap-servers</code></td><td>Both brokers of our cluster — first contact point to fetch metadata.</td></tr>
+      <tr><td><code>consumer.group-id</code></td><td><strong>Which group the consumer needs to join.</strong> All instances with this id share the partitions; another id would get its own copy of every event.</td></tr>
+      <tr><td><code>key-deserializer</code> / <code>value-deserializer</code></td><td>The reverse of the producer's serializers — <strong>must match what the producer selected</strong> (String key, JSON value).</td></tr>
+      <tr><td><code>spring.json.value.default.type</code></td><td>Because we chose <code>JsonDeserializer</code>, we tell it the <strong>default Java type</strong> to convert the JSON into.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>The consumer's own POJO — the same fields as the producer's <code>Order</code>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Order.java (POJO class, package com.eda.consumer.model)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">public class Order {
+    private String orderId;
+    private String customerId;
+    private String productId;
+    private Integer quantity;
+    private Double totalAmount;
+    private String status;
+
+    // getters and setters
+}</code></pre>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="listener"><span class="sec-num">4</span>Step 3: Which Topic to Listen To, and the Business Logic</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderEventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderEventListener {
+
+    @KafkaListener(topics = "order-events")      // topic the consumer is interested in
+    public void consume(Order order) {             // executed for each record (event)
+        // business logic
+        System.out.println("Received order event: " + order.getOrderId());
+    }
+}</code></pre>
+</div>
+<ul>
+  <li><code>@KafkaListener(topics = "order-events")</code> — the <strong>topic this consumer is interested in</strong>.</li>
+  <li><code>consume(Order order)</code> — <strong>executed for each record (event)</strong>. The JSON value has already been turned into an <code>Order</code> by the deserializer.</li>
+</ul>
+<p>That is all the code we write. The rest of this chapter explains what Spring does for us behind this one annotation.</p>
+
+<!-- ======================================================= -->
+<h2 id="demo"><span class="sec-num">5</span>Demo</h2>
+<ol class="steps">
+  <li>Start the cluster from <a href="03-cluster-setup.html#start">Cluster Setup</a> (controllers first, then brokers).</li>
+  <li>Start the consumer service (port 8082) — it joins <code>order-consumer-group</code> and gets partitions of <code>order-events</code> assigned.</li>
+  <li>Start the producer service from <a href="04-producer-setup.html">Producer Setup</a> (port 8081) and publish an order:</li>
+</ol>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">publish an order — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ curl -X POST http://localhost:8081/api/orders/with-key -H "Content-Type: application/json" -d '{"orderId":"ORD-1001","customerId":"CUST-1","productId":"PROD-9","quantity":2,"totalAmount":499.0,"status":"CREATED"}'
+Order created and event published!</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">publish an order — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; curl -X POST http://localhost:8081/api/orders/with-key -H "Content-Type: application/json" -d "{\"orderId\":\"ORD-1001\",\"customerId\":\"CUST-1\",\"productId\":\"PROD-9\",\"quantity\":2,\"totalAmount\":499.0,\"status\":\"CREATED\"}"
+Order created and event published!</code></pre>
+</div>
+</div>
+<p>The consumer's console then shows the listener output (example):</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">consumer service console (example)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Received order event: ORD-1001</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><b class="ct">Two things that commonly trip up the demo</b>
+  <ul style="margin:6px 0 0">
+    <li><strong>Old events are not printed.</strong> <code>auto-offset-reset</code> defaults to <code>latest</code>: a <em>new</em> group with no committed offset starts at the end of the partition, so only events produced <em>after</em> it joined are delivered. Use <code>spring.kafka.consumer.auto-offset-reset=earliest</code> to start from the beginning the first time.</li>
+    <li><strong>“…is not in the trusted packages”.</strong> The producer's <code>JsonSerializer</code> adds a type header with <em>its</em> class name (e.g. <code>com.eda.producer…Order</code>), and the consumer's <code>JsonDeserializer</code> uses that header by default. If the consumer's package is different, either ignore the header so <code>default.type</code> is used — <code>spring.kafka.consumer.properties.spring.json.use.type.headers=false</code> — or trust that package with <code>spring.json.trusted.packages</code>.</li>
+  </ul>
+</div></div>
+
+<!-- ======================================================= -->
+<h2 id="behind-the-scenes"><span class="sec-num">6</span>One Level Deeper: What Happens Behind the Scenes</h2>
+<p>Conceptually, this is what we would have to write <strong>without Spring Boot</strong>, using the plain Kafka client:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">plain KafkaConsumer — conceptual</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">Properties props = new Properties();
+props.put("bootstrap.servers", "localhost:9092,localhost:9192");
+props.put("group.id", "order-consumer-group");                 // which group the consumer needs to join
+props.put("key.deserializer", StringDeserializer.class);       // should be the same as
+props.put("value.deserializer", JsonDeserializer.class);       // what the producer selected
+props.put("auto.offset.reset", "latest");
+props.put("enable.auto.commit", "true");
+
+KafkaConsumer consumer = new KafkaConsumer&lt;&gt;(props);
+consumer.subscribe(Arrays.asList("order-events"));            // which topic this consumer is interested in
+
+// Connect with 1 of the brokers and fetch cluster metadata and store it
+
+try {
+    while (true) {
+        ConsumerRecords records = consumer.poll();              // continuous poll inside while(true), fetches records
+
+        // commitIntervalPassed default is 5 sec: after every 5 seconds, make an offset commit request
+        // (no matter whether the fetched records were successfully processed or not)
+        if (autoCommitEnabled &amp;&amp; commitIntervalPassed) {
+            commitOffsets();
+        }
+
+        for (ConsumerRecord record : records) {
+            // business logic                                     // process the events
+        }
+
+        // If enable.auto.commit=false, we must call:
+        //   consumer.commitSync();    // blocks until broker confirms
+        //   consumer.commitAsync();   // fire-and-forget, no guarantee
+    }
+} finally {
+    consumer.close();                                           // leaves consumer group
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>This is <em>conceptual</em> code as in the source notes. In the real client API, <code>poll</code> takes a timeout — <code>consumer.poll(Duration.ofMillis(100))</code> — and the auto-commit check happens <strong>inside</strong> <code>poll()</code>; the explicit <code>if (autoCommitEnabled …)</code> block just makes that hidden step visible.</p></div></div>
+
+<h3 id="poll-internals">What <code>poll()</code> does internally</h3>
+<div class="vs">
+  <div class="side b">
+    <h4>First call</h4>
+    <div class="sb">
+      <ol>
+        <li>Sends <strong>JoinGroupRequest</strong> to the Group Coordinator.</li>
+        <li>Receives the <strong>partition assignment</strong>.</li>
+        <li>Requests the <strong>last committed offset</strong> for the assigned partitions from the group coordinator.</li>
+        <li>The group coordinator reads <code>__consumer_offsets</code> and returns the offset that needs to be read.</li>
+        <li>Sends <strong>FetchRequest</strong> to the partition leaders with the offset it wants to read.</li>
+      </ol>
+    </div>
+  </div>
+  <div class="side a">
+    <h4>Subsequent calls</h4>
+    <div class="sb">
+      <ul>
+        <li>Sends <strong>FetchRequest</strong> for new data — new offsets in a continuous manner.</li>
+        <li>(And, if auto-commit is enabled and the interval has passed, commits the offsets.)</li>
+      </ul>
+    </div>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">poll() — first call vs later calls</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Consumer poll()
+    participant GC as Group Coordinator
+    participant L as Partition Leader
+    Note over C,L: First call
+    C->>GC: JoinGroupRequest
+    GC-->>C: partition assignment
+    C->>GC: last committed offset for assigned partitions?
+    Note over GC: reads __consumer_offsets
+    GC-->>C: offset to read
+    C->>L: FetchRequest (from that offset)
+    L-->>C: records
+    Note over C,L: Subsequent calls
+    loop while (true)
+        C->>L: FetchRequest (next offsets)
+        L-->>C: records
+        opt auto-commit enabled and 5 s passed
+            C->>GC: commit offsets
+        end
+    end
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Joining the group, getting partitions and finding the start offset happen <strong>once</strong>, inside the first <code>poll()</code>. After that, each <code>poll()</code> is just a fetch of the next records. With auto-commit, every 5 seconds the consumer commits the offsets it has fetched — <strong>whether or not they were processed successfully</strong>, which is the at-most-once risk from <a href="02-kafka-architecture.html#auto-commit">Offset Commit Strategies</a>.</p>
+  </div>
+</div>
+
+<h3 id="commit-and-close">Committing manually and closing</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Call</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>consumer.commitSync()</code></td><td><strong>Blocks until the broker confirms</strong> the commit (needed when <code>enable.auto.commit=false</code>).</td></tr>
+      <tr><td><code>consumer.commitAsync()</code></td><td><strong>Fire-and-forget</strong>, no guarantee — faster, but a failed commit is not retried.</td></tr>
+      <tr><td><code>consumer.close()</code></td><td><strong>Leaves the consumer group</strong> cleanly, so the coordinator can rebalance its partitions to other consumers right away.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>If the consumer stops <em>without</em> <code>close()</code> (for example it crashes), no more heartbeats are sent by the consumer's background thread to the broker; the broker considers it dead and <strong>triggers a rebalance</strong> — but only after the heartbeat/session timeout has passed.</p>
+
+<!-- ======================================================= -->
+<h2 id="spring-mapping"><span class="sec-num">7</span>Spring Kafka Does All of This for Us</h2>
+<p>The good thing is, we don't have to write all of this ourselves — it is all provided within the Spring Kafka framework. Each piece of the plain code maps to something we provide or something the framework provides:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Plain Kafka client code</th><th>Spring Kafka equivalent</th><th>Who provides it</th></tr></thead>
+    <tbody>
+      <tr><td><code>Properties props = new Properties(); props.put(...)</code></td><td><code>application.properties</code> (<code>spring.kafka.consumer.*</code>)</td><td><strong>We provide this</strong></td></tr>
+      <tr><td><code>new KafkaConsumer&lt;&gt;(props)</code></td><td><code>ConsumerFactory</code> (<code>DefaultKafkaConsumerFactory</code>) creates the KafkaConsumer object using application.properties</td><td>Framework provides this</td></tr>
+      <tr><td><code>consumer.subscribe(Arrays.asList("order-events"))</code></td><td><code>@KafkaListener(topics = "order-events")</code></td><td><strong>We provide this</strong></td></tr>
+      <tr><td><code>for (ConsumerRecord record : records) { // business logic }</code></td><td>The body of the <code>@KafkaListener</code> method</td><td><strong>We provide this</strong></td></tr>
+      <tr><td>Connect + fetch metadata, <code>while (true) { poll() }</code>, auto-commit, <code>commitSync/commitAsync</code>, <code>finally { close() }</code></td><td><code>KafkaListenerContainer</code></td><td>Framework provides this</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — we provide this</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+# default
+spring.kafka.consumer.auto-offset-reset=latest
+# default
+spring.kafka.consumer.enable-auto-commit=true</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">@KafkaListener — we provide this</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@KafkaListener(topics = "order-events")
+public void consume(Order order) {
+    // business logic
+    System.out.println("Received order event: " + order);
+}</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">What we provide vs what Spring Kafka provides</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    AP["application.properties"] --> CF["ConsumerFactory · DefaultKafkaConsumerFactory"]
+    CF -->|"creates KafkaConsumer"| LC["KafkaListenerContainer · poll loop, commit, close"]
+    KL["@KafkaListener method · topics + business logic"] --> LC
+    LC -->|"for each record"| KL
+    classDef ours fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef fw fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:2px
+    class AP,KL ours
+    class CF,LC fw
+</div>
+    <div class="chips" style="justify-content:center">
+      <span class="chip"><i style="background:#fdba74"></i>We have to provide this</span>
+      <span class="chip"><i style="background:#5eead4"></i>Framework provides this</span>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>We only supply the <strong>configuration</strong> and the <strong>listener method</strong>. Spring's <code>ConsumerFactory</code> turns the properties into a <code>KafkaConsumer</code>, and the <code>KafkaListenerContainer</code> runs the whole poll loop — fetching, committing and closing — and calls our method once for every record.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="startup-flow"><span class="sec-num">8</span>The Spring Boot Start-up Flow</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">From application start to the poll loop</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["Spring Boot application starts"] --> B["KafkaAutoConfiguration · triggered by spring-kafka on the class path"]
+    B --> B1["Creates bean: ConsumerFactory · reads spring.kafka.consumer.* props, stores them as a Map"]
+    B --> B2["Creates bean: ConcurrentKafkaListenerContainerFactory · holds a reference to ConsumerFactory · no KafkaConsumer object created yet"]
+    A --> C["@EnableKafka · added automatically by Spring Boot based on the class path · enables Kafka listener processing"]
+    C --> D["Creates bean: KafkaListenerAnnotationBeanPostProcessor"]
+    D --> D1["Scans for @KafkaListener"]
+    D --> D2["For each @KafkaListener, asks ConcurrentKafkaListenerContainerFactory to create a KafkaListenerContainer bean"]
+    D2 --> E1["KafkaListenerContainer gets a KafkaConsumer object from the ConsumerFactory"]
+    D2 --> E2["Poll loop starts"]
+    classDef start fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef auto fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ann fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef run fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A start
+    class B,B1,B2 auto
+    class C,D,D1,D2 ann
+    class E1,E2 run
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li><strong>Spring Boot application starts.</strong></li>
+      <li><strong>KafkaAutoConfiguration</strong> is triggered because <code>spring-kafka</code> is on the class path. It creates:
+        <ul>
+          <li><strong>ConsumerFactory</strong> — reads the <code>spring.kafka.consumer.*</code> properties and stores them as a Map.</li>
+          <li><strong>ConcurrentKafkaListenerContainerFactory</strong> — holds a reference to the ConsumerFactory. <em>No KafkaConsumer object is created yet.</em></li>
+        </ul>
+      </li>
+      <li><strong>@EnableKafka</strong> is added automatically by Spring Boot based on the class path; only then is Kafka listener processing enabled. It creates the <strong>KafkaListenerAnnotationBeanPostProcessor</strong> bean.</li>
+      <li>The post-processor <strong>scans for @KafkaListener</strong> methods.</li>
+      <li>For each <code>@KafkaListener</code>, it asks the <strong>ConcurrentKafkaListenerContainerFactory</strong> to create a <strong>KafkaListenerContainer</strong> bean.</li>
+      <li>The <strong>KafkaListenerContainer gets a KafkaConsumer</strong> object from the ConsumerFactory&hellip;</li>
+      <li>&hellip;and the <strong>poll loop starts</strong> — the first <code>poll()</code> joins the group, gets the partitions and the start offset, exactly as in the read flow above.</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li>A Spring Boot consumer needs only <strong>spring-kafka</strong>, a few <code>spring.kafka.consumer.*</code> properties (group id, deserializers, JSON default type) and a <strong>@KafkaListener</strong> method.</li>
+    <li>Deserializers must match the producer's serializers; <code>JsonDeserializer</code> needs the target type.</li>
+    <li>Behind the scenes: a <code>KafkaConsumer</code> is created, <code>subscribe()</code>s to the topic and runs <code>while (true) { poll(); process; commit }</code>, then <code>close()</code>s to leave the group.</li>
+    <li>The <strong>first poll()</strong> joins the group, receives partitions, fetches the committed offset and starts fetching; later polls just fetch the next records.</li>
+    <li>Auto-commit (default every 5 s) commits regardless of processing success; with it disabled use <code>commitSync()</code> (blocking) or <code>commitAsync()</code> (fire-and-forget).</li>
+    <li>Spring creates <strong>ConsumerFactory</strong> and <strong>ConcurrentKafkaListenerContainerFactory</strong>, scans <code>@KafkaListener</code>, builds a <strong>KafkaListenerContainer</strong> per listener and starts its poll loop.</li>
+  </ul>
+</div>

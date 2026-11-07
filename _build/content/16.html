@@ -1,0 +1,391 @@
+<!--meta
+{
+  "lead": "The source node of a topology, and the three ways to read a topic: KStream (every record is an independent event), KTable (the latest value per key, kept in RocksDB) and GlobalKTable (a full copy of a small topic on every instance). Why table state matters for joins and interactive queries, what happens on fresh start-up versus restore, why KStream–KTable joins need co-partitioning, and when GlobalKTable is the answer.",
+  "date": "Saturday, 27 June 2026",
+  "related": [
+    { "n": 15, "why": "Topology, tasks, RocksDB and changelog topics — the architecture behind these abstractions." },
+    { "n": 17, "why": "SerDes — the Consumed / Produced / Materialized serializers used in every example." },
+    { "n": 18, "why": "Stateless processing nodes like peek, filter and map used after the source." },
+    { "n": 19, "why": "Stateful nodes and joins between KStream, KTable and GlobalKTable." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128218;</span>
+  <div>
+    <b class="ct">Prerequisite</b>
+    <p>If <a href="15-kafka-streams-architecture.html">Kafka Streams Architecture</a> is clear, you know the major part of a Kafka Streams app is <strong>writing the topology</strong>; the rest is managed by the framework. A topology has 3 parts — <strong>Source</strong>, <strong>Processor</strong>, <strong>Sink</strong>. Today we focus on the <strong>SOURCE</strong>.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="source"><span class="sec-num">1</span>The Source Node</h2>
+<ul class="points">
+  <li>The source is the <strong>entry point</strong> of a Kafka Streams topology.</li>
+  <li>It reads records from one or more Kafka topics and forwards them to the stream-processing pipeline.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Source → Processors → Sink</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    S["Source · topic order-events · read, deserialize, forward · like raw material"] --> P["Processors · business logic · like cut, paint, package"] --> K["Sink · output topic · serialize, write · like shipping"]
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class S src
+    class P proc
+    class K sink
+</div>
+  </div>
+  <div class="diagram-explain"><p>There are <strong>3 ways</strong> to read from a topic:</p></div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th></th><th>KStream</th><th>KTable</th><th>GlobalKTable</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Meaning</strong></td><td>every record is an independent event</td><td>latest state of each key</td><td>latest state of each key, all partitions</td></tr>
+      <tr><td><strong>Created with</strong></td><td><code>builder.stream()</code></td><td><code>builder.table()</code></td><td><code>builder.globalTable()</code></td></tr>
+      <tr><td><strong>State store</strong></td><td>none</td><td>RocksDB per task (its partitions)</td><td>RocksDB per instance (whole topic)</td></tr>
+      <tr><td><strong>Use when</strong></td><td>each record matters</td><td>you need the current value, joins, lookups</td><td>small reference data joined without co-partitioning</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="kstream"><span class="sec-num">2</span>KStream</h2>
+<p>Each record read from the source topic partitions is treated as an <strong>independent event</strong>. Say these events arrive:</p>
+<div class="logviz">
+  <div class="row"><span class="lab">order-events</span><div class="cells"><span class="cell">offset 0<small>001 · CREATED</small></span><span class="cell">offset 1<small>001 · SHIPPED</small></span><span class="cell">offset 2<small>001 · DELIVERED</small></span></div><span class="ptr">KStream forwards all 3</span></div>
+</div>
+<p>All 3 events belong to the same <code>orderId = "001"</code>, but KStream sees them as <strong>3 separate events</strong> and forwards each one down the pipeline. So: <strong>use KStream when each record matters</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SourceTypesTopology.java — KStream</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    @Autowired
+    public void kstreamDemo(StreamsBuilder builder) {
+
+        KStream&lt;String, String&gt; orders = builder.stream("order-events",
+                Consumed.with(Serdes.String(), Serdes.String()));
+
+        orders.peek((key, value) -&gt;
+                System.out.println("key=" + key + " value=" + value));
+
+        orders.to("order-events-output",
+                Produced.with(Serdes.String(), Serdes.String()));
+    }
+}</code></pre>
+</div>
+<ul class="points">
+  <li><code>StreamsBuilder</code> helps create the topology. Because of <code>@EnableKafkaStreams</code>, Spring Boot injects it into our method.</li>
+  <li><code>.stream()</code> creates a KStream. Parameters: the <strong>source topic(s)</strong>, and the <strong>key and value SerDes</strong> — data in Kafka is stored as bytes, so it must be converted into Java objects.</li>
+  <li><code>peek</code> and <code>to</code> are a processor node and a sink node; we'll see them <a href="18-stateless-processing-nodes.html">later</a>.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">reading multiple topics</span><span class="lang">java</span></div>
+<pre><code data-lang="java">builder.stream(
+        List.of("order-events", "payment-events"),
+        Consumed.with(Serdes.String(), Serdes.String())
+);</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes declare these methods as <code>@Bean public void …(StreamsBuilder builder)</code>. Spring does not allow <code>void</code> <code>@Bean</code> methods, so the examples here use <code>@Autowired</code> on a <code>void</code> method, which Spring calls once with the injected <code>StreamsBuilder</code> — the topology code itself is unchanged. Returning the stream from a <code>@Bean</code> also works (see <a href="15-kafka-streams-architecture.html#setup">Chapter 15</a>).</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="ktable"><span class="sec-num">3</span>KTable</h2>
+<ul class="points">
+  <li>A KTable represents the <strong>latest state of each key</strong>.</li>
+  <li>It stores the topic in <strong>RocksDB</strong> and continuously updates the value associated with each key.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Same 3 events, read as a KTable</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant T as order-events
+    participant K as KTable
+    participant R as RocksDB (order-events-store)
+    participant P as Pipeline
+    T->>K: offset 0 · 001 · CREATED
+    K->>R: put(001, CREATED)
+    K->>P: forward
+    T->>K: offset 1 · 001 · SHIPPED
+    K->>R: put(001, SHIPPED) — overwrites
+    K->>P: forward
+    T->>K: offset 2 · 001 · DELIVERED
+    K->>R: put(001, DELIVERED) — overwrites
+    K->>P: forward
+    Note over R: key 001 → DELIVERED (only the latest)
+</div>
+  </div>
+  <div class="diagram-explain"><p>The KTable reads events one by one; for each it <strong>updates RocksDB</strong> and <strong>forwards</strong> the update downstream. Downstream sees each change as an update to key <code>001</code>, not as a new independent event. Forwarding may be batched by the record cache (<code>statestore.cache.max.bytes</code>), so quick consecutive updates to one key can collapse into one.</p></div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SourceTypesTopology.java — KTable</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    @Autowired
+    public void kTableDemo(StreamsBuilder builder) {
+
+        KTable&lt;String, String&gt; orders = builder.table("order-events",
+                Consumed.with(Serdes.String(), Serdes.String()),
+                Materialized
+                        .&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("order-events-store")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.String())
+        );
+
+        orders.toStream()
+              .peek((key, value) -&gt;
+                      System.out.println("key=" + key + " value=" + value))
+              .to("order-events-output",
+                      Produced.with(Serdes.String(), Serdes.String()));
+    }
+}</code></pre>
+</div>
+<p><code>.table()</code> creates a KTable. Parameters:</p>
+<ul class="points">
+  <li>The <strong>source topic</strong>.</li>
+  <li>The <strong>key and value SerDes</strong> to deserialize the bytes.</li>
+  <li>A <strong>Materialized</strong> object: the RocksDB <strong>store name</strong>, plus key and value SerDes, because RocksDB also stores data as bytes.</li>
+</ul>
+
+<h3 id="doubt1">Doubt 1: Why keep state if KTable forwards every event anyway?</h3>
+<p>There are 2 major advantages.</p>
+<p><strong>#1 — Another operation in the pipeline needs to look something up.</strong> Example: join each order with the customer's <em>current</em> city.</p>
+<div class="vs">
+  <div class="side a">
+    <h4>Without KTable (two KStreams)</h4>
+    <div class="sb">
+      <ul>
+        <li>T1: customer record <code>SJ → Delhi</code></li>
+        <li>T2: customer record <code>SJ → Bangalore</code></li>
+        <li>T3: order <code>SJ → laptop</code> — needs SJ's current city</li>
+      </ul>
+      <p>Without RocksDB, where would it look? The customer records have already flowed past. They're <strong>gone</strong>; there is nothing to look up.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>With KTable (customers as a table)</h4>
+    <div class="sb">
+      <div class="logviz">
+        <div class="row"><span class="lab">after T1</span><div class="cells"><span class="cell">SJ<small>Delhi</small></span></div></div>
+        <div class="row"><span class="lab">after T2</span><div class="cells"><span class="cell new">SJ<small>Bangalore</small></span></div></div>
+      </div>
+      <p>At T3, the join looks up <code>SJ</code> in RocksDB, finds <strong>Bangalore</strong> and enriches the order.</p>
+    </div>
+  </div>
+</div>
+<p><strong>#2 — Interactive queries.</strong> We can expose a REST endpoint that queries this local state store and returns the current state, <strong>without querying an external database</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">interactive query (sketch)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@GetMapping("/orders/{id}/status")
+public String status(@PathVariable String id) {
+    KafkaStreams streams = factoryBean.getKafkaStreams();   // StreamsBuilderFactoryBean
+    ReadOnlyKeyValueStore&lt;String, String&gt; store = streams.store(
+            StoreQueryParameters.fromNameAndType("order-events-store",
+                    QueryableStoreTypes.keyValueStore()));
+    return store.get(id);   // latest value for this key, from local RocksDB
+}</code></pre>
+</div>
+<p>With several instances, each one holds only its own partitions, so a key may live on another instance. Kafka Streams' metadata API (<code>queryMetadataForKey</code>) tells you which instance has it.</p>
+
+<h3 id="doubt2">Doubt 2: Does the KTable get priority over the KStream?</h3>
+<p>The order event needs the customer data in RocksDB. What if the order event arrives <strong>before</strong> the customer's state exists?</p>
+<div class="vs">
+  <div class="side a">
+    <h4>Fresh start-up (no changelog, first-ever start)</h4>
+    <div class="sb">
+      <ul>
+        <li>KStream and KTable source records arrive <strong>in parallel</strong>.</li>
+        <li>They are processed record by record, in the order they arrive.</li>
+        <li><strong>No priority</strong> is given to the KTable.</li>
+        <li>If an order arrives before its customer, the join finds <strong>nothing</strong> (an inner join drops it; a left join emits it with <code>null</code>).</li>
+      </ul>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Restoration or rebalance (RocksDB gone, changelog present)</h4>
+    <div class="sb">
+      <ul>
+        <li><strong>Before processing any new record</strong>, the task reads the <strong>changelog topic</strong> (not the source topic).</li>
+        <li>It rebuilds RocksDB from the changelog.</li>
+        <li>Only then does it process new records from the source topics.</li>
+      </ul>
+      <p>This is not “read the KTable source first” — it is “<strong>rebuild the state store from its backup</strong>”.</p>
+    </div>
+  </div>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>Kafka Streams does try to process records across its input partitions <strong>roughly in timestamp order</strong>, and <code>max.task.idle.ms</code> lets a task wait briefly for data on all its inputs. That reduces, but does not remove, the “order before customer” race on a fresh start.</p></div></div>
+
+<h3 id="doubt3">Doubt 3: Can a KStream–KTable join even work across partitions?</h3>
+<p>Say the customers topic has 2 partitions. Customer P0 goes to Task1 on StreamThread-1, customer P1 to Task2 on StreamThread-2. What if an order in Task1 needs customer <code>SJ</code>, who is in Task2?</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Co-partitioning makes the join local</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph T1["StreamThread-1 · Task1"]
+        A1["KStream orders P0 · SJ → laptop, SJ → phone"] --> J1["JOIN works"]
+        A2["KTable customers P0 · SJ → Delhi"] --> J1
+    end
+    subgraph T2["StreamThread-2 · Task2"]
+        B1["KStream orders P1 · RJ → tablet, RJ → mouse"] --> J2["JOIN works"]
+        B2["KTable customers P1 · RJ → Bangalore"] --> J2
+    end
+    classDef s fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef t fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A1,B1 s
+    class A2,B2 t
+    class J1,J2 ok
+</div>
+  </div>
+  <div class="diagram-explain">
+    <p>A KStream–KTable join works seamlessly only with <strong>co-partitioning</strong>:</p>
+    <ul>
+      <li>The <strong>same number of partitions</strong> in both the orders and the customers topic.</li>
+      <li>The <strong>same partitioning strategy</strong> (the same key, here customerId, and the same partitioner) for both.</li>
+    </ul>
+    <p>Then orders for SJ and the customer record for SJ always land in the same partition number, and therefore in the same task. Without co-partitioning, a KStream–KTable join does not work. Kafka Streams checks the partition counts at start-up and fails if they differ. If the key is different, re-key with <code>selectKey</code> first, which creates a <a href="15-kafka-streams-architecture.html#sub-topology">repartition topic</a>.</p>
+  </div>
+</div>
+<p style="font-size:13.5px;color:var(--muted)">The notes write “CONSUMER topic” in the co-partitioning rules; it means the customers topic.</p>
+
+<!-- ======================================================= -->
+<h2 id="globalktable"><span class="sec-num">4</span>GlobalKTable</h2>
+<h3 id="ktable-problem">The problem with KTable for reference data</h3>
+<p>A Kafka Streams app with 2 stream threads, an orders topic with 2 partitions and a countries topic with 2 partitions. Each order has a country id, and we need the country name.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Countries split across tasks → lookup may fail</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph T1["Task1"]
+        A1["KStream orders P0"] --> X1{"country IN?"}
+        A2["KTable countries P0 · SOME countries"] --> X1
+    end
+    subgraph T2["Task2"]
+        B1["KStream orders P1"] --> X2{"country US?"}
+        B2["KTable countries P1 · OTHER countries"] --> X2
+    end
+    X1 -- "IN is in P1" --> F["JOIN FAILS"]
+    classDef s fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef t fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class A1,B1 s
+    class A2,B2 t
+    class F bad
+</div>
+  </div>
+  <div class="diagram-explain"><p>Orders are keyed by order id, countries by country id, so they are not co-partitioned. Task1 sees some countries and Task2 sees others, so an order in Task1 may need a country held by Task2, and the join fails. (IN / US are just example codes.)</p></div>
+</div>
+
+<h3 id="global-solution">The solution: every instance gets all partitions</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Global stream thread + global state store per instance</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:globalKTable-->
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li>Each Kafka Streams application instance gets the data of <strong>all partitions</strong> of the GlobalKTable topic.</li>
+      <li>A separate <strong>Global Stream Thread</strong> consumes it into a <strong>global state store</strong> (RocksDB).</li>
+      <li>All tasks running in that instance can query the shared global store, so the join works <strong>without co-partitioning</strong> and without repartitioning the orders.</li>
+    </ul>
+    <p>In the notes' picture, instance 2 shows Task3 and Task4. With only 2 orders partitions there are only 2 tasks, so instance 2's threads would actually sit idle. The drawing shows that, which is also a reminder that adding threads beyond the partition count does not add parallelism.</p>
+  </div>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="callout warn" style="margin:0"><span class="ci">&#9888;</span><div><p>Always use a GlobalKTable for <strong>relatively small or reference datasets</strong>: every instance keeps a <strong>complete local copy</strong> of the topic.</p></div></div>
+  <div class="card" style="margin:0"><h4>Good candidates</h4><div class="chips"><span>Countries</span><span>Currency codes</span><span>Configuration</span><span>Product categories</span></div></div>
+</div>
+
+<h3 id="global-startup">Start-up order</h3>
+<div class="grid grid-2" style="align-items:center">
+  <ol class="steps">
+    <li>On start-up, the global stream thread reads <strong>all partitions</strong> of the GlobalKTable topics (e.g. <code>countries</code>).</li>
+    <li>It builds the global RocksDB store.</li>
+    <li>No <strong>changelog</strong> is kept for the global store: the source topic itself is the backup, and since the dataset is small, it is simply read in full.</li>
+    <li><strong>Only after this is complete</strong> do the stream threads start.</li>
+  </ol>
+  <div class="mermaid">
+flowchart TD
+    A["Application start"] --> B["Restore or create GlobalKTable first"] --> C["Start StreamThreads"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef g fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class A,C step
+    class B g
+  </div>
+</div>
+<p>This is a “<strong>read first</strong>” behaviour — but only for GlobalKTable, not for a regular KTable. It also means the GlobalKTable topic should be <strong>compacted</strong>, so a full read stays small. Global state is read-only from the topology's point of view: updates come only from the topic.</p>
+
+<h3 id="global-code">Code</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SourceTypesTopology.java — GlobalKTable join</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Autowired
+    public void globalKTableDemo(StreamsBuilder builder) {
+
+        GlobalKTable&lt;String, String&gt; countries = builder.globalTable("countries",
+                Consumed.with(Serdes.String(), Serdes.String()),
+                Materialized
+                        .&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("countries-store")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.String())
+        );
+
+        KStream&lt;String, String&gt; ordersWithCountry = builder.stream("order-events",
+                Consumed.with(Serdes.String(), Serdes.String()));
+
+        KStream&lt;String, String&gt; enriched = ordersWithCountry.join(
+                countries,
+                // which key to look up in the GlobalKTable
+                (orderId, orderJson) -&gt; {
+                    try {
+                        JsonNode order = objectMapper.readTree(orderJson);
+                        return order.get("countryCode").asText();
+                    } catch (Exception e) {
+                        return null;   // exception handling: null key → record is skipped
+                    }
+                },
+                // how to combine the order with the country name
+                (orderJson, countryName) -&gt;
+                        orderJson + " | country=" + countryName
+        );
+
+        enriched.peek((key, value) -&gt;
+                        System.out.println("key=" + key + " value=" + value))
+                .to("order-enriched-with-country",
+                        Produced.with(Serdes.String(), Serdes.String()));
+    }
+}</code></pre>
+</div>
+<p><code>.globalTable()</code> takes the same parameters as <code>.table()</code>: the source topic, key/value SerDes, and a Materialized object with the store name and SerDes.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Join argument</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>countries</code></td><td>the GlobalKTable to look into</td></tr>
+      <tr><td><strong>KeyValueMapper</strong> <code>(orderId, orderJson) -&gt; countryCode</code></td><td>picks the lookup key from each order. Unlike a KTable join, the stream does not need to be keyed by it — no repartition.</td></tr>
+      <tr><td><strong>ValueJoiner</strong> <code>(orderJson, countryName) -&gt; …</code></td><td>builds the output value from both sides</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes leave the <code>catch</code> block as “exception handling” with no return value, which would not compile; returning <code>null</code> is the simplest fix. With an inner <code>join</code>, an order whose lookup key is null or not found is dropped; use <code>leftJoin</code> to keep it with a <code>null</code> country. Joins are processor nodes, covered in <a href="19-stateful-processing-nodes.html">Stateful Processing Nodes</a>.</p></div></div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li><strong>KStream</strong> — every record is an event; no state.</li>
+    <li><strong>KTable</strong> — latest value per key in a per-task RocksDB store, backed by a changelog; enables lookups, joins and interactive queries; joins need <strong>co-partitioning</strong>.</li>
+    <li><strong>GlobalKTable</strong> — the whole (small) topic on every instance, loaded before stream threads start; joins with any key, no co-partitioning, no changelog.</li>
+  </ul>
+</div></div>

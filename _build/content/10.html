@@ -1,0 +1,443 @@
+<!--meta
+{
+  "lead": "Why idempotency alone is not enough — new PIDs after a restart, partial writes across topics and duplicate read-process-write — and how Kafka transactions solve all three. Walk through the full protocol: transactional.id, finding the Transaction Coordinator, InitProducerId with PID + epoch, zombie fencing, AddPartitionsToTxn, the two-phase commit with control records, and the Spring executeInTransaction implementation with real log output.",
+  "date": "Saturday, 28 March 2026",
+  "related": [
+    { "n": 5, "why": "Idempotency internals — PID and sequence numbers that transactions build on." },
+    { "n": 4, "why": "The producer pipeline and why send() is asynchronous." },
+    { "n": 11, "why": "The consumer side: how isolation.level reads transactional records." },
+    { "n": 13, "why": "The Outbox pattern for atomic writes across a database and Kafka." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="need"><span class="sec-num">1</span>Why Do We Need Transactions in Kafka?</h2>
+<p>There are three problems that the idempotent producer from <a href="05-idempotency.html">Idempotency</a> cannot solve:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Problem</th><th>Side</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><a href="#problem-idempotency">Idempotency breaks when the producer restarts</a></td><td>Producer</td></tr>
+      <tr><td>2</td><td><a href="#problem-partial">Partial writes across topics</a></td><td>Producer</td></tr>
+      <tr><td>3</td><td><a href="#problem-duplicate">Duplicate processing in read-process-write</a></td><td>Consumer</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="problem-idempotency">Problem 1: Idempotency — a restarted producer gets a new PID</h3>
+<p>Recall how an idempotent producer gets its Producer ID (PID):</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Recap: how a producer gets a PID (idempotency)</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant C as Controller
+    P->>B: 1. Give me Unique ID
+    B->>C: 2. Pass the request to Controller
+    Note over C: 3. Pick next available PID &lt;br/&gt; (e.g. till 1000 is used, so pick 1001)
+    C-->>B: 4. PID = 1001
+    B-->>P: 5. PID = 1001
+</div>
+  </div>
+  <div class="diagram-explain"><p>The controller only hands out the <strong>next free number</strong>. It does not store any <em>producer → PID</em> mapping. So when the producer restarts and asks again, it always gets a <strong>new PID</strong>.</p></div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Restart with a new PID → duplicate batch</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker (Topic-A, P0)
+    P->>B: Give me PID
+    B-->>P: PID: 1001
+    P->>B: Batch1 · PID 1001 · baseSequence 3 · lastSequence 5 (E1, E2, E3)
+    Note over B: .log: Header baseSequence-3, lastSequence-5, PID-1001 &lt;br/&gt; E1 offset1, E2 offset2, E3 offset3 &lt;br/&gt; state: PID 1001 · A · P0 · last seq 5
+    Note over P: Producer crashed &lt;br/&gt; and might have missed the ACK
+    P->>B: Give me PID
+    B-->>P: PID: 2001
+    P->>B: Batch1 again · PID 2001 · baseSequence 3 · lastSequence 5
+    Note over B: PID 2001 is new, so the sequence check passes &lt;br/&gt; E1, E2, E3 written AGAIN → DUPLICATE &lt;br/&gt; state: 1001 · A · P0 · 5 and 2001 · A · P0 · 5
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The producer re-sends the same batch after restarting — perhaps because it is reading from an upstream database and does not see a “processed” flag yet. The broker deduplicates per <strong>(PID, partition, sequence)</strong>. Because the PID changed from 1001 to 2001, the broker sees a brand-new producer at sequence 3 and writes the events a <strong>second time</strong>. Idempotency only protects retries <strong>within one producer session</strong>.</p>
+  </div>
+</div>
+
+<h3 id="problem-partial">Problem 2: Partial writes</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">three independent sends</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// success
+kafkaTemplate.send("order-events", order);
+
+// success
+kafkaTemplate.send("payment-events", payment);
+
+// Fails (broker down or network issue)
+kafkaTemplate.send("inventory-events", stock);</code></pre>
+</div>
+<div class="callout danger"><span class="ci">&#10060;</span><div><p><strong>Outcome:</strong> <code>order-events</code> and <code>payment-events</code> have records, but <code>inventory-events</code> does <strong>not</strong>. Consumers see partial data, which can lead to an <strong>inconsistent state</strong>: the payment was made, but the stock was <strong>not reserved</strong>.</p></div></div>
+
+<h3 id="problem-duplicate">Problem 3: Duplicate processing (read-process-write)</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Crash between publishing and committing</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant B as Broker
+    participant C as Consumer
+    C->>B: poll()
+    B-->>C: Record (offset 50)
+    Note over C: Processed record
+    C->>B: Publish another event send()
+    C--xB: Offset commit (lost / crashed)
+    C->>B: poll()
+    B-->>C: Record (offset 50) again
+    Note over C: Processed record again
+    C->>B: Publish another event send() → DUPLICATE
+</div>
+  </div>
+  <div class="diagram-explain"><p>The output event and the offset commit are <strong>two separate writes</strong>. If the consumer dies after <code>send()</code> but before the commit, offset 50 is delivered again, processed again, and the output event is <strong>published twice</strong>. The cure is to make the output event and the offset commit part of <strong>one transaction</strong>; the consumer side is covered in <a href="11-transactions-consumer.html">Transactions (Consumer)</a>.</p></div>
+</div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div><p><strong>Solution: Transactions in Kafka.</strong> All writes in a transaction become visible together or not at all (atomic), and the PID survives restarts. The rest of this chapter walks the protocol step by step.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step1"><span class="sec-num">2</span>Step 1: Transaction Id</h2>
+<ul class="points">
+  <li>Each producer assigns itself a <strong>unique transaction id</strong>.</li>
+  <li>If the producer application has <strong>multiple instances</strong>, each instance must have a <strong>different</strong> unique id.</li>
+  <li>The id must be <strong>stable</strong>: when the application restarts, it must not change.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — choosing the prefix</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># Good: Kubernetes injects HOSTNAME (stable per pod, e.g. StatefulSet order-serv-0)
+spring.kafka.producer.transaction-id-prefix=order-serv-${HOSTNAME}-
+
+# Good: if each instance has a different port
+spring.kafka.producer.transaction-id-prefix=order-serv-${server.port}-
+
+# Don't do this for uniqueness: the id changes on every restart
+spring.kafka.producer.transaction-id-prefix=order-serv-${random.uuid}-</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p><strong>Why not <code>${random.uuid}</code>?</strong> With every restart the id changes, which breaks the transaction guarantees: the coordinator can no longer link the new instance to its old, unfinished transaction. <code>${HOSTNAME}</code> is stable only when the pod name is stable (a StatefulSet); a Deployment gives each new pod a random name.</p></div></div>
+<p>Why does each instance need its own unique id? To avoid <strong>zombies</strong>, using <a href="#zombie-fencing">Zombie Fencing</a>. We cover that after Step 3, once the PID and epoch are in place. Spring adds a suffix to the prefix (for example <code>order-serv-0</code>, <code>order-serv-1</code>) for each producer it creates.</p>
+
+<!-- ======================================================= -->
+<h2 id="step2"><span class="sec-num">3</span>Step 2: Find the Transaction Coordinator</h2>
+<ul class="points">
+  <li>The internal topic <strong><code>__transaction_state</code></strong> holds the transaction information — consider it the <strong>brain</strong> of transactions.</li>
+  <li><code>__transaction_state</code> has <strong>50 partitions</strong>, divided among the brokers.</li>
+  <li>A given producer's transactions always go to <strong>one specific partition</strong>.</li>
+</ul>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Topic: __transaction_state</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Partition:
+  P0  - Leader Broker1
+  P1  - Leader Broker2
+  P2  - Leader Broker3
+  .
+  .
+  P49 - Leader Broker1</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">example</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Producer Transaction-id = "order-serv-0"
+Partition = hash("order-serv-0") % 50 = Partition 23
+Leader of Partition 23 = Broker2
+
+→ Broker2 is the "Transaction Coordinator"
+  for transaction-id "order-serv-0"</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">FindCoordinator (done once)</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant P as Producer (txn-id order-serv-0)
+    participant AB as Any Broker
+    participant TC as Transaction Coordinator (Leader of __transaction_state P23)
+    P->>AB: FindCoordinatorRequest (Type = Transaction, Key = "order-serv-0")
+    Note over AB: hash("order-serv-0") % 50 = 23 &lt;br/&gt; Leader of Partition 23 = Broker-2
+    AB-->>P: Coordinator Response: Broker-2
+    Note over P,TC: all further transaction requests go to Broker-2
+</div>
+  </div>
+  <div class="diagram-explain"><p>This mirrors how a consumer finds its Group Coordinator with <code>__consumer_offsets</code> (<a href="09-consumer-setup-part3.html#step2">Consumer Part 3</a>), only keyed by <strong>transaction id</strong> instead of group id.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step3"><span class="sec-num">4</span>Step 3: Get the Producer ID and Epoch</h2>
+<ul class="points">
+  <li>Using transactions in Kafka <strong>also enables idempotency</strong> internally, and idempotency needs a PID.</li>
+  <li>In short, the idempotent producer ensures <strong>no duplicates</strong> (even with retries) and <strong>ordering per partition</strong> (via sequence numbers). Transactions need idempotency so that retries are safe.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">InitProducerId (done once)</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant P as Producer (txn-id order-serv-0)
+    participant TC as Transaction Coordinator
+    participant TS as __transaction_state P23
+    P->>TC: InitProducerIdRequest (Transaction id = "order-serv-0")
+    TC->>TS: Write: id "order-serv-0" · PID 5 · Epoch 0 · State Empty · Partitions []
+    TC-->>P: Response: { PID = 5, Epoch = 0 }
+</div>
+  </div>
+  <div class="diagram-explain"><p>Recall the idempotency problem: the controller did not store any producer → PID mapping, so a restarted producer always got a new PID. <strong>This is resolved with transactions</strong>, because <code>__transaction_state</code> holds the mapping.</p></div>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">__transaction_state entry</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Transaction Id -&gt; {
+    PID,
+    Epoch,
+    State,
+    Partitions involved,
+    Timeout
+}</code></pre>
+  </div>
+  <div class="table-wrap" style="margin:0">
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td>PID</td><td>The unique Producer ID.</td></tr>
+        <tr><td>Epoch</td><td>The producer's version number (0, 1, 2 …).</td></tr>
+        <tr><td>State</td><td>Transaction state (below).</td></tr>
+        <tr><td>Partitions involved</td><td>Partitions in the ongoing transaction, e.g. <code>[{Topic-A, Partition2}, {Topic-B, Partition1}]</code></td></tr>
+        <tr><td>Timeout</td><td>Max time the transaction can stay ONGOING; after that the coordinator ABORTs it.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Transaction states</span><span class="db">state diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+stateDiagram-v2
+    direction LR
+    [*] --> EMPTY
+    EMPTY --> ONGOING: first send
+    ONGOING --> PREPARE_COMMIT: commit
+    ONGOING --> PREPARE_ABORT: abort or timeout
+    PREPARE_COMMIT --> COMMIT
+    PREPARE_ABORT --> ABORT
+    COMMIT --> ONGOING: next transaction
+    ABORT --> ONGOING: next transaction
+</div>
+  </div>
+  <div class="diagram-explain"><p>The final states appear in the broker as <code>COMPLETE_COMMIT</code> and <code>COMPLETE_ABORT</code> (the notes write them as COMMIT / COMMIT_COMPLETED and ABORT / COMPLETED_ABORT).</p></div>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div>
+  <b class="ct">Advantages of keeping this mapping</b>
+  <ol style="margin:6px 0 0">
+    <li>A producer with the same transaction id <strong>always gets the same PID</strong>, even after a restart. The duplicate problem from Problem 1 is solved.</li>
+    <li><strong>PID + Epoch</strong> enables <strong>Zombie Fencing</strong>.</li>
+  </ol>
+</div></div>
+
+<h3 id="zombie-fencing">Zombie fencing</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Old producer (epoch 0) is fenced by the new one (epoch 1)</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:zombieFencing-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ol class="steps">
+      <li><strong>Producer1</strong> (txn.id T1) initialises and gets <strong>PID 5, Epoch 0</strong>. The coordinator stores T1 as EMPTY.</li>
+      <li>Producer1 begins a transaction and sends to <code>order-events P0</code> and <code>payment-events P2</code>. T1 becomes ONGOING with those two partitions.</li>
+      <li>Producer1 hits a <strong>network pause</strong>. It is considered inactive, and a new <strong>Producer2</strong> with the same transaction id T1 takes its place.</li>
+      <li>Producer2 sends InitProducerId for T1. The coordinator finds the mapping, <strong>ABORTs the ongoing transaction</strong>, <strong>increases the epoch</strong> to 1 and returns <strong>PID 5, Epoch 1</strong>.</li>
+      <li>Somehow the old Producer1 becomes active again and sends COMMIT with <strong>epoch 0</strong>. The latest version for T1 is epoch 1, so the coordinator rejects it with <code>ProducerFencedException</code>. The request came from a <strong>zombie</strong>.</li>
+    </ol>
+    <p>This is why every instance needs its own <strong>stable</strong> transaction id: the id is how the coordinator recognises “the same producer, restarted” and fences off the old copy.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step4"><span class="sec-num">5</span>Step 4: Begin the Transaction and Send Events</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">AddPartitionsToTxn before the first write to each partition</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant P as Producer (order-serv-0)
+    participant TC as Transaction Coordinator
+    participant TS as __transaction_state P23
+    participant B1 as Broker-1 (leader order-events P2)
+    participant B2 as Broker-2 (leader payment-events P1)
+    Note over P: begin_transaction
+    Note over P: First: send("order-events", key, order)
+    P->>TC: AddPartitionsToTxnRequest {order-serv-0, PID 5, Epoch 0} · order-events P2
+    TC->>TS: State ONGOING · Partitions [{order-events, P2}]
+    TC-->>P: OK
+    P->>B1: send("order-events", key, order) · header has PID + Epoch
+    B1-->>P: ACK
+    Note over P: Second: send("payment-events", key, payment)
+    P->>TC: AddPartitionsToTxnRequest {order-serv-0, PID 5, Epoch 0} · payment-events P1
+    TC->>TS: Partitions [{order-events, P2}, {payment-events, P1}]
+    TC-->>P: OK
+    P->>B2: send("payment-events", key, payment) · header has PID + Epoch
+    B2-->>P: ACK
+</div>
+  </div>
+  <div class="diagram-explain"><p><code>beginTransaction()</code> itself makes no network call. Each <code>send()</code> to a partition that is <strong>new to this transaction</strong> is intercepted: the producer first registers that partition with the coordinator, so the coordinator knows exactly where to write the commit/abort markers later. Every record carries the <strong>PID and epoch</strong> in its batch header.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step5"><span class="sec-num">6</span>Step 5: Two-Phase Commit Protocol</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Phase 1: PREPARE · Phase 2: write markers and finalise</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant P as Producer (order-serv-0)
+    participant TC as Transaction Coordinator
+    participant TS as __transaction_state P23
+    participant B1 as Broker-1 (order-events P2)
+    participant B2 as Broker-2 (payment-events P1)
+    Note over P: commit transaction
+    P->>TC: EndTxnRequest (order-serv-0, PID 5, Epoch 0)
+    TC->>TS: PREPARE (point of no return) · State PREPARE_COMMIT
+    Note over TS: wait for replication to all ISR of P23
+    TC->>B1: Commit marker · PID 5, Epoch 0
+    Note over B1: adds CONTROL record COMMIT
+    B1-->>TC: done
+    TC->>B2: Commit marker · PID 5, Epoch 0
+    Note over B2: adds CONTROL record COMMIT
+    B2-->>TC: done
+    TC->>TS: FINALIZE · State COMMIT_COMPLETED
+    TC-->>P: Return: Success
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><strong>PREPARE_COMMIT is the point of no return.</strong> The coordinator waits until it is replicated to all ISRs of <code>__transaction_state</code> P23. After that, whatever happens (even a broker failure), the commit will ultimately be retried and completed.</li>
+      <li>The coordinator then writes a <strong>COMMIT control record</strong> (marker) into every partition involved: order-events P2 on Broker-1 and payment-events P1 on Broker-2.</li>
+      <li>When all markers are written, it records the final state and returns success to the producer.</li>
+    </ul>
+    <p>In the real protocol the producer gets its response once PREPARE_COMMIT is durable; the markers are written asynchronously after that.</p>
+  </div>
+</div>
+<p><strong>Abort</strong> works the same way, with no other difference: first <code>PREPARE_ABORT</code> is written, then every partition in the transaction gets an <strong>ABORT</strong> control record, and finally the completed-abort state is stored. When a new transaction starts, the whole process repeats from <a href="#step4">Step 4</a>.</p>
+
+<!-- ======================================================= -->
+<h2 id="implementation"><span class="sec-num">7</span>Implementation with Spring Kafka</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.producer.transaction-id-prefix=order-serv-
+
+# 60 sec timeout for transaction
+spring.kafka.producer.properties.transaction.timeout.ms=60000</code></pre>
+</div>
+<p>Setting <code>transaction-id-prefix</code> is all it takes for Spring Boot to create a transactional producer factory (which also turns on idempotence).</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderController.java — just a controller method</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@PostMapping("/txn-commit")
+public ResponseEntity&lt;String&gt; txnCommit(@RequestBody Order order) {
+    Payment payment = new Payment("PAY-" + order.getOrderId(), order.getCustomerId(), order.getTotalAmount(), "PAID");
+    String result = orderProducerService.sendTransactionalCommit(order, payment);
+    return ResponseEntity.ok(result);
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderProducerService.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Autowired
+KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+
+public String sendTransactionalCommit(Order order, Payment payment) {
+
+    return kafkaTemplate.executeInTransaction(ops -&gt; {
+
+        // Send 1: order-events
+        SendResult&lt;String, Object&gt; orderResult = ops.send("order-events", order.getOrderId(), order).join();
+
+        // Send 2: payment-events (same transaction)
+        SendResult&lt;String, Object&gt; paymentResult = ops.send("payment-events", payment.getPaymentId(), payment).join();
+
+        return "COMMITTED";
+    });
+}</code></pre>
+</div>
+<p>All the <code>send()</code> calls that need to be atomic must happen <strong>within the same transaction</strong>, i.e. inside <code>executeInTransaction</code>. A simplified sketch of what that method does:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaTemplate.executeInTransaction (simplified)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public &lt;T&gt; T executeInTransaction(OperationsCallback&lt;K, V, T&gt; callback) {
+    producer = producerFactory.createProducer(this.transactionIdPrefix);
+    producer.beginTransaction();
+    try {
+        T result = callback.doInOperations(this);
+        producer.commitTransaction();
+        return result;
+    }
+    catch (Exception ex) {
+        producer.abortTransaction();
+        throw ex;
+    }
+}</code></pre>
+</div>
+<div class="callout key"><span class="ci">&#9203;</span><div>
+  <b class="ct">Why <code>join()</code> matters</b>
+  <p>Recall from <a href="04-producer-setup.html">Producer Setup</a> that <code>send()</code> is <strong>asynchronous</strong>: the application thread's work ends once the record is handed to the pipeline, and it is free to take other requests. The rest happens in the background.</p>
+  <div class="stages" style="margin:10px 0"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st done">1 · Serializer</span><span class="ar">&rarr;</span><span class="st done">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st done">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st">4 · Compression</span><span class="ar">&rarr;</span><span class="st on">5 · Sender Thread</span></div>
+  <p>With <code>join()</code> the application thread <strong>waits for the ACK</strong>. If any send fails, the exception is thrown inside the callback and the transaction is <strong>aborted</strong>. Note that <code>commitTransaction()</code> also flushes pending sends, so the transaction stays atomic either way; <code>join()</code> makes the failure surface right at the failing send.</p>
+</div></div>
+
+<h3 id="logs">What the logs show</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump both partitions — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-events-0/00000000000000000000.log
+$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/payment-events-0/00000000000000000000.log</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump both partitions — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-events-0/00000000000000000000.log
+&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/payment-events-0/00000000000000000000.log</code></pre>
+</div>
+</div>
+<p>The partition directories depend on which partition each key landed in; adjust the paths to match your topics.</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events log</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774875887784 size: 243 magic: 2 compresscodec: snappy crc: 1578994549 isvalid: true
+| offset: 0 CreateTime: 1774875887784 keySize: 4 valueSize: 113 sequence: 0 headerKeys: [__TypeId__] key: O-33 payload: {"orderId":"O-33","customerId":"CUST-2","productId":"PROD-3","quantity":1,"totalAmount":99.99,"status":"CREATED"}
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: true deleteHorizonMs: OptionalLong.empty position: 243 CreateTime: 1774875888150 size: 78 magic: 2 compresscodec: none crc: 2450373141 isvalid: true
+| offset: 1 CreateTime: 1774875888150 keySize: 4 valueSize: 6 sequence: -1 headerKeys: [] endTxnMarker: COMMIT coordinatorEpoch: 0</code></pre>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">payment-events log</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774875888100 size: 216 magic: 2 compresscodec: snappy crc: 2150642178 isvalid: true
+| offset: 0 CreateTime: 1774875888100 keySize: 8 valueSize: 82 sequence: 0 headerKeys: [__TypeId__] key: PAY-O-33 payload: {"paymentId":"PAY-O-33","customerId":"CUST-2","totalAmount":99.99,"status":"PAID"}
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: true deleteHorizonMs: OptionalLong.empty position: 216 CreateTime: 1774875888151 size: 78 magic: 2 compresscodec: none crc: 3247449494 isvalid: true
+| offset: 1 CreateTime: 1774875888151 keySize: 4 valueSize: 6 sequence: -1 headerKeys: [] endTxnMarker: COMMIT coordinatorEpoch: 0</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">order-events</span>
+    <div class="cells"><span class="cell new">offset 0<small>O-33 data</small></span><span class="cell">offset 1<small>COMMIT marker</small></span></div>
+  </div>
+  <div class="row"><span class="lab">payment-events</span>
+    <div class="cells"><span class="cell new">offset 0<small>PAY-O-33 data</small></span><span class="cell">offset 1<small>COMMIT marker</small></span></div>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Field</th><th>Data batch (offset 0)</th><th>Control batch (offset 1)</th></tr></thead>
+    <tbody>
+      <tr><td><code>producerId</code> / <code>producerEpoch</code></td><td>0 / 0</td><td>0 / 0 — the same PID + epoch in both topics</td></tr>
+      <tr><td><code>isTransactional</code></td><td>true</td><td>true</td></tr>
+      <tr><td><code>isControl</code></td><td>false</td><td><strong>true</strong></td></tr>
+      <tr><td>sequence</td><td>0</td><td>-1 (markers carry no sequence)</td></tr>
+      <tr><td>content</td><td>the order / payment JSON</td><td><code>endTxnMarker: COMMIT</code> — whether COMMIT or ABORT</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The header has the PID, epoch and <code>isTransactional</code> info, and each partition ends the transaction with a <strong>control record</strong>. The marker uses up an offset (offset 1), so offsets of a transactional topic have <strong>gaps</strong> when seen by a consumer — that's normal. How consumers use these markers is the topic of <a href="11-transactions-consumer.html">Transactions (Consumer)</a>.</p></div></div>

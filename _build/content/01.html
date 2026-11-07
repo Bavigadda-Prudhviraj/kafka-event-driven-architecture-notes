@@ -1,0 +1,471 @@
+<!--meta
+{
+  "lead": "Why modern distributed systems move from synchronous REST call chains to events — what an event is, how events flow through a broker, the Pub/Sub and Streaming models, and when Event Driven Architecture is (and is not) the right choice. This chapter is the foundation for everything Kafka does.",
+  "date": "Thursday, 12 February 2026",
+  "related": [
+    { "n": 2, "why": "How Kafka implements the streaming model: brokers, topics, partitions, offsets." },
+    { "n": 5, "why": "Duplicate events are normal in EDA — see how idempotent producers handle them." },
+    { "n": 8, "why": "Poison messages and how consumers deal with failing records." },
+    { "n": 12, "why": "Schema evolution — keeping producers and consumers compatible." },
+    { "n": 13, "why": "Reliably publishing events while updating a database." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">What you will learn</b>
+    <p>The definition of EDA and an <em>event</em>; a side-by-side comparison of an order flow built with synchronous REST calls versus events; the five problems of synchronous chains; the advantages and key components of EDA; Push vs Pull delivery; Pub/Sub vs Streaming models (RabbitMQ vs Kafka); the seven challenges of EDA; and the four use-cases where EDA is the right choice.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="what-is-eda"><span class="sec-num">1</span>What is Event Driven Architecture (EDA)?</h2>
+
+<p>Event Driven Architecture can be considered as a <strong>system design style</strong> where:</p>
+
+<div class="grid grid-2">
+  <div class="card feature red">
+    <span class="icon">&#10007;</span>
+    <h4>Services do not call each other directly</h4>
+    <p>There is no service-to-service REST call where one service waits for another one to answer.</p>
+  </div>
+  <div class="card feature green">
+    <span class="icon">&#10003;</span>
+    <h4>Services emit events, others react</h4>
+    <p>Instead, a service <strong>emits an event</strong> (a fact that something happened) and the other services that are interested <strong>react to those events</strong>.</p>
+  </div>
+</div>
+
+<p>In other words, the producer of the information no longer needs to know <em>who</em> needs the information or <em>how</em> to reach them. It simply announces what happened, and every interested service decides on its own what to do about it.</p>
+
+<!-- ======================================================= -->
+<h2 id="what-is-event"><span class="sec-num">2</span>What is an Event?</h2>
+
+<div class="callout note">
+  <span class="ci">&#128204;</span>
+  <div><b class="ct">Definition</b><p>An event is <strong>a fact that something happened in the past</strong>.</p></div>
+</div>
+
+<p>Every event has three properties:</p>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Property</th><th>Description</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>Immutable</td><td>Can not be changed once created.</td><td><code>OrderCreated</code> at 10:30 PM</td></tr>
+      <tr><td>Past Tense</td><td>Describes <strong>what happened</strong>, not what to do.</td><td><code>OrderCreated</code>, <em>not</em> <code>Place Order</code></td></tr>
+      <tr><td>Self-Contained</td><td>Has all info needed to understand it.</td><td>Contains <code>orderId</code>, <code>amount</code>, <code>timestamp</code>.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="grid grid-3">
+  <div class="card feature"><span class="icon">&#128274;</span><h4>Immutable</h4><p>Because the event records something that already happened at 10:30 PM, that fact can never be edited — a correction would be a <em>new</em> event.</p></div>
+  <div class="card feature teal"><span class="icon">&#8634;</span><h4>Past Tense</h4><p><code>OrderCreated</code> states a fact. <code>Place Order</code> would be a command telling someone what to do — that is not an event.</p></div>
+  <div class="card feature blue"><span class="icon">&#128230;</span><h4>Self-Contained</h4><p>A consumer can act on the event without calling back the producer, because <code>orderId</code>, <code>amount</code> and <code>timestamp</code> travel inside it.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="rest-microservices"><span class="sec-num">3</span>Order Flow in REST Distributed Microservices</h2>
+
+<p>To see why EDA is needed, first look at a typical order flow built with synchronous REST calls. The <strong>OrderService</strong> orchestrates every step and calls each downstream service one after another, waiting for each response before moving on.</p>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">REST (synchronous) order flow</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant U as User
+    participant O as OrderService
+    participant P as PaymentService
+    participant I as InventoryService
+    participant N as NotificationService
+    U->>O: Place order
+    O->>I: Check Real time Inventory
+    I-->>O: response
+    O->>P: Process Payment
+    P-->>O: response
+    O->>I: Reserve Inventory
+    I-->>O: response
+    O->>N: Send Notification
+    N-->>O: response
+    O-->>U: Order Placed
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>How this flow works</h4>
+    <p><strong>Participants:</strong> the <em>User</em> and four microservices — <em>OrderService</em>, <em>PaymentService</em>, <em>InventoryService</em> and <em>NotificationService</em>. Solid arrows are requests; dashed arrows are the responses OrderService must wait for.</p>
+    <ol class="steps">
+      <li><strong>Place order</strong> — the user sends the order request to OrderService and keeps waiting.</li>
+      <li><strong>Check Real time Inventory</strong> — OrderService calls InventoryService and blocks until it replies.</li>
+      <li><strong>Process Payment</strong> — only after inventory answers, OrderService calls PaymentService and blocks again.</li>
+      <li><strong>Reserve Inventory</strong> — another blocking call to InventoryService.</li>
+      <li><strong>Send Notification</strong> — a final blocking call to NotificationService.</li>
+      <li><strong>Order Placed</strong> — only when <em>every</em> call has succeeded does the user get the response.</li>
+    </ol>
+    <p>The whole chain is <strong>synchronous</strong>: the user's request is held open across four network hops, and OrderService has to know the address, invocation style and response structure of every other service.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="sync-problems"><span class="sec-num">4</span>Problems with the Synchronous Chain</h2>
+
+<ol class="points red">
+  <li><b>Availability</b>All services must be available at the same time. If any one service is down, the request will fail.</li>
+  <li><b>Latency Accumulation</b>
+    <p><code>Total Latency = Sum of all service latencies</code>. Each hop adds its own response time to what the user experiences.</p>
+  </li>
+  <li><b>Cascading Failure</b>One slow service can bring down other services and the entire flow, because callers keep waiting (and holding resources) on it.</li>
+  <li><b>Tight Coupling</b>In the example above, OrderService knows about Payment, Inventory and Notification service — their endpoints, how to invoke them, their response structure, etc. Any change in them forces a change in OrderService.</li>
+  <li><b>Scaling issue</b>We can not scale one service independently based on load — the chain is only as fast as all of its parts together.</li>
+</ol>
+
+<div class="card">
+  <div class="card-title">&#9201; Latency accumulation — illustrated</div>
+  <p>If the user's request passes through four sequential calls, the user waits for all of them:</p>
+  <div class="code terminal">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">latency formula</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Total Latency = latency(Check Inventory) + latency(Process Payment)
+              + latency(Reserve Inventory) + latency(Send Notification)</code></pre>
+  </div>
+  <p>Event Driven Architecture removes the non-critical steps from this path, which is why <em>improvement in latency</em> appears among its advantages below.</p>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="eda-microservices"><span class="sec-num">5</span>Order Flow in Event Driven Architecture (EDA) Distributed Microservices</h2>
+
+<div class="callout warn">
+  <span class="ci">&#9888;</span>
+  <div><p><strong>Note:</strong> It's just an example to understand EDA.</p></div>
+</div>
+
+<p>The same order flow is now rebuilt around an <strong>Event Router</strong>. Only the steps the user must wait for remain synchronous; everything else happens through events.</p>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">EDA order flow — three processing phases</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+    <div class="chips">
+      <span class="chip"><i style="background:#fca5a5"></i>Real time Processing</span>
+      <span class="chip"><i style="background:#86efac"></i>Async &amp; Parallel Processing</span>
+      <span class="chip"><i style="background:#93c5fd"></i>Async Processing</span>
+    </div>
+<div class="mermaid wide">
+sequenceDiagram
+    participant U as User
+    participant O as OrderService
+    participant R as Event Router
+    participant P as PaymentService
+    participant I as InventoryService
+    participant N as NotificationService
+    rect rgba(239, 68, 68, 0.10)
+    Note over U,I: (Real time Processing)
+    U->>O: Place order
+    O->>I: Check Real time Inventory
+    I-->>O: response
+    O->>O: Save Order (status = PENDING)
+    O->>R: Publish: OrderCreated
+    O-->>U: Order Accepted
+    end
+    rect rgba(34, 197, 94, 0.10)
+    Note over R,I: Async & Parallel Processing
+    R->>P: Push OrderCreated Event
+    R->>I: Push OrderCreated Event
+    P->>P: Process Payment
+    I->>I: Reserve Inventory
+    P->>R: Publish: PaymentSuccess
+    I->>R: Publish: ReservationSuccess
+    end
+    rect rgba(59, 130, 246, 0.10)
+    Note over O,N: Async Processing
+    R->>N: Push PaymentSuccess Event
+    R->>O: Push PaymentSuccess Event
+    N->>N: Send email and SMS
+    O->>O: Update Order (status = Completed)
+    end
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Phase 1 — Real time Processing (red)</h4>
+    <ol class="steps">
+      <li><strong>Place order</strong> — the user sends the order to OrderService.</li>
+      <li><strong>Check Real time Inventory</strong> — the only synchronous call that is kept, because the user must know immediately whether the item is available.</li>
+      <li><strong>Save Order (status = PENDING)</strong> — OrderService stores the order locally in a <em>PENDING</em> state.</li>
+      <li><strong>Publish: OrderCreated</strong> — OrderService publishes an <code>OrderCreated</code> event to the Event Router. It does not call Payment, Inventory or Notification itself.</li>
+      <li><strong>Order Accepted</strong> — the user gets a response right away; they do not wait for payment, reservation or notification.</li>
+    </ol>
+    <h4>Phase 2 — Async &amp; Parallel Processing (green)</h4>
+    <ol class="steps">
+      <li>The Event Router <strong>pushes the OrderCreated event</strong> to both PaymentService and InventoryService.</li>
+      <li>Both services work <strong>in parallel</strong>: PaymentService runs <em>Process Payment</em> while InventoryService runs <em>Reserve Inventory</em>.</li>
+      <li>Each publishes its own result back to the router: <code>PaymentSuccess</code> and <code>ReservationSuccess</code>.</li>
+    </ol>
+    <h4>Phase 3 — Async Processing (blue)</h4>
+    <ol class="steps">
+      <li>The Event Router <strong>pushes the PaymentSuccess event</strong> to NotificationService and to OrderService.</li>
+      <li>NotificationService <strong>sends email and SMS</strong>.</li>
+      <li>OrderService <strong>updates the order (status = Completed)</strong>.</li>
+    </ol>
+    <p><strong>Key insight:</strong> OrderService only knows the Event Router. Payment, Inventory and Notification can be added, removed or scaled without changing OrderService, and a slow NotificationService no longer delays the user.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="eda-advantages"><span class="sec-num">6</span>Advantages of Event Driven Architecture</h2>
+
+<div class="grid grid-3">
+  <div class="card feature green"><span class="tag">01</span><span class="icon">&#128279;</span><h4>Loose Coupling</h4><p>No direct REST dependency between services.</p></div>
+  <div class="card feature blue"><span class="tag">02</span><span class="icon">&#128200;</span><h4>Better Scalability</h4><p>Services can scale independently.</p></div>
+  <div class="card feature teal"><span class="tag">03</span><span class="icon">&#128737;</span><h4>Better Resilience</h4><p>A temporary issue does not break the whole system.</p></div>
+  <div class="card feature violet"><span class="tag">04</span><span class="icon">&#9194;</span><h4>Replay</h4><p>We can re-process old events.</p></div>
+  <div class="card feature amber"><span class="tag">05</span><span class="icon">&#9889;</span><h4>Improvement in Latency</h4><p>The user only waits for the real-time part of the flow.</p></div>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Concern</th><th>REST synchronous chain</th><th>Event Driven Architecture</th></tr></thead>
+    <tbody>
+      <tr><td>Coupling</td><td>OrderService knows every downstream service (endpoint, invocation, response).</td><td>Services only know the Event Router — no direct REST dependency.</td></tr>
+      <tr><td>Availability</td><td>All services must be up at the same time.</td><td>A temporary issue does not break the whole system.</td></tr>
+      <tr><td>Latency</td><td>Sum of all service latencies.</td><td>User waits only for the real-time part.</td></tr>
+      <tr><td>Scaling</td><td>Cannot scale one service independently.</td><td>Services scale independently.</td></tr>
+      <tr><td>History</td><td>No record to re-process.</td><td>Old events can be replayed (in the streaming model).</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="eda-components"><span class="sec-num">7</span>Key Event Driven Architecture Components</h2>
+
+<p>From the above understanding, the key EDA components are:</p>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Producer &rarr; Event Router / Broker &rarr; Consumers</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P["Producer"] --> B["Event Router / Broker"]
+    B --> C1["Consumer1"]
+    B --> C2["Consumer2"]
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef brok fill:#ea580c,stroke:#9a3412,color:#fff,stroke-width:2px
+    classDef cons fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:2px
+    class P prod
+    class B brok
+    class C1,C2 cons
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Components</h4>
+    <ul>
+      <li><strong>Producer</strong> — the service that emits events. In the order example, OrderService is a producer of <code>OrderCreated</code>; PaymentService and InventoryService produce <code>PaymentSuccess</code> and <code>ReservationSuccess</code>.</li>
+      <li><strong>Event Router / Broker</strong> — the middle layer that receives events from producers and delivers them to consumers. Producers and consumers never talk to each other directly; they only talk to the broker.</li>
+      <li><strong>Consumers (Consumer1, Consumer2)</strong> — the services that react to events. A single event can reach many consumers, e.g. both PaymentService and InventoryService receive <code>OrderCreated</code>.</li>
+    </ul>
+    <p>A service can be a producer and a consumer at the same time — PaymentService consumes <code>OrderCreated</code> and produces <code>PaymentSuccess</code>.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="push-vs-pull"><span class="sec-num">8</span>How Do Events Move Through EDA? Push vs Pull</h2>
+
+<p>Once the broker has an event, there are two ways it can reach the consumer.</p>
+
+<h3 id="push">Push</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Push model</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant Pr as Producer
+    participant B as Broker
+    participant C as Consumer
+    Pr->>B: Publish Message
+    B->>C: Push Messages (Immediately)
+    B->>C: Push Messages
+    B->>C: Push Messages
+    Note right of C: Consumer must handle whatever rate broker sends
+    Note right of C: Consumer can get overwhelmed
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>How push works</h4>
+    <ol class="steps">
+      <li>The producer <strong>publishes a message</strong> to the broker.</li>
+      <li>The broker <strong>pushes messages to the consumer immediately</strong>, one after another, as soon as they arrive.</li>
+      <li>The broker decides the rate. The <strong>consumer must handle whatever rate the broker sends</strong>.</li>
+      <li>If messages arrive faster than the consumer can process them, the <strong>consumer can get overwhelmed</strong>.</li>
+    </ol>
+  </div>
+</div>
+
+<h3 id="pull">Pull</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Pull model</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant Pr as Producer
+    participant B as Broker
+    participant C as Consumer
+    Pr->>B: Publish Message
+    Pr->>B: Publish Message
+    Note over B: Messages stored
+    C->>B: Give me messages
+    B-->>C: Take 1 message
+    Note right of C: Process at own pace
+    C->>B: Give me more messages
+    Note over B,C: ... and so on
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>How pull works</h4>
+    <ol class="steps">
+      <li>The producer <strong>publishes messages</strong>; the broker <strong>stores</strong> them instead of forwarding them immediately.</li>
+      <li>The consumer asks the broker: <strong>“Give me messages.”</strong></li>
+      <li>The broker answers with what the consumer asked for (<strong>“Take 1 message”</strong>).</li>
+      <li>The consumer <strong>processes at its own pace</strong>.</li>
+      <li>When ready, it asks again: <strong>“Give me more messages”</strong> — and the cycle repeats.</li>
+    </ol>
+    <p>Because the consumer controls the rate, it cannot be overwhelmed — messages simply wait in the broker until it asks for them.</p>
+  </div>
+</div>
+
+<div class="vs">
+  <div class="side a"><h4>Push</h4><div class="sb"><ul><li>Broker sends messages immediately.</li><li>Broker controls the rate.</li><li>Consumer must keep up — it can get overwhelmed.</li></ul></div></div>
+  <div class="side b"><h4>Pull</h4><div class="sb"><ul><li>Broker stores messages.</li><li>Consumer requests messages when ready.</li><li>Consumer processes at its own pace.</li></ul></div></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="pubsub-vs-streaming"><span class="sec-num">9</span>EDA Models: Pub/Sub vs Streaming</h2>
+
+<div class="vs">
+  <div class="side a">
+    <h4>Pub/Sub</h4>
+    <div class="sb">
+      <ul>
+        <li>Events are published to <strong>active consumers</strong> and then <strong>forgotten</strong>.</li>
+        <li>If a new consumer joined, say, tomorrow, it <strong>won't get yesterday's messages</strong>.</li>
+      </ul>
+      <div class="lbl">Used when</div>
+      <ul><li>We care about just delivery.</li><li>Not about storing history.</li></ul>
+      <div class="lbl">Example</div>
+      <ul><li>RabbitMQ Exchange</li></ul>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Streaming</h4>
+    <div class="sb">
+      <ul>
+        <li>Events are <strong>appended in logs</strong> forever or retention based.</li>
+        <li>If a new consumer joined, say, tomorrow, it can read from the <strong>latest offset</strong> or read from <strong>day 1</strong> (if retention allows).</li>
+      </ul>
+      <div class="lbl">Used when</div>
+      <ul><li>We want replay.</li><li>We want multiple consumers.</li></ul>
+      <div class="lbl">Example</div>
+      <ul><li><strong>Kafka</strong></li></ul>
+    </div>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">What a consumer that joins “tomorrow” can see</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">Pub/Sub</span>
+        <div class="cells">
+          <span class="cell gone">E1<small>day 1</small></span><span class="cell gone">E2<small>day 1</small></span><span class="cell gone">E3<small>day 1</small></span><span class="cell new">E4<small>day 2</small></span><span class="cell new">E5<small>day 2</small></span>
+        </div>
+        <span class="ptr t">new consumer gets only E4, E5</span>
+      </div>
+      <div class="row"><span class="lab">Streaming (log)</span>
+        <div class="cells">
+          <span class="cell">E1<small>offset 0</small></span><span class="cell">E2<small>offset 1</small></span><span class="cell">E3<small>offset 2</small></span><span class="cell">E4<small>offset 3</small></span><span class="cell">E5<small>offset 4</small></span>
+        </div>
+        <span class="ptr">read from day 1 (offset 0) or from latest</span>
+      </div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Reading the visualisation</h4>
+    <ul>
+      <li><strong>Pub/Sub:</strong> E1–E3 were published yesterday to the consumers that were active then, and then forgotten (shown struck-through). A consumer that joins today only receives the new events E4 and E5.</li>
+      <li><strong>Streaming:</strong> every event is appended to a log and keeps its position (<em>offset</em>). Nothing is removed on delivery — only when the retention period expires. A consumer that joins today chooses where to start: from the <em>latest offset</em> (only new events) or from <em>day 1</em> (replay everything still retained). Because the log is not consumed destructively, many consumers can read the same events independently.</li>
+    </ul>
+    <p>This is exactly the model Apache Kafka follows, which is why <em>replay</em> and <em>multiple consumers</em> come naturally with Kafka. The next chapter explains how Kafka stores this log.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="eda-challenges"><span class="sec-num">10</span>Challenges of Event Driven Architecture</h2>
+
+<p>EDA is not free. These are the problems that come with it — many of the following chapters show how Kafka addresses them.</p>
+
+<ol class="points amber">
+  <li><b>Eventual Consistency</b>As events are processed in an async manner, a GET call might return stale data, but subsequent calls might give up-to-date information. (In the example, the order stays <code>PENDING</code> until the <code>PaymentSuccess</code> event is processed.)</li>
+  <li><b>Duplicate events</b>Most event routers guarantee <strong>“at-least once delivery”</strong>. So duplicates are normal, and consumers must be prepared for them.</li>
+  <li><b>Ordering problems</b>Events might reach the consumer out-of-order.</li>
+  <li><b>Schema evolution</b>If the event schema breaks, all consumers will crash.</li>
+  <li><b>Debugging complexity</b>Distributed tracing across async hops is a little difficult.</li>
+  <li><b>Poison messages</b>One bad message can block the Event Router.</li>
+  <li><b>Operational overhead</b>We must monitor for:
+    <ul><li>Consumer lag</li><li>Throughput</li><li>Partition, queue etc.</li></ul>
+  </li>
+</ol>
+
+<!-- ======================================================= -->
+<h2 id="eda-use-cases"><span class="sec-num">11</span>Use-cases of EDA — When to Go for It</h2>
+
+<ol class="points green">
+  <li><b>1 event &rarr; N consumers</b>When one action must trigger multiple independent actions. For example, when <code>OrderPlaced</code> happens, then:
+    <ul><li>Inventory reserves</li><li>Payment charges</li><li>Email sent</li><li>Loyalty points added</li><li>Analytics updated</li></ul>
+  </li>
+  <li><b>Long running business workflow</b>Example: <code>order &rarr; payment &rarr; shipment &rarr; delivery</code>. These flows take time and can fail midway. Since the flow is not in the critical path, it can be broken into multiple steps, which handles this failure-prone nature better.</li>
+  <li><b>Eventual consistency is acceptable</b>The business can tolerate data being up-to-date a little later rather than instantly.</li>
+  <li><b>Real time analytics</b>Data needs to be continuously processed.</li>
+</ol>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Use-case 1 &amp; 2 at a glance</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+    <div class="grid grid-2" style="margin:0;align-items:center">
+<div class="mermaid">
+flowchart LR
+    E(["OrderPlaced"]) --> A1["Inventory reserves"]
+    E --> A2["Payment charges"]
+    E --> A3["Email sent"]
+    E --> A4["Loyalty points added"]
+    E --> A5["Analytics updated"]
+    classDef ev fill:#ea580c,stroke:#9a3412,color:#fff,stroke-width:2px
+    class E ev
+</div>
+<div class="mermaid">
+flowchart LR
+    S1["order"] --> S2["payment"] --> S3["shipment"] --> S4["delivery"]
+</div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><strong>Left — 1 event &rarr; N consumers:</strong> a single <code>OrderPlaced</code> event fans out to five independent reactions. With REST, OrderService would have to call all five; with EDA it publishes once and each consumer reacts on its own.</li>
+      <li><strong>Right — long running business workflow:</strong> a long-running workflow broken into steps. Each step is triggered by the event of the previous one, so a failure in <em>shipment</em> does not undo the <em>order</em> and <em>payment</em> that already happened — the failing step can be handled on its own.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li><strong>EDA</strong>: services don't call each other; they emit events and others react.</li>
+    <li>An <strong>event</strong> is an immutable, past-tense, self-contained fact (e.g. <code>OrderCreated</code>).</li>
+    <li>Synchronous REST chains suffer from <strong>availability, latency accumulation, cascading failure, tight coupling and scaling</strong> problems.</li>
+    <li>EDA keeps only the real-time part synchronous and moves the rest to <strong>async &amp; parallel</strong> processing through an Event Router.</li>
+    <li>Key components: <strong>Producer &rarr; Event Router / Broker &rarr; Consumers</strong>.</li>
+    <li><strong>Push</strong> can overwhelm consumers; with <strong>Pull</strong> consumers process at their own pace.</li>
+    <li><strong>Pub/Sub</strong> (RabbitMQ Exchange) delivers and forgets; <strong>Streaming</strong> (Kafka) appends to a log, enabling replay and multiple consumers.</li>
+    <li>Challenges: eventual consistency, duplicates, ordering, schema evolution, debugging, poison messages, operational overhead.</li>
+  </ul>
+</div>

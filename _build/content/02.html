@@ -1,0 +1,1393 @@
+<!--meta
+{
+  "lead": "A deep dive into how Kafka is built: producers, topics, partitions, offsets, segment and index files, partitioning strategies, brokers, consumer groups and committed offsets, the cluster with leader/follower replicas, the Controller and KRaft consensus, ISR and acks, the complete write and read flows, log cleanup, why Kafka is fast, and what happens when each component fails.",
+  "date": "Thursday, 19 February 2026 (Kafka Architecture Part 1–5)",
+  "related": [
+    { "n": 1, "why": "Pub/Sub vs Streaming — why Kafka follows the streaming model." },
+    { "n": 3, "why": "Set up the multi-broker cluster described in this chapter." },
+    { "n": 4, "why": "Producer configuration, acks and custom partitioning in code." },
+    { "n": 5, "why": "What retries and acks can cause — duplicates, and how idempotency fixes them." },
+    { "n": 6, "why": "Consumer internals, groups, offsets and rebalancing in practice." },
+    { "n": 9, "why": "Other consumer configurations such as max.poll settings." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">Where this chapter fits</b>
+    <p>In the EDA introduction we already saw the <strong>Pub/Sub model</strong>, the <strong>Streaming model</strong> and the advantages of EDA. Today we start with the most popular streaming model: <strong>Kafka</strong>. The chapter goes from the basic building blocks (producer, topic, partition) to the internals (segments, index files, controller, KRaft, ISR) and ends with complete end-to-end flows and failure scenarios.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="what-is-kafka"><span class="sec-num">1</span>What is Kafka?</h2>
+
+<p>Kafka is a <strong>distributed event streaming platform</strong> that allows us to:</p>
+<div class="grid grid-3">
+  <div class="card feature"><span class="icon">&#128228;</span><h4>Publish events</h4><p>Producers write events into Kafka.</p></div>
+  <div class="card feature teal"><span class="icon">&#128190;</span><h4>Store events</h4><p>Events are kept durably in logs (forever or retention based).</p></div>
+  <div class="card feature blue"><span class="icon">&#128229;</span><h4>Subscribe to events</h4><p>Consumers read the events they are interested in.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="producer"><span class="sec-num">2</span>Producer</h2>
+<ul>
+  <li>A producer is an <strong>application that publishes events to Kafka</strong>.</li>
+  <li>A producer <strong>does not care who will consume</strong> this event.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Producer publishes to Kafka</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P["Producer"] -->|"publish event"| K["Kafka"]
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef kaf fill:#ea580c,stroke:#9a3412,color:#fff,stroke-width:2px
+    class P prod
+    class K kaf
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The arrow only goes one way: the producer hands the event to Kafka and its job is done. There is no consumer in this picture because the producer is completely decoupled from whoever reads the event later — this is the loose coupling from the EDA chapter.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="topic"><span class="sec-num">3</span>Topic</h2>
+<ul>
+  <li>Consider a topic as a <strong>category or folder</strong> to which events are published.</li>
+  <li><strong>Many producers can write to the same topic.</strong></li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Many producers &rarr; one topic</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P1["Producer1"] --> T["order-events"]
+    P2["Producer2"] --> T
+    subgraph TOPIC["Topic"]
+      T
+    end
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef top fill:#fff4ec,stroke:#dc2626,color:#7c2d12,stroke-width:2px
+    class P1,P2 prod
+    class T top
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p><code>Producer1</code> and <code>Producer2</code> both publish into the same topic, <code>order-events</code>. The topic is a <em>logical</em> name that groups all order-related events together, no matter which application produced them.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="partition"><span class="sec-num">4</span>Partition</h2>
+<div class="callout note"><span class="ci">&#128204;</span><div><p>A partition is a <strong>physical, ordered and append-only log</strong> that is part of a topic. A topic can have <strong>many partitions</strong>.</p></div></div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Topic order-events with 3 partitions</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    PR["Producer1"] --> T
+    subgraph T["Topic name = order-events"]
+      direction TB
+      p0["P0"]
+      p1["P1"]
+      p2["P2"]
+    end
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef part fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    class PR prod
+    class p0,p1,p2 part
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The topic <code>order-events</code> is split into three partitions <strong>P0, P1 and P2</strong>. Each partition is its own independent log; the producer's events are spread across them. Let's understand each word of the definition: <em>physical</em>, <em>ordered</em> and <em>append-only</em>.</p>
+  </div>
+</div>
+
+<h3 id="physical">Physical</h3>
+<p>Events are <strong>actually stored on disk inside the partition</strong>. Each partition is a log file on disk named <code>&lt;topic&gt;-&lt;partition&gt;</code>:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">on-disk layout</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Topic: order-events
+ ├── Partition0: order-events-0   (partition0 log file)
+ ├── Partition1: order-events-1   (partition1 log file)
+ └── Partition2: order-events-2   (partition2 log file)</code></pre>
+</div>
+
+<h3 id="ordered">Ordered</h3>
+<p>Events are <strong>written sequentially and assigned incrementing offsets</strong>. Consumers read them in offset order.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Events and offsets inside each partition</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">P0</span><div class="cells"><span class="cell">E0<small>Offset1</small></span><span class="cell">E3<small>Offset2</small></span></div></div>
+      <div class="row"><span class="lab">P1</span><div class="cells"><span class="cell">E1<small>Offset1</small></span><span class="cell">E4<small>Offset2</small></span></div></div>
+      <div class="row"><span class="lab">P2</span><div class="cells"><span class="cell">E2<small>Offset1</small></span></div></div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>How offsets are assigned</h4>
+    <ul>
+      <li>Each partition maintains its own <strong>next offset counter</strong>.</li>
+      <li>When a new event arrives, Kafka <strong>assigns the next offset</strong> to that event and <strong>appends the event to the log</strong>.</li>
+      <li>Here Producer1 sent E0…E4. E0 and E3 landed in P0 (Offset1, Offset2), E1 and E4 in P1, and E2 in P2. Offsets restart in every partition because each partition has its own counter.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="card feature green"><span class="icon">&#10003;</span><h4>Within a single partition — order is guaranteed</h4><p>Events are written sequentially and read in increasing offset manner. Kafka does <strong>not</strong> re-order events in a partition.</p></div>
+  <div class="card feature red"><span class="icon">&#10007;</span><h4>No global order across partitions</h4><p>Kafka does not guarantee ORDER globally (across multiple partitions of the topic).</p></div>
+</div>
+<div class="callout warn">
+  <span class="ci">&#9888;</span>
+  <div>
+    <b class="ct">Example</b>
+    <p>In Partition0 (P0) we know that <strong>Event3 happened after Event0</strong>, because Offset2 comes after Offset1 in that partition.</p>
+    <p>But we <strong>cannot guarantee</strong> that Event4 in Partition1 happened after (or before) Event0 in Partition0 — because an offset belongs to a <em>partition</em>, not to the whole topic.</p>
+  </div>
+</div>
+
+<h3 id="append-only">Append-only log</h3>
+<p>Each partition's log file simply contains the events in offset order:</p>
+<div class="grid grid-2">
+  <div class="code">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events-0 / -1 / -2 (log files)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">order-events-0 (log file)
+  Offset1: event0 json
+  Offset2: event3 json
+
+order-events-1 (log file)
+  Offset1: event1 json
+  Offset2: event4 json
+
+order-events-2 (log file)
+  Offset1: event2 json</code></pre>
+  </div>
+  <div class="code">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">new event E5 arrives at Partition2</span><span class="lang">text</span></div>
+<pre><code data-lang="text">order-events-2 (log file)
+  Offset1: event2 json
+  Offset2: event5 json   &lt;-- appended at the end</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Let's say a new event E5 arrives at Partition2 (P2)</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">P0</span><div class="cells"><span class="cell">E0<small>Offset1</small></span><span class="cell">E3<small>Offset2</small></span></div></div>
+      <div class="row"><span class="lab">P1</span><div class="cells"><span class="cell">E1<small>Offset1</small></span><span class="cell">E4<small>Offset2</small></span></div></div>
+      <div class="row"><span class="lab">P2</span><div class="cells"><span class="cell">E2<small>Offset1</small></span><span class="cell new">E5<small>Offset2</small></span></div><span class="ptr t">appended</span></div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The file is <strong>appended with new events in incremental offset manner</strong>. E5 goes to the end of P2's log and gets P2's next offset (Offset2). Nothing in the middle of the file is changed — existing events are never modified.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="segments"><span class="sec-num">5</span>Going One Level Deeper: Segments and Index Files</h2>
+
+<h3 id="segment-files">Segment files</h3>
+<p>The partition log file is further divided into <strong>segments</strong>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Partition log divided into segments</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    T["Topic: order-events"] --> P["Partition0: order-events-0"]
+    P --> S1["Segment1: 000000.log"] -.-> D1["Stores events with offset 0 – 499"]
+    P --> S2["Segment2: 000500.log"] -.-> D2["Stores events with offset 500 – 999"]
+    P --> S3["Segment3: 001000.log"] -.-> D3["Stores events with offset starting from 1000"]
+    classDef seg fill:#eef4ff,stroke:#2563eb,color:#1e3a8a
+    classDef txt fill:#ffffff,stroke:#cbd5e1,color:#3f4859
+    class S1,S2,S3 seg
+    class D1,D2,D3 txt
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Why segments?</h4>
+    <ol class="steps">
+      <li>A consumer can say: <em>“I want to read from Partition0 of order-events, offset 550 to 800.”</em></li>
+      <li>If, instead of one big log file, the log is divided into multiple small segment files, searching can happen faster.</li>
+      <li>Each segment file is named by the first offset it contains, so Kafka can <strong>directly jump to Segment2: 000500.log</strong>.</li>
+    </ol>
+  </div>
+</div>
+
+<h3 id="segment-retention">Retention is applied per segment (7 days / 1 GB)</h3>
+<p>Segments are also the unit Kafka uses when it cleans up old data. With the delete policy configured as <code>retention.ms=604800000</code> (<strong>7 days</strong>) and <code>retention.bytes=1073741824</code> (<strong>1 GB</strong>), Kafka never removes individual events from the middle of a file — it deletes <strong>whole old segment files</strong>.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Which segments of Partition0 survive retention</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">Time based (7 days)</span>
+        <div class="cells">
+          <span class="cell gone">Segment1<small>created 8 days ago</small></span>
+          <span class="cell">Segment2<small>created 6 days ago</small></span>
+          <span class="cell new">Active segment<small>being written</small></span>
+        </div>
+        <span class="ptr" style="background:#dc2626">Segment1 DELETED</span>
+      </div>
+      <div class="row"><span class="lab">Size based (1 GB)</span>
+        <div class="cells">
+          <span class="cell gone">Segment1<small>1 GB</small></span>
+          <span class="cell">Segment2<small>200 MB</small></span>
+        </div>
+        <span class="ptr">total 1.2 GB &gt; 1 GB &rarr; oldest segment deleted</span>
+      </div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Key points</h4>
+    <ul>
+      <li><strong>Retention works on whole segments.</strong> A segment is deleted only when the <em>entire</em> segment is older than <code>retention.ms</code> (e.g. 7 days) — or, for size-based retention, when the partition's total size goes above <code>retention.bytes</code> (e.g. 1 GB) and the <strong>oldest</strong> segment is removed first.</li>
+      <li><strong>The active segment is never deleted.</strong> Kafka always writes to the newest (active) segment; only closed (older) segments are eligible for deletion.</li>
+      <li><strong>Segment size affects how precise retention is.</strong> Because cleanup removes a whole segment at a time, some events can be kept a little longer than 7 days until the whole segment they are in has expired.</li>
+      <li><strong>Deletion is cheap.</strong> Removing a whole file (its <code>.log</code> plus its <code>.index</code>) is much faster than rewriting a big log, and it is done by an <strong>async</strong> background job, so writes are not blocked.</li>
+      <li><strong>Retention is per partition.</strong> <code>retention.bytes</code> applies to each partition's log separately, not to the whole topic.</li>
+    </ul>
+    <p>The full cleanup policies (delete vs compact) are explained in <a href="#log-cleanup">Log Compaction (Cleanup) Strategies</a> below.</p>
+  </div>
+</div>
+
+<h3 id="index-files">Index file per segment</h3>
+<p>We can control the segment size too. Say we keep the segment size as <strong>1 GB</strong> — then a sequential search inside a 1 GB segment file will also take time. That's why Kafka further maintains an <strong>index file per segment</strong>:</p>
+<div class="grid grid-2">
+  <div>
+    <div class="code terminal">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Partition0: order-events-0</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Segment1: 000000.log    -&gt; stores events with offset 0 - 499
+Segment1: 000000.index  -&gt; offset to file-position map</code></pre>
+    </div>
+  </div>
+  <div class="table-wrap" style="margin-top:0">
+    <table>
+      <thead><tr><th>offset</th><th>Physical position in log file (bytes)</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>0</td></tr>
+        <tr><td>150</td><td>4200</td></tr>
+        <tr><td>300</td><td>8900</td></tr>
+        <tr><td>450</td><td>13200</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="callout tip">
+  <span class="ci">&#9889;</span>
+  <div>
+    <p><strong>Not every offset is indexed.</strong> Instead, Kafka indexes every N bytes: after N bytes have been written to the log file, it creates one index row. This <strong>saves memory</strong> and also helps in <strong>faster lookup</strong> — Kafka finds the nearest indexed offset, jumps to that byte position, and scans forward only a little.</p>
+  </div>
+</div>
+
+<h4>Worked example — when does an index row get created?</h4>
+<div class="grid grid-2">
+  <div class="card">
+    <div class="card-title">Partition0 of order-events</div>
+    <ul>
+      <li>Offset0 — event size 300 bytes</li>
+      <li>Offset1 — event size 500 bytes</li>
+      <li>Offset2 — event size 1000 bytes</li>
+      <li>Offset3 — event size 2000 bytes</li>
+      <li>Offset4 — event size 500 bytes</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="card-title">Configuration</div>
+    <ul>
+      <li><strong>Segment size:</strong> 1 GB</li>
+      <li><strong>Index interval bytes:</strong> 4096 bytes — after this many bytes are written to the log file, one index record is created in the <code>.index</code> file.</li>
+    </ul>
+  </div>
+</div>
+<p><code>Segment1: 000000.log</code> (stores events with offset starting from 0):</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Offset</th><th>Event size</th><th>File position</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>300</td><td>0</td></tr>
+      <tr><td>1</td><td>500</td><td>300</td></tr>
+      <tr><td>2</td><td>1000</td><td>800</td></tr>
+      <tr><td>3</td><td>2000</td><td>1800</td></tr>
+      <tr><td>4</td><td>500</td><td>3800</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>Total bytes written: <code>300 + 500 + 1000 + 2000 + 500 = 4300 bytes</code>. Since <strong>4300 bytes &gt; index interval bytes (4096)</strong>, one record is created in the index file <code>Segment1: 000000.index</code>:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>offset</th><th>Physical position in log file (bytes)</th></tr></thead>
+    <tbody><tr><td>4</td><td>3800</td></tr></tbody>
+  </table>
+</div>
+<p>Each <em>file position</em> is simply the sum of the sizes of all earlier events (e.g. offset 3 starts at 300 + 500 + 1000 = 1800). The index row maps offset 4 straight to byte 3800, so a read of offset 4 does not need to scan the first 3800 bytes.</p>
+
+<!-- ======================================================= -->
+<h2 id="partitioning"><span class="sec-num">6</span>Partitioning Strategies — Which Partition Does an Event Go To?</h2>
+<p>The producer can pick one of different algorithms to decide which partition of a topic an event should be sent to.</p>
+
+<h3 id="key-based">1. Key-based Partitioning</h3>
+<div class="callout tip"><span class="ci">&#128273;</span><div><p>All events for the <strong>same KEY go to the same partition</strong> (ordering guaranteed).</p></div></div>
+<div class="grid grid-2">
+  <div class="code">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">publish (topic, key, event)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Publish:
+{
+  "order-events",   &lt;-- topic
+  orderId,          &lt;-- key
+  orderJson         &lt;-- event
+}
+
+partition = hash(orderId) % num_partitions
+
+Example:
+E0 : hash("123") % 3 = Partition 1
+E1 : hash("456") % 3 = Partition 2
+E2 : hash("789") % 3 = Partition 0</code></pre>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Result</span><span class="db">HTML visualisation</span></div>
+    <div class="diagram-body" style="text-align:left">
+      <div class="logviz">
+        <div class="row"><span class="lab">P0</span><div class="cells"><span class="cell">E2<small>key 789</small></span></div></div>
+        <div class="row"><span class="lab">P1</span><div class="cells"><span class="cell">E0<small>key 123</small></span></div></div>
+        <div class="row"><span class="lab">P2</span><div class="cells"><span class="cell">E1<small>key 456</small></span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+<p>Because the hash of a given <code>orderId</code> is always the same, every future event for order <code>123</code> will also land in Partition 1 — so all events of one order are read in the exact order they were written.</p>
+
+<h3 id="round-robin">2. Round Robin (No key)</h3>
+<div class="callout warn"><span class="ci">&#8635;</span><div><p><strong>Even distribution, but ordering is not guaranteed.</strong> Related events may go to different partitions.</p></div></div>
+<div class="grid grid-2">
+  <div class="code">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">publish without key</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Publish:
+{
+  "order-events",   &lt;-- topic
+  null,             &lt;-- key
+  orderJson         &lt;-- event
+}
+
+Example:
+E0 : Partition 0
+E1 : Partition 1
+E2 : Partition 2
+E3 : Partition 0
+...</code></pre>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Result</span><span class="db">HTML visualisation</span></div>
+    <div class="diagram-body" style="text-align:left">
+      <div class="logviz">
+        <div class="row"><span class="lab">P0</span><div class="cells"><span class="cell">E0</span><span class="cell">E3</span></div></div>
+        <div class="row"><span class="lab">P1</span><div class="cells"><span class="cell">E1</span></div></div>
+        <div class="row"><span class="lab">P2</span><div class="cells"><span class="cell">E2</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3 id="custom-partitioning">3. Custom Partitioning</h3>
+<p>We can also write our own custom logic, for example:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">custom rule</span><span class="lang">text</span></div>
+<pre><code data-lang="text">country is "India" -&gt; go to Partition0
+country is "US"    -&gt; go to Partition1</code></pre>
+</div>
+<p>During implementation (<a href="04-producer-setup.html">Producer Setup</a>), we will see how to write the custom partitioning logic.</p>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Strategy</th><th>Key</th><th>Distribution</th><th>Ordering</th></tr></thead>
+    <tbody>
+      <tr><td>Key-based</td><td>e.g. <code>orderId</code></td><td><code>hash(key) % num_partitions</code></td><td>Guaranteed for the same key</td></tr>
+      <tr><td>Round Robin</td><td><code>null</code></td><td>Even, one partition after another</td><td>Not guaranteed — related events may be split</td></tr>
+      <tr><td>Custom</td><td>Any field (e.g. country)</td><td>Our own logic</td><td>Depends on the logic</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="broker"><span class="sec-num">7</span>Broker</h2>
+<ul>
+  <li>A broker is a <strong>single Kafka server instance</strong>.</li>
+  <li>A broker is the one which <strong>actually stores data and serves clients</strong> (producer and consumer).</li>
+  <li>A broker stores <strong>some partitions of some topics</strong>.</li>
+</ul>
+<div class="callout danger">
+  <span class="ci">&#10071;</span>
+  <div>
+    <b class="ct">Important note</b>
+    <p>Topics and partitions are <strong>distributed across multiple brokers</strong>. That's why we say one broker stores only <em>some partitions of some topics</em>: it does <strong>not</strong> hold all topics, and it does <strong>not</strong> hold all partitions of a topic. We will understand the multiple-broker scenario when we see the <a href="#kafka-cluster">Kafka cluster</a> below.</p>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Single broker hosting topic order-events</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:broker-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The broker is the server process; the topic and its partitions live <em>inside</em> it as files on its disk. The producer connects to the broker to write, and consumers will connect to the broker to read.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="consumer-groups"><span class="sec-num">8</span>Consumers and Consumer Groups</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Two consumer groups reading the same topic</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:consumerGroups-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li>Two independent applications — <strong>notification</strong> and <strong>analytics</strong> — each form a <em>consumer group</em> with Consumer 1 … Consumer N.</li>
+      <li>Inside one group, each partition goes to exactly one consumer (P0 &rarr; notification Consumer 1, P1 &rarr; notification Consumer N).</li>
+      <li>P1 is read by a consumer of <em>both</em> groups: different groups read the same data independently.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout key">
+  <span class="ci">&#128220;</span>
+  <div><b class="ct">Rule</b><p>In one consumer group, the <strong>same partition is not read by multiple consumers</strong>.</p></div>
+</div>
+
+<div class="grid grid-3">
+  <div class="card">
+    <div class="card-title">Scenario 1: Consumers = Partitions</div>
+    <p>Topic: <code>order-events</code> (3 partitions)<br>Group: <code>notification-service</code> (3 consumers)</p>
+    <ul>
+      <li>Consumer 1 &rarr; Partition 0</li>
+      <li>Consumer 2 &rarr; Partition 1</li>
+      <li>Consumer 3 &rarr; Partition 2</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="card-title">Scenario 2: Consumers &lt; Partitions</div>
+    <p>Topic: <code>order-events</code> (6 partitions)<br>Group 1: <code>notification-service</code> (3 consumers)</p>
+    <ul>
+      <li>Consumer 1 &rarr; Partition 0, Partition 3</li>
+      <li>Consumer 2 &rarr; Partition 1, Partition 4</li>
+      <li>Consumer 3 &rarr; Partition 2, Partition 5</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="card-title">Scenario 3: Consumers &gt; Partitions</div>
+    <p>Topic: <code>order-events</code> (3 partitions)<br>Group 1: <code>notification-service</code> (5 consumers)</p>
+    <ul>
+      <li>Consumer 1 &rarr; Partition 0</li>
+      <li>Consumer 2 &rarr; Partition 1</li>
+      <li>Consumer 3 &rarr; Partition 2</li>
+      <li>Consumer 4 &rarr; <strong>IDLE</strong> (no partition)</li>
+      <li>Consumer 5 &rarr; <strong>IDLE</strong> (no partition)</li>
+    </ul>
+  </div>
+</div>
+<p>Scenario 3 shows why the number of partitions limits parallelism inside a group: extra consumers beyond the partition count simply sit idle.</p>
+
+<h3 id="multiple-groups">Multiple consumer groups</h3>
+<p>The <strong>same partition can be read by multiple consumers present in different groups</strong>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Partition 0 of order-events read by three groups</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P0["order-events · Partition 0"]
+    P0 --> A["Consumer Group 1: notification-service · Consumer 1"]
+    P0 --> B["Consumer Group 2: analytics-service · Consumer 2"]
+    P0 --> C["Consumer Group 3: audit-service · Consumer 3"]
+    classDef part fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:2px
+    classDef cons fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48
+    class P0 part
+    class A,B,C cons
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Each group gets its own full copy of the stream. Notification, analytics and audit all read Partition 0 without affecting each other — this is how “1 event &rarr; N consumers” from the EDA chapter is achieved in Kafka.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="consumer-offsets"><span class="sec-num">9</span>Committed Offsets and the <code>__consumer_offsets</code> Topic</h2>
+<p>Each consumer group maintains <strong>partition-wise offsets independently</strong>:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">what is tracked</span><span class="lang">text</span></div>
+<pre><code data-lang="text">(Consumer group, topic, partition) -&gt; Offset consumed till now</code></pre>
+</div>
+<p>For example:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Consumer Group</th><th>Topic</th><th>Partition</th><th>Committed Offset (processed up to this offset)</th></tr></thead>
+    <tbody>
+      <tr><td>notification</td><td>order-events</td><td>0</td><td><strong>105</strong></td></tr>
+      <tr><td>notification</td><td>order-events</td><td>1</td><td><strong>98</strong></td></tr>
+      <tr><td>analytics</td><td>order-events</td><td>0</td><td><strong>60</strong></td></tr>
+      <tr><td>analytics</td><td>order-events</td><td>1</td><td><strong>45</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+<p>The same partition (order-events / 0) is at offset 105 for <em>notification</em> but only at 60 for <em>analytics</em> — each group moves at its own pace.</p>
+
+<p>This consumer-group offset information is stored in Kafka's internal <code>__consumer_offsets</code> topic. In a Kafka UI the topic list shows it like this:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Topic Name</th><th>Partitions</th></tr></thead>
+    <tbody><tr><td><span class="chip" style="padding:1px 8px">IN</span> __consumer_offsets</td><td>50</td></tr></tbody>
+  </table>
+</div>
+<ul>
+  <li><strong>“IN”</strong> means <strong>INTERNAL</strong> — this topic is created internally by Kafka.</li>
+  <li><strong>50</strong> is the default number of partitions of the <code>__consumer_offsets</code> topic.</li>
+</ul>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The source notes write the name as <code>_consumer_offsets</code>; the actual internal topic name (as shown in the UI) starts with two underscores: <code>__consumer_offsets</code>.</p></div></div>
+
+<h3 id="commit-flow">How a group's offset is written</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Offset commit goes to one partition of __consumer_offsets</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:consumerOffsets-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <div class="code" style="margin-top:4px">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">offset commit message</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Publish:
+{
+  "__consumer_offsets",
+  notification_group_id,
+  message: (notification_group_id, topic, partition, committed_offset)
+}
+
+partition = hash(notification_group_id) % 50 = 23</code></pre>
+    </div>
+    <p>The <strong>group id is the key</strong>, so — exactly like key-based partitioning — <strong>all offset updates for consumer group <em>notification</em> go to Partition 23</strong> of <code>__consumer_offsets</code>.</p>
+  </div>
+</div>
+
+<h3 id="offset-recovery">Why committed offsets matter</h3>
+<p>This committed-offset strategy helps when a consumer crashes and, say, a new consumer comes up:</p>
+<ol class="steps">
+  <li>It finds the partition number of topic <code>__consumer_offsets</code>: <code>hash(notification_group_id) % 50 = 23</code>.</li>
+  <li>The consumer asks the broker which holds Partition 23 of <code>__consumer_offsets</code>: <em>“Till what point are events processed for, say, TopicA-Partition2?”</em></li>
+  <li>The broker internally maintains a key-value map built from the <code>__consumer_offsets</code> data — <strong>key:</strong> (topic, partition), <strong>value:</strong> committed offset.</li>
+  <li>The broker checks the map and returns the committed offset value, and the new consumer continues from there.</li>
+</ol>
+
+<!-- ======================================================= -->
+<h2 id="commit-strategies"><span class="sec-num">10</span>Offset Commit Strategies</h2>
+
+<h3 id="auto-commit">Strategy 1: Auto-Commit</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">consumer config</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">auto.commit.interval.ms=5000</code></pre>
+</div>
+<p>Means: <strong>auto commit every 5 seconds</strong>. But this strategy is <strong>risky</strong>. Let's see an example:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Auto-commit losing events</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Consumer
+    participant K as Kafka
+    Note over C,K: Time 0s
+    C->>K: poll
+    K-->>C: events 0-99
+    Note over C: Time 1s: processing events...
+    Note over C,K: Time 5s: auto-commit triggers
+    C->>K: commit offset 99
+    Note over C: Time 6s: CRASH (only 50 events processed)
+    Note over C,K: Time 7s: consumer restarts
+    C->>K: where do I start?
+    K-->>C: offset 100
+    Note over C: Events 51-99 are LOST (at-most-once delivery)
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Why events are lost</h4>
+    <p>The commit happened on a timer, not when processing finished. Kafka was told “processed up to 99” while only ~50 events were actually done. After the restart the consumer resumes from offset 100, so the unprocessed events are never seen again — <strong>at-most-once delivery</strong>.</p>
+  </div>
+</div>
+
+<h3 id="manual-commit">Strategy 2: Manual Commit</h3>
+<ol class="points green">
+  <li><b>Step 1</b>Poll events 0-99.</li>
+  <li><b>Step 2</b>Process ALL events.</li>
+  <li><b>Step 3</b>Commit offset 99 (wait for confirmation).</li>
+  <li><b>Step 4</b>Kafka confirms the commit.</li>
+  <li><b>Step 5</b>Continue to the next batch.</li>
+</ol>
+<div class="vs">
+  <div class="side a"><h4>Crash before commit</h4><div class="sb"><p>Events are <strong>reprocessed</strong> &rarr; <strong>at-least-once</strong> delivery (duplicates possible, but nothing lost).</p></div></div>
+  <div class="side b"><h4>Crash after commit</h4><div class="sb"><p>Events are <strong>not reprocessed</strong> — the batch is already recorded as done.</p></div></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="kafka-cluster"><span class="sec-num">11</span>Advanced Level: Kafka Cluster</h2>
+<p>A Kafka cluster is a <strong>group of brokers working together</strong> to provide:</p>
+<div class="grid grid-3">
+  <div class="card feature blue"><span class="icon">&#128200;</span><h4>Scalability</h4><p>Distribute load across multiple servers.</p></div>
+  <div class="card feature teal"><span class="icon">&#128737;</span><h4>Fault tolerance</h4><p>Continue operation even if brokers fail.</p></div>
+  <div class="card feature green"><span class="icon">&#9989;</span><h4>High availability</h4><p>No single point of failure.</p></div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Kafka cluster with three brokers</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    PR["Producer1"] --> B1
+    subgraph KC["Kafka Cluster"]
+      direction TB
+      subgraph B1["Kafka Broker-1"]
+        direction TB
+        subgraph OE["Topic name = order-events"]
+          direction TB
+          o0["P0"]
+          o1["P1"]
+          o2["P2"]
+        end
+        subgraph PE["Topic name = product-events"]
+          direction TB
+          q0["P0"]
+          q1["P1"]
+        end
+      end
+      B2["Kafka Broker-2"]
+      B3["Kafka Broker-3"]
+    end
+    G1["Consumer Group1 = notification · Consumer 1 … N"] --> B2
+    G2["Consumer Group2 = analytics · Consumer 1 … N"] --> B2
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef part fill:#eef4ff,stroke:#2563eb,color:#1e3a8a
+    classDef brk fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef cons fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48
+    class PR prod
+    class o0,o1,o2,q0,q1 part
+    class B2,B3 brk
+    class G1,G2 cons
+    style KC fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+    style B1 fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Three brokers form one cluster. Broker-1 is shown hosting topics <code>order-events</code> (P0–P2) and <code>product-events</code> (P0–P1); Broker-2 and Broker-3 host other partitions. Producers and consumer groups talk to whichever broker holds the partition they need.</p>
+    <p><strong>Now the question is: how?</strong> How does this multi-broker architecture achieve scalability, availability and fault tolerance? The answer starts with leader–follower partitions.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="leader-follower"><span class="sec-num">12</span>Leader–Follower Partitions (Replication)</h2>
+<p>For each partition, <strong>one broker is the Leader and the others are Followers</strong>.</p>
+<div class="card">
+  <div class="card-title">Example</div>
+  <ul>
+    <li>Topic: <code>order-events</code> — Partitions: <strong>3</strong> (P0, P1, P2) — Replication Factor: <strong>2</strong></li>
+    <li>Each partition has 2 replicas: P0 (one leader and one follower), P1 (one leader and one follower), P2 (one leader and one follower).</li>
+    <li>All these replicas are <strong>distributed among the brokers</strong>.</li>
+  </ul>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Leaders and followers spread across brokers (RF = 2)</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    PR["Producer1"] --> B1
+    subgraph KC["Kafka Cluster"]
+      direction TB
+      subgraph B1["Kafka Broker-1 · order-events"]
+        a1["P0 : Leader"]
+        a2["P1 : Follower"]
+      end
+      subgraph B2["Kafka Broker-2 · order-events"]
+        b1["P1 : Leader"]
+        b2["P2 : Follower"]
+      end
+      subgraph B3["Kafka Broker-3 · order-events"]
+        c1["P0 : Follower"]
+        c2["P2 : Leader"]
+      end
+    end
+    G1["Consumer Group1 = notification"] --> B2
+    G2["Consumer Group2 = analytics"] --> B2
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef lead fill:#ea580c,stroke:#9a3412,color:#fff,stroke-width:2px
+    classDef fol fill:#eef4ff,stroke:#2563eb,color:#1e3a8a
+    classDef cons fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48
+    class PR prod
+    class a1,b1,c2 lead
+    class a2,b2,c1 fol
+    class G1,G2 cons
+    style KC fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+    style B1 fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+    style B2 fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+    style B3 fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><strong>P0</strong>: leader on Broker-1, follower on Broker-3.</li>
+      <li><strong>P1</strong>: leader on Broker-2, follower on Broker-1.</li>
+      <li><strong>P2</strong>: leader on Broker-3, follower on Broker-2.</li>
+    </ul>
+    <p>Every broker is leader for one partition and follower for another, so the write/read load is spread out (scalability), and every partition has a copy on a second broker (fault tolerance).</p>
+  </div>
+</div>
+<div class="vs">
+  <div class="side b">
+    <h4>Leader responsibility</h4>
+    <div class="sb"><ul><li>Handle all producer writes</li><li>Handle all consumer reads</li><li>Maintain partition logs</li><li>Coordinate with followers</li></ul></div>
+  </div>
+  <div class="side a">
+    <h4>Follower responsibility</h4>
+    <div class="sb"><ul><li>Replicate data from leader</li><li>Stay in sync with leader</li><li>Be ready to become leader if the current leader fails</li><li>Do <strong>not</strong> serve client (producer or consumer) requests</li></ul></div>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="controller"><span class="sec-num">13</span>The Controller</h2>
+<p>Now one question might have come to your mind. <strong>Who decides</strong> which broker hosts which partition replica, which partition replica becomes leader, and which partition replica stays a follower?</p>
+<div class="callout key"><span class="ci">&#129504;</span><div><p><strong>Answer: the Controller.</strong> It is a special broker whose responsibilities are:</p>
+  <ul><li>Creation of topics</li><li>Electing partition leaders and followers</li><li>Detecting broker failures (using heartbeats)</li><li>Notifying all brokers about the changes</li></ul>
+  <p>In short, the Controller manages the <strong>cluster metadata</strong> (info about topics, partitions, brokers etc.), which it records in <code>_cluster_metadata.log</code>.</p></div></div>
+<p>A Controller node can either have a <strong>dual responsibility</strong> (normal broker + controller role) or <strong>just one responsibility</strong> (controller role). For simplicity, the examples use a controller node that only has the controller role.</p>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Creating a topic through the Controller</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TB
+    A["Producer / Admin CLI"] -->|"Create Topic order-events · 3 partitions, Replication_Factor=2"| B["Any Broker"]
+    B -->|"Pass the request to"| C["Controller"]
+    C -.- N["Creates topic / partitions · Decides leader and followers · Updates _cluster_metadata.log"]
+    C --> D1["Broker1"]
+    C --> D2["Broker2"]
+    C --> D3["Broker N"]
+    classDef ctl fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:2px
+    classDef brk fill:#fff4ec,stroke:#ea580c,color:#7c2d12
+    classDef note fill:#fff8e6,stroke:#d97706,color:#78350f
+    class C ctl
+    class B,D1,D2,D3 brk
+    class N note
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li>A producer or the admin CLI asks <strong>any broker</strong> to create topic <code>order-events</code> with 3 partitions and replication factor 2.</li>
+      <li>That broker does not decide on its own — it <strong>passes the request to the Controller</strong>.</li>
+      <li>The Controller <strong>creates the topic/partitions</strong>, <strong>decides leaders and followers</strong> and <strong>updates <code>_cluster_metadata.log</code></strong>.</li>
+      <li>The Controller then <strong>notifies all brokers</strong> (Broker1 … Broker N) of the new layout.</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="kraft-zookeeper"><span class="sec-num">14</span>Who Coordinates the Controllers? KRaft vs ZooKeeper</h2>
+<p>Knowing about the Controller, a few things come to mind:</p>
+<ul>
+  <li>What if this controller fails? It seems like the brain of the cluster itself.</li>
+  <li>Even if the answer is “we can have multiple controllers”, who will control them? Brokers are coordinated by the controller — but with multiple controllers, who brings coordination among them? Do we need another controller for the controllers? It would become a loop!</li>
+</ul>
+<div class="vs">
+  <div class="side b">
+    <h4>KRaft (Modern)</h4>
+    <div class="sb">
+      <ul>
+        <li>KRaft (Kafka Raft) is <strong>inbuilt in Kafka</strong>.</li>
+        <li>So there is less overhead — no external system to manage.</li>
+        <li>Uses the <strong>Raft</strong> consensus algorithm.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="side a">
+    <h4>ZooKeeper (Legacy)</h4>
+    <div class="sb">
+      <ul>
+        <li>An <strong>external distributed system</strong> which Kafka has to deploy, monitor and maintain separately.</li>
+        <li>Deprecated in the latest versions of Kafka (&ge; 3.x) and replaced with KRaft.</li>
+        <li>Uses the <strong>Zab</strong> consensus algorithm.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+<p>Both help Kafka manage cluster metadata (topics, partitions, brokers, controller election). This documentation does not cover ZooKeeper, as it is deprecated.</p>
+
+<!-- ======================================================= -->
+<h2 id="consensus"><span class="sec-num">15</span>Consensus, Quorum and the KRaft Flow</h2>
+
+<h3 id="single-controller-problem">Problem: one Controller is a bottleneck</h3>
+<p>The Controller is the one that:</p>
+<ul>
+  <li>Stores the cluster metadata.</li>
+  <li>Creates / deletes topics.</li>
+  <li>Decides partition leaders and followers.</li>
+  <li>Keeps track of broker heartbeats and detects any broker failure in time.</li>
+  <li>If any broker fails, redistributes its topic partitions to other brokers.</li>
+  <li>Keeps other brokers up to date about the cluster information.</li>
+</ul>
+<div class="callout danger"><span class="ci">&#128165;</span><div><p>So, if this Controller fails, the <strong>cluster is unavailable</strong>: we cannot create new topics; if any broker is down, no one will take over its partition responsibility; and all cluster metadata information is lost. <strong>So we need multiple Controllers.</strong></p></div></div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Cluster with three controllers</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TB
+    PR["Producer1"] --> B1
+    subgraph KC["Kafka Cluster"]
+      direction TB
+      subgraph BR["Brokers"]
+        direction LR
+        B1["Kafka Broker-1 · P0 : Leader · P1 : Follower"]
+        B2["Kafka Broker-2 · P1 : Leader · P2 : Follower"]
+      end
+      subgraph CT["Controllers"]
+        direction LR
+        C1["Controller1 (Active)"] <-->|"heartbeats"| C2["Controller2 (Stand By)"]
+        C2 <-->|"heartbeats"| C3["Controller3 (Stand By)"]
+      end
+      BR <-->|"heartbeats / Metadata updates"| CT
+    end
+    G["Consumer Groups (notification, analytics)"] --> B2
+    classDef ctl fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:2px
+    classDef act fill:#7c3aed,stroke:#4c1d95,color:#fff,stroke-width:2px
+    classDef brk fill:#fff4ec,stroke:#ea580c,color:#7c2d12
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff
+    classDef cons fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48
+    class C2,C3 ctl
+    class C1 act
+    class B1,B2 brk
+    class PR prod
+    class G cons
+    style KC fill:#fffaf6,stroke:#ea580c,stroke-width:1.5px
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Only <strong>one controller is Active (Leader)</strong> in a cluster; the others act as <strong>Followers (Stand By)</strong>. Brokers exchange heartbeats with the controllers and receive metadata updates; the controllers exchange heartbeats among themselves.</p>
+    <p>Now: <strong>who decides which controller is leader and which is follower?</strong> We cannot have another controller to control these controllers (that would become a loop). That's where <strong>KRaft</strong>, which implements the <strong>Raft consensus algorithm</strong>, comes into the picture.</p>
+  </div>
+</div>
+
+<h3 id="quorum">Quorum</h3>
+<p>In this consensus algorithm, <strong>all decisions are taken by QUORUM</strong>. Quorum means the <strong>majority of the nodes</strong>.</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">quorum for 3 controllers</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Quorum = (N / 2) + 1
+       = (3 / 2) + 1      (integer division)
+       = 2</code></pre>
+</div>
+<p>So at least 2 controller nodes must agree on any decision before it can be final. For example, quorum happens on: which controller node should become the leader (Active) controller, any change in the cluster metadata information, etc.</p>
+
+<h3 id="kraft-flow">KRaft flow — creating a topic</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Metadata change committed through KRaft consensus</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant A as Producer /&lt;br/&gt;Admin CLI
+    participant B as Any Broker
+    participant C1 as Controller1&lt;br/&gt;(Active) + KRaft
+    participant C2 as Controller2&lt;br/&gt;(Stand-By) KRaft
+    participant C3 as Controller3&lt;br/&gt;(Stand-By) KRaft
+    participant BR as Broker1 …&lt;br/&gt;Broker N
+    A->>B: 1. Create Topic "order-events"&lt;br/&gt;(3 partitions, RF=2)
+    B->>C1: 2. Pass the request to&lt;br/&gt;Active (Leader) Controller
+    Note over C1: 3. Pass it to KRaft layer&lt;br/&gt;creates topic / partitions&lt;br/&gt;decides leader and follower partitions&lt;br/&gt;creates metadata record with offset 100
+    Note over C1: local cluster_metadata.log&lt;br/&gt;offset 99 record&lt;br/&gt;offset 100 record (no commit yet)&lt;br/&gt;last committed offset 99
+    C1->>C2: 4. Initiate Quorum -&lt;br/&gt;append offset 100 record
+    C1->>C3: 4. Initiate Quorum -&lt;br/&gt;append offset 100 record
+    Note over C2,C3: local log - offset 100 record (not committed)&lt;br/&gt;last committed offset 99
+    C2-->>C1: 5. Ack - written in local file,&lt;br/&gt;not yet committed
+    C3-->>C1: 5. Ack - written in local file,&lt;br/&gt;not yet committed
+    Note over C1: 6. Majority wrote successfully&lt;br/&gt;Commit - last committed offset 100
+    C1->>BR: 7. Propagate committed metadata
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li>The producer / admin CLI sends <em>Create Topic “order-events”, 3 partitions, Replication_Factor=2</em> to any broker.</li>
+      <li>The broker passes the request to the <strong>Active (Leader) Controller</strong>.</li>
+      <li>Controller1 passes it to its <strong>KRaft layer</strong>, which creates the topic/partitions, decides leader and follower partitions and creates a metadata record — say with <strong>offset 100</strong>. It updates its local <code>cluster_metadata.log</code>: offset 99 record, offset 100 record (<em>no commit yet</em>), last committed offset: 99.</li>
+      <li>KRaft <strong>initiates the quorum</strong>: it asks Controller2 and Controller3 to append the new metadata (offset 100 record). Each stand-by updates its local log: offset 100 record (<em>not committed</em>), last committed offset: 99.</li>
+      <li>The stand-bys <strong>Ack</strong>: written successfully in the local file, but not yet committed.</li>
+      <li>Since the <strong>majority was able to write successfully</strong>, the active controller <strong>commits</strong>: its local log now shows last committed offset: 100.</li>
+      <li>The committed metadata is sent to <strong>Broker1, Broker2 … Broker N</strong>.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Heartbeat carries the last committed offset</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C1 as Controller1 Raft (Active)
+    participant C2 as Controller2 Raft (Stand By)
+    participant C3 as Controller3 Raft (Stand By)
+    C1->>C2: heartbeat, last committed offset: 100
+    C1->>C3: heartbeat, last committed offset: 100
+    Note over C2: offset 100 record (committed), last committed offset 100
+    Note over C3: offset 100 record (committed), last committed offset 100
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>When the Active Controller sends its heartbeat to the stand-by controllers, it also sends the <strong>last committed offset</strong>. The stand-bys then mark offset 100 as committed in their local cluster metadata logs, so all three controllers end up with identical, committed metadata — and any of them can take over as leader.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="isr"><span class="sec-num">16</span>ISR (In-Sync Replicas)</h2>
+<p>The Controller also maintains one more important piece of cluster metadata: the <strong>ISR</strong>.</p>
+<div class="callout note"><span class="ci">&#128204;</span><div><p><strong>ISR:</strong> for each partition, ISR represents the list of replicas which are <strong>fully caught up with the leader</strong>.</p></div></div>
+<div class="card">
+  <div class="card-title">Example</div>
+  <p>Topic: <code>order-events</code>, Partition: 1, Replication factor = 3. Leader: Broker 1. Followers: Broker 2, Broker 3.</p>
+  <p>Possible ISR: <code>ISR = {Broker 1, Broker 2, Broker 3}</code></p>
+</div>
+<p>Say Broker 3 lags too much:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Replica logs of Partition 1</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">Broker1 (Leader)</span><div class="cells"><span class="cell">0</span><span class="cell">1</span><span class="cell">2</span><span class="cell">3</span><span class="cell">4</span><span class="cell">5</span><span class="cell">6</span><span class="cell">7</span><span class="cell">8</span><span class="cell">9</span></div><span class="ptr">Latest offset: 9</span></div>
+      <div class="row"><span class="lab">Broker2 (Follower)</span><div class="cells"><span class="cell new">0</span><span class="cell new">1</span><span class="cell new">2</span><span class="cell new">3</span><span class="cell new">4</span><span class="cell new">5</span><span class="cell new">6</span><span class="cell new">7</span><span class="cell new">8</span><span class="cell new">9</span></div><span class="ptr t">In-Sync</span></div>
+      <div class="row"><span class="lab">Broker3 (Follower)</span><div class="cells"><span class="cell gone" style="text-decoration:none">0</span><span class="cell gone" style="text-decoration:none">1</span><span class="cell gone" style="text-decoration:none">2</span><span class="cell gone" style="text-decoration:none">3</span><span class="cell gone" style="text-decoration:none">4</span><span class="cell gone" style="text-decoration:none">5</span><span class="cell gone" style="text-decoration:none">6</span></div><span class="ptr" style="background:#dc2626">Out-of-Sync</span></div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Result</h4>
+    <p><code>ISR = {Broker1, Broker2}</code> — Broker 3 is <strong>temporarily removed from ISR</strong> because it is 3 offsets behind the leader's latest offset 9.</p>
+  </div>
+</div>
+<h3 id="isr-rules">How does the leader decide a follower is out of sync?</h3>
+<div class="grid grid-2">
+  <div class="card feature green"><span class="icon">&#10003;</span><h4>A follower is in-sync if</h4><p>Its replica offset is close enough to the leader's log end offset, and it stays within <code>replica.lag.time.max.ms</code>.</p></div>
+  <div class="card feature red"><span class="icon">&#10007;</span><h4>Removed from ISR if it</h4><p>Stops fetching, or is too slow.</p></div>
+</div>
+<p>Once the leader identifies that a particular follower broker is out of sync, it <strong>requests the Controller to alter the ISR</strong>.</p>
+
+<!-- ======================================================= -->
+<h2 id="acks"><span class="sec-num">17</span>What is the Use of ISR? Producer acks</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Producer writes to the partition leader</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P["Producer · Publish order-events, null, orderJson · ack = 0 or 1 or all"] --> L["Broker (Leader) · Topic: order-events · Partition-2"]
+    L -.- N["Persist the event in Partition-2 logs (one of its segment files)"]
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef lead fill:#ea580c,stroke:#9a3412,color:#fff,stroke-width:2px
+    classDef note fill:#fff8e6,stroke:#d97706,color:#78350f
+    class P prod
+    class L lead
+    class N note
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Along with the event, the producer sets an <code>ack</code> config. If the producer used <strong><code>ack=all</code></strong>, the broker (leader) waits for <strong>all ISR replicas</strong> to update the event; only then does it send “successfully published” to the producer. This is where ISR is used.</p>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>ack value</th><th>Name</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>0</code></td><td>Fire and Forget</td><td>Producer sends record to leader. Producer does <strong>not wait</strong> for any response and immediately considers the send successful.</td></tr>
+      <tr><td><code>1</code></td><td>Wait for Leader</td><td>Producer sends record. Leader writes the record to its local log and sends ACK back. Producer waits for that ACK.</td></tr>
+      <tr><td><code>all</code></td><td>Wait for all ISR replicas</td><td>Leader waits until all replicas in the ISR have written the record, then sends ACK.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="min-isr">What if the ISR list becomes empty?</h3>
+<p>It cannot happen: there is one more piece of cluster metadata —</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">topic / broker config</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">min.insync.replicas=2</code></pre>
+</div>
+<p>It tells the <strong>minimum number of replicas that should be present in the ISR</strong>. If the count goes below this, the partition is <strong>UNAVAILABLE</strong> (for <code>acks=all</code> writes, the leader refuses the write instead of accepting it with too few copies).</p>
+
+<!-- ======================================================= -->
+<h2 id="write-flow"><span class="sec-num">18</span>Complete Producer Write Flow</h2>
+<p>Now let's combine all the information so far. Topics are created, leader–follower partitions are decided and brokers are updated with the cluster metadata. The producer publishes with <code>Ack=all</code>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">event</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Publish: Ack=all
+{
+  topic: "order-events",
+  key:   order-123,
+  value: orderJson
+}</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Producer write path, step by step</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant P as Producer
+    participant B1 as Broker-1&lt;br/&gt;(any broker)
+    participant AC as Active&lt;br/&gt;Controller
+    participant B2 as Broker2&lt;br/&gt;(Leader P1)
+    participant F as Broker1, Broker3&lt;br/&gt;(P1 followers)
+    Note over P: Step1 - Producer creates event
+    P->>B1: Step2 - Give me metadata (broker vs partition leader)
+    B1->>AC: Give me metadata
+    AC-->>B1: Metadata response
+    B1-->>P: Metadata - P0 leader Broker 1,&lt;br/&gt;P1 leader Broker 2, P2 leader Broker 3
+    Note over P: Step3 - Partition = hash(order-123) % 3 = 1
+    Note over P: Step4 - leader of&lt;br/&gt;Partition 1 = Broker2
+    P->>B2: Step5 - Send event directly to Broker 2
+    Note over B2: Step6 - write to Partition 1 log&lt;br/&gt;Segment_00000.log&lt;br/&gt;new event at offset 101
+    Note over B2: Step7 - Ack = all,&lt;br/&gt;wait for ISR replicas
+    F->>B2: Followers do continuous polling (fetch)
+    F-->>B2: Step8 - Ack after updating&lt;br/&gt;their partition logs
+    B2-->>P: Step9 - All ISR acked - "Event Published"
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li><strong>Producer creates the event</strong> (<code>order-events</code>, key <code>order-123</code>, value <code>orderJson</code>).</li>
+      <li><strong>Producer requests metadata</strong> (first time or on refresh) from any broker, e.g. Broker-1. Broker-1 gets it from the Active Controller and returns: partition 0 &rarr; Broker 1, partition 1 &rarr; Broker 2, partition 2 &rarr; Broker 3.</li>
+      <li><strong>Producer calculates the partition</strong>: <code>hash(order-123) % 3 = 1</code>.</li>
+      <li><strong>Looks up the broker details</strong>: who is leader of Partition 1? &rarr; <strong>Broker2</strong>.</li>
+      <li><strong>Producer sends the event directly to Broker 2</strong> (no hop through other brokers).</li>
+      <li><strong>Broker2 writes the event to the Partition 1 log</strong>: <code>Segment_00000.log [0][1][2]…[100][101]</code> — new event at offset 101.</li>
+      <li><strong>Ack = all</strong>: Broker2 waits for the ISR (in-sync replicas) to update the event.</li>
+      <li>The followers (Broker1 and Broker3, Partition 1 followers) <strong>do continuous polling</strong> and <strong>ack when they have updated their partition logs</strong>.</li>
+      <li>When all ISR replicas have acked, <strong>Broker2 sends the response back to the producer: “Event Published”</strong>.</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="read-flow"><span class="sec-num">19</span>Complete Consumer Read Flow</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Complete consumer read flow — step boxes (as in the source notes)</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:consumerReadFlowBoxes-->
+  </div>
+  <div class="diagram-explain">
+    <h4>How to read it</h4>
+    <p>Follow the black arrows from <strong>Step1</strong> to <strong>Step13</strong>: left to right along the top row, down to Step4, right to left along the second row, then down the left edge to Step10. The <span style="color:#2563eb;font-weight:600">blue arrow pairs</span> are request/response round trips (metadata, join group, offset fetch, record fetch, commit), and the red notes are the details of each call. Step13 loops back to Step8 — that is the continuous poll loop. The same flow is shown as a sequence diagram below, with a step-by-step explanation.</p>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Consumer join, offset fetch, read and commit</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant C as Consumer
+    participant B1 as Broker-1&lt;br/&gt;(any broker)
+    participant AC as Active&lt;br/&gt;Controller
+    participant B3 as Broker3&lt;br/&gt;(Group Coordinator,&lt;br/&gt;leader of P23)
+    participant F as Broker1, Broker2&lt;br/&gt;(P23 followers)
+    participant L as Broker2&lt;br/&gt;(Leader of&lt;br/&gt;order-events P-2)
+    Note over C: Step1 - Start, join&lt;br/&gt;group.id = notification-service
+    Note over C: Step2 - hash(group id) % 50&lt;br/&gt;= 23
+    C->>B1: Step3 - Give me metadata
+    B1->>AC: Give me metadata
+    AC-->>B1: Metadata response
+    B1-->>C: __consumer_offsets - P0 Broker 1,&lt;br/&gt;P2 Broker 2, P23 Broker 3
+    C->>B3: Step4 - Join the notification-service group
+    Note over B3: Step5 - group notification-service&lt;br/&gt;topic order-events&lt;br/&gt;Consumer1 P0, Consumer2 P1,&lt;br/&gt;Consumer3 P2
+    F->>B3: Followers poll and ack the group update
+    B3-->>C: Partition-2 assigned for topic order-events
+    C->>B3: Step6 - Fetch last offset for order-events Partition-2
+    Note over B3: Step7 - key&lt;br/&gt;notificationGroupId_order-events_Partition-2&lt;br/&gt;value offset 100
+    B3-->>C: Return 100
+    C->>L: Step8-9 - Fetch from offset 101,&lt;br/&gt;max bytes 200
+    L-->>C: Return offsets 101 - 501
+    Note over C: Step10 - Process events
+    C->>B3: Step11 - Commit offset (manual, batch wise)
+    Note over B3: Step12 - write __consumer_offsets&lt;br/&gt;P23, processed till 501
+    B3-->>C: Commit ACK
+    Note over C,L: Step13 - Continuous polling, go back to Step 8
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Step by step</h4>
+    <ol class="steps">
+      <li><strong>Consumer starts</strong> and wants to join group <code>group.id = "notification-service"</code>.</li>
+      <li><strong>Finds the partition number of topic <code>__consumer_offsets</code></strong>: <code>hash("notification-service-group-id") % 50 = 23</code> &rarr; Partition 23.</li>
+      <li><strong>Requests metadata</strong> (first time or refresh) through any broker, which asks the Active Controller. Response: <code>__consumer_offsets</code> partition 0 &rarr; Broker 1, partition 2 &rarr; Broker 2, <strong>partition 23 &rarr; Broker 3</strong>.</li>
+      <li><strong>Invokes Broker3</strong> — the leader of Partition 23 acts as the <strong>Group Coordinator</strong> — and requests to join the “notification-service” group.</li>
+      <li><strong>Broker3 (Group Coordinator)</strong> records the assignment for group <em>Notification-service</em>, topic <em>order-events</em>: Consumer1 &rarr; Partition-0, Consumer2 &rarr; Partition-1, Consumer3 &rarr; Partition-2. Broker3 waits for all followers (Broker1, Broker2 — Partition 23 followers, which poll continuously) to update the events in <code>__consumer_offsets</code> partition 23. There is no option to provide <code>ack=0/1/all</code> here — internally the consumer acts like <strong>Ack=All</strong>. Once all followers have the update, the coordinator responds: <strong>Partition-2 assigned</strong> for topic “order-events”.</li>
+      <li><strong>Consumer fetches the last offset</strong> for topic “order-events”, Partition-2.</li>
+      <li><strong>Broker3 looks at <code>__consumer_offsets</code></strong>, builds the key <code>group.id_topic_Partition</code> = <code>"notificationGroupId_order-events_Partition-2"</code> and finds value <strong>offset 100</strong>, which it returns.</li>
+      <li><strong>Consumer checks the metadata and invokes the leader broker</strong> of topic “order-events” Partition-2.</li>
+      <li><strong>Broker2 (leader)</strong> receives “fetch from offset 101, max bytes send me: 200 bytes” and returns the events at offsets 101 – 501.</li>
+      <li><strong>Consumer processes the events.</strong></li>
+      <li><strong>Consumer commits the offset</strong> (manual, batch wise).</li>
+      <li><strong>Broker3 (Group Coordinator)</strong> writes to <code>__consumer_offsets</code>, Partition 23: (group, topic, partition) &rarr; offset processed till = 501, and sends the commit ACK.</li>
+      <li><strong>Continuous polling</strong> — move back to step 8.</li>
+    </ol>
+  </div>
+</div>
+<div class="grid grid-2">
+  <div class="callout note" style="margin:0"><span class="ci">&#8505;</span><div><p><strong>Note:</strong> consumer offset details are <strong>not</strong> cluster metadata. They are stored like normal topic data, and they are <strong>not stored in Controller nodes</strong>.</p></div></div>
+  <div class="callout key" style="margin:0"><span class="ci">&#11015;</span><div><p><strong>Note:</strong> from the above flow we learn that the <strong>consumer follows the PULL model</strong>. Kafka does not follow the PUSH model.</p></div></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="log-cleanup"><span class="sec-num">20</span>Log Compaction (Cleanup) Strategies</h2>
+<div class="vs">
+  <div class="side a"><h4>Policy 1: Delete (default)</h4><div class="sb"><p>Delete old segments based on <strong>time or size</strong>. It is an <strong>async job</strong>.</p></div></div>
+  <div class="side b"><h4>Policy 2: Compact</h4><div class="sb"><p>Keep <strong>only the latest value for each key</strong>.</p></div></div>
+</div>
+
+<h3 id="delete-policy">Policy 1: Delete</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">topic config</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">cleanup.policy=delete
+retention.ms=604800000      # 7 days
+retention.bytes=1073741824  # 1GB</code></pre>
+</div>
+<div class="grid grid-2">
+  <div class="card">
+    <div class="card-title">&#9201; Time based</div>
+    <ul><li>Segment1: created 8 days ago &rarr; <strong>DELETED</strong></li><li>Segment2: created 6 days ago &rarr; <strong>KEPT</strong></li></ul>
+    <p>Anything older than <code>retention.ms</code> (7 days) is removed.</p>
+  </div>
+  <div class="card">
+    <div class="card-title">&#128190; Size based</div>
+    <p>Total partition log size becomes more than 1 GB:</p>
+    <ul><li>Segment1: 1 GB</li><li>Segment2: 200 MB</li><li>Total: 1.2 GB</li></ul>
+    <p>So Kafka deletes the old segment, <strong>Segment1</strong>.</p>
+  </div>
+</div>
+
+<h3 id="compact-policy">Policy 2: Compact</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">topic config</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">cleanup.policy=compact</code></pre>
+</div>
+<div class="grid grid-2">
+  <div>
+    <h4>Segment (before)</h4>
+    <div class="table-wrap"><table>
+      <thead><tr><th>offset</th><th>key</th><th>record</th></tr></thead>
+      <tbody>
+        <tr><td>100</td><td>user1</td><td>v1</td></tr>
+        <tr><td>101</td><td>user2</td><td>v1</td></tr>
+        <tr><td>102</td><td>user1</td><td>v2</td></tr>
+        <tr><td>103</td><td>user3</td><td>v1</td></tr>
+        <tr><td>104</td><td>user2</td><td>v2</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <div>
+    <h4>After cleanup</h4>
+    <div class="table-wrap"><table>
+      <thead><tr><th>offset</th><th>key</th><th>record</th></tr></thead>
+      <tbody>
+        <tr><td>102</td><td>user1</td><td>v2</td></tr>
+        <tr><td>104</td><td>user2</td><td>v2</td></tr>
+        <tr><td>103</td><td>user3</td><td>v1</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</div>
+<p><code>user1</code> and <code>user2</code> each had an older value (v1 at offsets 100 and 101) that was replaced by a newer one, so the old records are dropped. <code>user3</code> only ever had one value, so it stays. Offsets of the surviving records do not change. Compaction:</p>
+<ul><li>Happens at segment level</li><li>Is asynchronous</li><li>Does not block writes</li><li>Does not guarantee immediate cleanup</li></ul>
+
+<!-- ======================================================= -->
+<h2 id="why-fast"><span class="sec-num">21</span>Kafka Reads and Writes to Disk — So Why Is It So Fast?</h2>
+<p>One doubt might come to your mind: Kafka is reading from and writing to DISK, and disk reads and writes are slow. Then how come Kafka is so fast?</p>
+
+<h3 id="page-cache">Page Cache Optimization for event writes</h3>
+<p>Kafka trusts the OS for caching the log files efficiently.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Writes land in RAM first</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    L["Leader Broker · writes to disk"] --> PC["OS Page Cache (RAM)"] -->|"Asynchronously flush"| D[("Disk")]
+    classDef lead fill:#fff4ec,stroke:#dc2626,color:#7c2d12,stroke-width:2px
+    classDef ram fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:2px
+    class L lead
+    class PC ram
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Why this is fast</h4>
+    <ul>
+      <li><strong>No blocking disk wait</strong> — the write returns once it is in the OS page cache; the OS flushes to disk asynchronously.</li>
+      <li><strong>Sequential write</strong> (the best case for disks), because Kafka is append-only: no insert in the middle, never modifies old data, never updates a record in place — it only writes at the end. So the disk keeps moving forward.</li>
+    </ul>
+  </div>
+</div>
+
+<h3 id="zero-copy">Zero-Copy Optimization for event reads</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Normal read vs Kafka zero-copy read</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph N["Normal read"]
+      direction LR
+      a1[("Disk")] --> a2["OS Page Cache"] --> a3["User Space"] --> a4["Network"]
+    end
+    subgraph Z["Kafka zero-copy · sendfile()"]
+      direction LR
+      b1[("Disk")] --> b2["OS Page Cache"] --> b4["Network"]
+    end
+    classDef us fill:#fef1f1,stroke:#dc2626,color:#7f1d1d
+    classDef net fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48
+    class a3 us
+    class a4,b4 net
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Normally, reading something from disk goes <em>Disk &rarr; OS Page Cache &rarr; User Space &rarr; Network</em>. Kafka says: <strong>do not bring the data to my space, send it directly to the network</strong>, using the <code>sendfile()</code> system call. The flow becomes <em>Disk &rarr; OS Page Cache &rarr; Network</em>, and <strong>no copy is kept in the Kafka JVM</strong>.</p>
+    <p><strong>Advantages:</strong> data copy time and memory saved, CPU cycles saved, high throughput.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="failures"><span class="sec-num">22</span>Edge Cases and Failure Scenarios</h2>
+
+<h3 id="controller-fails">What happens when the Active Controller fails?</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Controller leader election</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C1 as Controller1 (Leader)
+    participant C2 as Controller2 (Follower)
+    participant C3 as Controller3 (Follower)
+    Note over C1: Controller1 crashes
+    Note over C2,C3: No heartbeat from leader
+    C2->>C3: Election starts - request vote
+    C3-->>C2: Vote for Controller2
+    Note over C2: Controller2 becomes new leader (2/3 majority)
+    Note over C3: Controller3 remains follower
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Impact</h4>
+    <p>Initial state: Controller1 leader, Controller2 and Controller3 followers. When Controller1 crashes, the followers stop receiving heartbeats; Controller2 starts an election and requests votes; Controller3 votes for it, giving a <strong>2/3 majority</strong> (the quorum). <strong>New leader elected, cluster continues.</strong></p>
+  </div>
+</div>
+
+<h3 id="leader-partition-fails">What happens when a Leader Partition fails?</h3>
+<p><strong>Setup:</strong> Partition 0 (RF=3) — Leader: Broker1, Followers: Broker2, Broker3.</p>
+<ol class="points">
+  <li><b>Step 1</b>Broker 1 (leader) crashes.</li>
+  <li><b>Step 2</b>The Controller detects the leader failure, as there is no heartbeat from the leader.</li>
+  <li><b>Step 3</b>The Controller triggers leader election. Candidates: Broker 2, Broker 3 (both in ISR). New leader: <strong>Broker 2</strong> (selected from ISR).</li>
+  <li><b>Step 4</b>The Controller updates metadata — Leader: Broker 1 &rarr; Broker 2; ISR: {Broker 2, Broker 3}.</li>
+  <li><b>Step 5</b>Clients receive the metadata update; producers/consumers reconnect to Broker 2.</li>
+  <li><b>Step 6</b>The system resumes normal operation.</li>
+</ol>
+<div class="callout tip"><span class="ci">&#9989;</span><div><p><strong>Impact:</strong> NO data loss (the new leader has all committed data, because it was in the ISR). Automatic recovery.</p></div></div>
+
+<h3 id="follower-fails">What happens when a Follower Partition fails?</h3>
+<p><strong>Setup:</strong> Partition 0 (RF=3) — Leader: Broker 1, Followers: Broker 2, Broker 3.</p>
+<ol class="points">
+  <li><b>Step 1</b>Broker 3 crashes.</li>
+  <li><b>Step 2</b>The leader (Broker 1) detects that Broker 3 is unresponsive — no timely fetch calls.</li>
+  <li><b>Step 3</b>The Controller removes Broker 3 from ISR: {Broker 1, Broker 2, Broker 3} &rarr; {Broker 1, Broker 2}.</li>
+  <li><b>Step 4</b>The system continues normally — producers still write (<code>acks=all</code> waits for 2 replicas), consumers still read, NO downtime.</li>
+  <li><b>Step 5</b>Broker 3 recovers.</li>
+  <li><b>Step 6</b>Broker 3 catches up with the leader.</li>
+  <li><b>Step 7</b>Broker 3 is added back to ISR: {Broker 1, Broker 2} &rarr; {Broker 1, Broker 2, Broker 3}.</li>
+</ol>
+<div class="callout tip"><span class="ci">&#9989;</span><div><p><strong>Impact:</strong> NO data loss, NO downtime.</p></div></div>
+
+<h3 id="topic-fails">What happens when a Topic fails?</h3>
+<div class="callout key"><span class="ci">&#127891;</span><div><p>When an interviewer asks this question, the answer is: <strong>a topic never fails</strong>, as it is just a logical category or folder. <em>Partitions</em> fail, which we have seen above.</p></div></div>
+
+<h3 id="consumer-fails">What happens when a Consumer fails?</h3>
+<h4>Scenario 1: Consumer crashes before committing the offset (manual commit, batch wise)</h4>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Crash before commit &rarr; duplicates</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Consumer
+    participant K as Kafka
+    C->>K: Step 1 - poll
+    K-->>C: offsets 100-199
+    Note over C: Step 2 - process events 100-150
+    Note over C: Step 3 - CRASH (before commit)
+    Note over C: Step 4 - consumer restarts
+    C->>K: Step 5 - what is my last offset?
+    K-->>C: Step 6 - offset 99 (last committed)
+    Note over C: Step 7 - reprocess events 100-150 (DUPLICATES)
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Result</h4>
+    <p><strong>At-least-once delivery</strong> (duplicates possible). Events 100-150 were processed once before the crash and are processed again after the restart, because the last committed offset was still 99.</p>
+  </div>
+</div>
+
+<h4>Scenario 2: Consumer heartbeat timeout — long processing time</h4>
+<ol class="points red">
+  <li><b>Step 1</b>Consumer polls events.</li>
+  <li><b>Step 2</b>Consumer starts processing (takes 6 minutes).</li>
+  <li><b>Step 3</b><code>max.poll.interval.ms</code> (5 minutes) is exceeded.</li>
+  <li><b>Step 4</b>The Group Coordinator considers the consumer DEAD, as it did not get the expected signal from it (the consumer is busy processing).</li>
+  <li><b>Step 5</b>Rebalance is triggered.</li>
+  <li><b>Step 6</b>Partitions are reassigned to other consumers.</li>
+  <li><b>Step 7</b>The original consumer finishes processing.</li>
+  <li><b>Step 8</b>The original consumer tries to commit.</li>
+  <li><b>Step 9</b>The Group Coordinator rejects the commit (consumer not in group).</li>
+</ol>
+<div class="callout danger"><span class="ci">&#128465;</span><div><p><strong>Result:</strong> wasted processing.</p></div></div>
+<div class="card">
+  <div class="card-title">&#128295; Solutions</div>
+  <ol>
+    <li>Increase <code>max.poll.interval.ms</code>.</li>
+    <li>Reduce <code>max.poll.records</code> (process smaller batches).</li>
+    <li>Optimize the processing logic (faster processing).</li>
+    <li>Use a separate thread pool for processing.</li>
+  </ol>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>In current Kafka clients, heartbeats are sent from a background thread, so a busy consumer can still be heartbeating. What removes it from the group in this scenario is the gap between two <code>poll()</code> calls exceeding <code>max.poll.interval.ms</code>. The outcome — rebalance, reassignment and rejected commit — is the same. (Covered in detail in the consumer chapters.)</p></div></div>
+
+<h3 id="broker-fails">What happens when a Broker fails?</h3>
+<p><strong>Setup:</strong> Cluster: 3 brokers. Topic: <code>order-events</code> (6 partitions, RF=3).</p>
+<ol class="points">
+  <li><b>Step 1</b>Broker 1 crashes.</li>
+  <li><b>Step 2</b>The Controller detects the failure, as it did not receive any heartbeat.</li>
+  <li><b>Step 3</b>For each partition where Broker 1 was <strong>leader</strong>: a new leader is elected from ISR and metadata is updated.</li>
+  <li><b>Step 4</b>For each partition where Broker 1 was <strong>follower</strong>: it is removed from ISR and the partition continues with the remaining replicas.</li>
+  <li><b>Step 5</b>Clients receive the metadata update.</li>
+  <li><b>Step 6</b>The system continues normally.</li>
+</ol>
+<div class="callout tip"><span class="ci">&#9989;</span><div><p><strong>Impact:</strong> NO data loss. Automatic recovery.</p></div></div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li><strong>Kafka</strong> = distributed event streaming platform: publish, store, subscribe.</li>
+    <li><strong>Topic</strong> = logical category; <strong>partition</strong> = physical, ordered, append-only log. Order is guaranteed only <em>within</em> a partition.</li>
+    <li>Partition logs are split into <strong>segments</strong>, each with a sparse <strong>index</strong> (one row every <em>index interval bytes</em>).</li>
+    <li>Partitioning: <strong>key-based</strong> (same key &rarr; same partition), <strong>round robin</strong> (no key), or <strong>custom</strong>.</li>
+    <li>In one <strong>consumer group</strong> a partition is read by only one consumer; different groups read independently. Committed offsets live in <code>__consumer_offsets</code> (50 partitions, keyed by group id).</li>
+    <li>Auto-commit risks <strong>at-most-once</strong>; manual commit after processing gives <strong>at-least-once</strong>.</li>
+    <li>Each partition has one <strong>leader</strong> and followers; the <strong>Controller</strong> manages metadata, and multiple controllers agree through <strong>KRaft (Raft) quorum</strong>.</li>
+    <li><strong>ISR</strong> + <code>acks=all</code> + <code>min.insync.replicas</code> give durable writes; failures are handled by electing new leaders from the ISR.</li>
+    <li>Kafka consumers <strong>pull</strong>. Kafka is fast thanks to the <strong>OS page cache</strong>, <strong>sequential writes</strong> and <strong>zero-copy</strong> reads.</li>
+  </ul>
+</div>

@@ -1,0 +1,302 @@
+<!--meta
+{
+  "lead": "The processor part of a topology, starting with stateless nodes — operations that look at one record at a time and remember nothing. How a KStream variable is a reference to a stage in the pipeline, and the six key stateless operations in depth: filter, map, mapValues, selectKey, split/branch and merge, including which ones can trigger a repartition later.",
+  "date": "Tuesday, 21 July 2026",
+  "related": [
+    { "n": 16, "why": "The source node — KStream, KTable, GlobalKTable — that feeds these processors." },
+    { "n": 17, "why": "SerDes — needed whenever a processor changes the key or value type." },
+    { "n": 15, "why": "Repartition topics and sub-topologies, triggered by key changes." },
+    { "n": 19, "why": "Stateful processing nodes: groupBy, count, aggregate, joins." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="processors"><span class="sec-num">1</span>Processors: Stateless and Stateful</h2>
+<p>A topology has 3 parts — <strong>Source</strong> (<a href="16-kstream-ktable-globalktable.html">Chapter 16</a>), <strong>Processor</strong> and <strong>Sink</strong>. Processors are the business logic, where transformation happens: they receive records from their parent, process them, and forward results to their children.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Two kinds of processing node</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    S["Source · order-events"] --> P["PROCESSORS"]
+    P --> A["Stateless processing nodes · this chapter"]
+    P --> B["Stateful processing nodes · next chapter"]
+    A --> K["Sink · output topic"]
+    B --> K
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef on fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:2px
+    classDef off fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class S src
+    class P,A on
+    class B off
+    class K sink
+</div>
+  </div>
+</div>
+<div class="callout key"><span class="ci">&#128161;</span><div>
+  <p>A <strong>stateless node</strong> processes each record <strong>independently</strong>; it does not remember anything from previous records. No state store, no changelog. The important stateless operations, each covered below:</p>
+  <div class="chips"><span>1 · filter</span><span>2 · map</span><span>3 · mapValues</span><span>4 · selectKey</span><span>5 · split / branch</span><span>6 · merge</span></div>
+  <p>Others include <code>flatMap</code>, <code>flatMapValues</code>, <code>peek</code> and <code>foreach</code>. Generally, stateless operations <strong>return a KStream</strong>.</p>
+</div></div>
+
+<h3 id="kstream-reference">A KStream is a reference to a stage</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Variables point at nodes, not at data</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    SRC["Processing node · read records from Kafka (source)"] --> F1["Processing node · filter &gt;= 1000"]
+    SRC --> F2["Processing node · filter &lt; 1000"]
+    O(["orders KStream"]) -. "reference to source stage" .-> SRC
+    H(["highOrder KStream"]) -. "reference to '&gt;= 1000' node" .-> F1
+    L(["lowOrder KStream"]) -. "reference to '&lt; 1000' node" .-> F2
+    classDef node1 fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ref fill:#fff7e0,stroke:#d4a017,color:#7a5a00,stroke-width:1.5px
+    class SRC,F1,F2 node1
+    class O,H,L ref
+</div>
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li>A <code>KStream</code> object represents a <strong>stage in the processing pipeline</strong>. It does <strong>not contain data</strong>.</li>
+      <li>Holding several KStream objects lets us continue building the topology from <strong>different stages</strong> of the same pipeline, e.g. two filters both hanging off the source.</li>
+    </ul>
+    <p>Calling <code>filter</code> adds a node to the topology and returns a new KStream pointing at it. Nothing runs until the application starts; then every record flows through the nodes.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="filter"><span class="sec-num">2</span>filter</h2>
+<p><code>filter</code> keeps only the records that satisfy a condition: if the condition returns <code>true</code>, the record continues in the stream; if <code>false</code>, the record is <strong>dropped</strong>.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KStream.filter signature</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// returns KStream&lt;K, V&gt;; Predicate takes the key and the value
+KStream&lt;K, V&gt; filter(Predicate&lt;? super K, ? super V&gt; predicate);</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Predicate.java (Kafka Streams)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface Predicate&lt;K, V&gt; {
+    boolean test(K var1, V var2);
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SourceTypesTopology.java — filter</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    @Autowired
+    public void kstreamDemo(StreamsBuilder builder) {
+
+        Serde&lt;Order&gt; orderSerde = new JsonSerde&lt;&gt;(Order.class);
+
+        // Processing node: reading from source
+        // orders KStream acts as a reference to the source processing node
+        KStream&lt;String, Order&gt; orders = builder.stream("order-events",
+                Consumed.with(Serdes.String(), orderSerde));
+
+        // Processing node: filter amount &gt; 1000
+        // highValueOrders KStream acts as a reference to the filter processing node
+        KStream&lt;String, Order&gt; highValueOrders =
+                orders.filter((key, order) -&gt; order.getTotalAmount() &gt; 1000);
+
+        highValueOrders.to("order-events-output",
+                Produced.with(Serdes.String(), orderSerde));
+    }
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>In the notes, <code>.to(...)</code> is chained straight onto <code>filter(...)</code> and the result is assigned to <code>highValueOrders</code>. <code>to()</code> returns <code>void</code>, so that does not compile; the sink call is made on the variable instead, as above. <code>@Bean void</code> is written as <code>@Autowired</code> (see <a href="16-kstream-ktable-globalktable.html#kstream">Chapter 16</a>). The inverse operation, <code>filterNot</code>, keeps the records where the predicate is <code>false</code>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="map"><span class="sec-num">3</span>map</h2>
+<p><code>map</code> transforms each record into another record. It can change <strong>only the key</strong>, <strong>only the value</strong>, or <strong>both</strong>.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KStream.map signature</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// returns KStream&lt;KR, VR&gt; (new key, new value);
+// the mapper takes (old key, old value) and returns a KeyValue
+&lt;KR, VR&gt; KStream&lt;KR, VR&gt; map(
+    KeyValueMapper&lt;? super K, ? super V,
+                   ? extends KeyValue&lt;? extends KR, ? extends VR&gt;&gt; mapper);</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KeyValueMapper.java (Kafka Streams)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface KeyValueMapper&lt;K, V, VR&gt; {
+    VR apply(K var1, V var2);
+}</code></pre>
+  </div>
+</div>
+<p>The return type of this functional interface is <code>VR</code>; for <code>map</code>, <code>VR</code> is a <code>KeyValue&lt;KR, VR&gt;</code> pair holding the new key and the new value.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">map — change only the key</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">// Processing node: map, change only the key
+// updatedOrders KStream acts as a reference to this map processing node
+KStream&lt;String, Order&gt; updatedOrders =
+        orders.map((key, order) -&gt; KeyValue.pair("ORDER-" + key, order));
+
+updatedOrders.to("order-events-output",
+        Produced.with(Serdes.String(), orderSerde));</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">input</span><div class="cells"><span class="cell">101<small>Order</small></span></div></div>
+  <div class="row"><span class="lab">after map()</span><div class="cells"><span class="cell new">ORDER-101<small>Order</small></span></div><span class="ptr t">key changed</span></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="mapvalues"><span class="sec-num">4</span>mapValues</h2>
+<p>Like <code>map()</code>, but <strong>no key change is allowed</strong> — only the value can be changed.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">mapValues — Order → OrderAlert</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KStream&lt;String, OrderAlert&gt; alerts =
+        orders.mapValues(order -&gt; new OrderAlert(order.getOrderId(), order.getAmount()));</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">input</span><div class="cells"><span class="cell">order-1<small>Order</small></span></div></div>
+  <div class="row"><span class="lab">output</span><div class="cells"><span class="cell new">order-1<small>OrderAlert</small></span></div><span class="ptr t">value type changed</span></div>
+</div>
+<p>Because the value type changes from <code>Order</code> to <code>OrderAlert</code>, a sink or store after this needs a SerDe for <code>OrderAlert</code> (e.g. <code>new JsonSerde&lt;&gt;(OrderAlert.class)</code>). The examples assume the classes have these getters (<code>getAmount</code>, <code>getUserId</code>); with Chapter 15's <code>Order</code> they would be <code>getTotalAmount</code> / <code>getCustomerId</code>.</p>
+
+<!-- ======================================================= -->
+<h2 id="selectkey"><span class="sec-num">5</span>selectKey</h2>
+<p>The opposite restriction: <strong>only the key can change</strong>, no value change is allowed.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">selectKey — re-key by user</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KStream&lt;String, Order&gt; ordersByUser =
+        orders.selectKey((orderId, order) -&gt; order.getUserId());</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">input</span><div class="cells"><span class="cell">order-1<small>{ userId: "u1", amount: 500 }</small></span></div></div>
+  <div class="row"><span class="lab">output</span><div class="cells"><span class="cell new">u1<small>{ userId: "u1", amount: 500 }</small></span></div><span class="ptr t">key changed</span></div>
+</div>
+
+<h3 id="compare">map vs mapValues vs selectKey</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Method</th><th>Can change key</th><th>Can change value</th><th>May require repartition later</th></tr></thead>
+    <tbody>
+      <tr><td><code>map()</code></td><td>Yes</td><td>Yes</td><td>Yes (if the key is changed)</td></tr>
+      <tr><td><code>mapValues()</code></td><td>No</td><td>Yes</td><td>No</td></tr>
+      <tr><td><code>selectKey()</code></td><td>Yes</td><td>No</td><td>Yes</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div>
+  <p><strong>When the key changes, the repartition does not happen immediately.</strong> It happens when a <strong>downstream operation</strong> needs the records partitioned by the new key — generally <code>groupByKey</code> or a <code>join</code>. (Concept: <a href="15-kafka-streams-architecture.html#sub-topology">repartitioning</a> in Kafka Streams Architecture.)</p>
+  <p>Kafka Streams cannot see inside <code>map()</code>, so it must assume the key changed and marks the stream as needing repartitioning. If you only change the value, prefer <code>mapValues()</code>: it avoids an unnecessary repartition topic.</p>
+</div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">selectKey → groupByKey splits the topology</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph ST0["Sub-topology 0"]
+        A1["Source · order-events · key orderId"] --> A2["selectKey(productId)"] --> A3["Sink · repartition-topic · key productId"]
+    end
+    subgraph ST1["Sub-topology 1"]
+        B1["Source · repartition-topic"] --> B2["groupByKey"] --> B3["count"] --> B4["Sink · product-order-counts"]
+    end
+    A3 -.-> B1
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A1,B1 src
+    class A2,B2,B3 proc
+    class A3,B4 sink
+</div>
+  </div>
+  <div class="diagram-explain"><p>The topology <em>source → selectKey(productId) → groupByKey → count → sink</em>: the repartition topic is inserted <strong>right before</strong> <code>groupByKey</code>, not at <code>selectKey</code>. Without the grouping, the re-keyed records would simply go to the sink with the new key and no repartition.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="split"><span class="sec-num">6</span>split / branch</h2>
+<p><strong>The problem with two filters:</strong></p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">two independent filters</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// Processing node: filter amount &gt; 1000
+KStream&lt;String, Order&gt; highValueOrders =
+        orders.filter((key, order) -&gt; order.getTotalAmount() &gt; 1000);
+
+// Processing node: filter amount &lt;= 1000
+KStream&lt;String, Order&gt; lowValueOrders =
+        orders.filter((key, order) -&gt; order.getTotalAmount() &lt;= 1000);</code></pre>
+</div>
+<p>For each record, <strong>both filters are executed</strong>. That is fine when a record can go both ways; otherwise, why check every condition for every record? Use <code>split()</code> with branches:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">split / branch</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">Map&lt;String, KStream&lt;String, Order&gt;&gt; branches = orders.split(Named.as("orders-"))
+        .branch((k, o) -&gt; o.getTotalAmount() &gt; 2000, Branched.as("premium"))
+        .branch((k, o) -&gt; o.getTotalAmount() &gt; 1000, Branched.as("high"))
+        .defaultBranch(Branched.as("low"));
+
+KStream&lt;String, Order&gt; premiumOrders = branches.get("orders-premium");
+KStream&lt;String, Order&gt; highOrders = branches.get("orders-high");
+KStream&lt;String, Order&gt; lowOrders = branches.get("orders-low");</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">An if / else-if / else chain</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    O["orders"] --> Q1{"amount &gt; 2000?"}
+    Q1 -- "yes" --> P["premium"]
+    Q1 -- "no" --> Q2{"amount &gt; 1000?"}
+    Q2 -- "yes" --> H["high"]
+    Q2 -- "no" --> L["low (defaultBranch)"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef out fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class O,Q1,Q2 step
+    class P,H,L out
+</div>
+  </div>
+  <div class="diagram-explain"><p>Branches are checked <strong>in order</strong> and a record goes to the <strong>first</strong> branch whose predicate matches; not every condition is evaluated. An order of 2500 goes to <em>premium</em> only, even though it is also &gt; 1000. Without <code>defaultBranch</code>, records matching no branch are dropped.</p></div>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes call <code>orders.split()</code> with no name and then look up <code>branches.get("premium")</code>. The map keys are the split's name <strong>prefix</strong> + the branch name. With an unnamed <code>split()</code> the prefix is a generated name, so a lookup by just <code>"premium"</code> returns <code>null</code>. Giving the split a name with <code>Named.as("orders-")</code> makes the keys predictable: <code>orders-premium</code>, <code>orders-high</code>, <code>orders-low</code>. (Alternatively, <code>Branched.withConsumer(...)</code> handles each branch inline without the map.)</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="merge"><span class="sec-num">7</span>merge</h2>
+<p><code>merge()</code> is the opposite of <code>split()</code>: <code>split()</code> turns one stream into many; <code>merge()</code> turns many streams into one.</p>
+<div class="grid grid-2" style="align-items:center">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">merge the branches back</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KStream&lt;String, Order&gt; premiumOrders = branches.get("orders-premium");
+KStream&lt;String, Order&gt; highOrders = branches.get("orders-high");
+KStream&lt;String, Order&gt; lowOrders = branches.get("orders-low");
+
+KStream&lt;String, Order&gt; allOrders = premiumOrders
+        .merge(highOrders)
+        .merge(lowOrders);</code></pre>
+  </div>
+  <div class="mermaid">
+flowchart LR
+    P["premiumOrders"] --> M["merge"]
+    H["highOrders"] --> M
+    L["lowOrders"] --> M
+    M --> A["allOrders"]
+    classDef in fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef out fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class P,H,L in
+    class M,A out
+  </div>
+</div>
+<p>The <strong>key and value types must be the same</strong> for all merged streams. There is no ordering guarantee between records coming from different input streams; order is only kept within each input.</p>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>A typical pattern: <strong>split</strong> to treat each kind of order differently (e.g. <code>mapValues</code> a discount onto premium orders only), then <strong>merge</strong> to continue with a single stream and one sink.</p></div></div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <div class="table-wrap" style="margin:8px 0 0">
+    <table>
+      <thead><tr><th>Operation</th><th>Does</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>filter</code></td><td>keeps records where the predicate is true</td><td>KStream&lt;K, V&gt;</td></tr>
+        <tr><td><code>map</code></td><td>new key and/or value</td><td>KStream&lt;KR, VR&gt;</td></tr>
+        <tr><td><code>mapValues</code></td><td>new value only (no repartition)</td><td>KStream&lt;K, VR&gt;</td></tr>
+        <tr><td><code>selectKey</code></td><td>new key only (repartition before grouping/join)</td><td>KStream&lt;KR, V&gt;</td></tr>
+        <tr><td><code>split / branch</code></td><td>routes each record to the first matching branch</td><td>Map&lt;String, KStream&lt;K, V&gt;&gt;</td></tr>
+        <tr><td><code>merge</code></td><td>combines streams of the same type</td><td>KStream&lt;K, V&gt;</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div></div>

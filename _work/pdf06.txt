@@ -1,0 +1,279 @@
+11. Consumer Setup - Part1
+
+Saturday, 14 March 2026 12:11PM
+
+                  In Kafka Architecture topic, I have already covered the overall Consumer workflow:
+
+                                         Complete Consumer Read Flow:
+
+                                                                                                                                  Active
+                                                                                                                                  Controller
+
+                                                                                                               Give me metadata:                 Metadata response
+
+                                                                                                                        Broker-1 (any broker)
+
+                                                                                                               Give me metadata:                 Metadata response
+                                                                                                               Broker vs partition (leader)
+
+                             Step1:                                       Step2:                               Step3:                                    Metadata:
+         Consumer Starts and want to join Group           Finds the Partition number of topic                           Consumer requests metadata
+                                                          "_consumer_offsets"                                                                            topic: _consumer_offsets
+             group.id = "notification-service"                                                                                (first time or refresh)     partition 0:
+                                                     hash("notification-service-group-id")%50 = 23
+                                                     Partition 23 of topic _consumer_offsets                                                                  leader = Broker 1
+                                                                                                                                                         partition 2
+
+                                                                                                                                                             leader = Broker 2
+                                                                                                                                                         partition 23
+
+                                                                                                                                                             leader = Broker 3
+
+                      Step8:                                                  Step6:                                                     Step4:
+
+         Check the metadata and invokes Leader       Consumer fetch last offset for                                     Invokes Broker3 (Group Coordinator)
+                          Broker of                                          Topic "order-events"                        and request to join the "notification-service"
+                                                                                   Partition-2                                                  group
+                    Topic "order-events"
+                          Partition-2
+
+         Fetch from offset 101  Return 101 - 501                                                                                             Join group             Once all followers get the latest update.
+                                                                                                                                                                    Group coordinator sends response:
+         Max bytes send me : 200bytes offset events  Get metadata, till where offset is processed  Return 100                                                       Partition-2 assigned
+                                                                                                                                                                    For topic "order-events"
+
+             Step9:                                                    Step7:                                                           Step5:
+                                                     Broker3 (Group coordinator)                                        Broker3 (Group coordinator)
+         Broker2 (Leader of)                         Looks at "_consumer_offsets"
+         Topic "order-events"                        Creates a key: group.id_topic_Partition                            Group: Notification-service
+                                                     key: "notificationGroupId_order-events_Partition-2"
+               Partition-2                           Value: offset 100                                                  Topic: order-events
+                                                                                                                        Consumer1 : handle Parition-0
+                                                               Note: Consumer offset details are not Cluster metadata,  Consumer2: handle Partiton-1                Broker3 waits for all followers to update the events.
+                                                               Its stored like normal topic data.                       Consumer3: handle Partition-2               in topic "_consumer_offset" and partition 23.
+                                                               Its not stored in Controller nodes.
+                                                                                                                                                                    there is no option to provide (ack=0 or 1 or all)
+                                                                                                                                                                    Internally Consumer act like Ack=All
+
+                                                                                                                        Followers do continuous polling.
+                                                                                                                        And Ack when followers updated their partition logs
+
+                                                                                                                                Broker1                          Broker2
+                                                                                                                        Partition 23 (follower)          Partition 23 (follower)
+
+Step10:                         Step11:                                Step13:
+Consumer process events  Consumer commits offset              Continuous Polling and move
+                         (manual batch wise)                  to step 8
+
+                         Commit  ACK
+
+                            Step12:
+
+                         Broker3 (Group Coordinator)
+
+                         Writes to:
+                         _consumer_offsets, Partition23:
+                         (group, topic, partition)
+                         offset processed till = 501
+
+                                                Step1: Dependency
+
+                                                            pom.xml
+                                 <dependency>
+
+                                      <groupId>org.springframework.kafka</groupId>
+                                      <artifactId>spring-kafka</artifactId>
+                                 </dependency>
+
+                                                          Step2: application.properties
+
+server.port=8082
+spring.application.name=kafka-consumer-service
+
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+spring.kafka.consumer.group-id=order-consumer-group                                      Which group consumer needs to join
+
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer                              Should be same what at
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer                       Producer we have selected
+
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+                                                                                                      Since we have selected JSON Deserializer , we need to tell the
+                                                                                                      default type, in which this JSON need to be converted to.
+
+                                                                                                              POJO class
+
+                                                                                         public class Order {
+                                                                                            private String orderId;
+                                                                                            private String customerId;
+                                                                                            private String productId;
+                                                                                            private Integer quantity;
+                                                                                            private Double totalAmount;
+                                                                                            private String status;
+
+                                                                                               //getters and setters
+                                                                                         }
+
+                                 Step3: Which topic need to listen and Business logic
+                                                                             Topic consumer interested in  For each record(event), this method will get executed
+
+@Component
+public class OrderEventListener {
+
+@KafkaListener(topics="order-events")
+public void consume (Order order) {
+
+      //business logic
+      System.out.println("Received order event: " + order.getOrderId());
+   }
+}
+
+                                                          DEMO
+
+                                          Now lets go 1 level deeper, what is happening behind the scene:
+
+                                          conceptually what we have to do without spring boot is:
+
+                                   Properties props = new Properties();                                                             Which group consumer needs to join
+                                      props.put("bootstrap.servers", "localhost:9092,localhost:9192");
+Should be same what                   props.put("group.id", "order-consumer-group");
+producer has selected                 props.put("key.deserializer", StringDeserializer.class);
+                                      props.put("value.deserializer", JsonDeserializer.class);
+Which topic, this consumer is         props.put("auto.offset.reset", "latest");
+interested in.                        props.put("enable.auto.commit", "true");
+
+  If auto-commit is enabled,       KafkaConsumer consumer = new KafkaConsumer<>(props);
+  then after specific time         consumer.subscribe(Arrays.asList("order-events"));
+  interval, it commit the offset.
+                                   Connect with 1 of the broker and fetch cluster metadata and store it
+
+                                   try {
+
+                                          while (true) {
+
+                                          ConsumerRecords records = consumer.poll()                        Continuous poll inside While(true) loop,
+                                                Internally poll() method, If it's a First call:            and it will fetch the records
+
+                                                          � Sends JoinGroupRequest to Group Coordinator
+
+                                                          � Receives partition assignment
+
+                                                          � Request last committed offset for assigned partition from group coordinator
+
+                                                          � Group coordinator reads from _consumer_offsets and return the offset that need to be read.
+
+                                                          � Sends FetchRequest to partition leaders with offset which it want to read
+
+                                          If not a first calls:
+                                              � For subsequent calls, Sends FetchRequest for new data (new offsets in continuous manner)
+
+                                          //commitIntervalPassed default is 5sec, after every 5 second, make offset commit request
+
+                                          if (autoCommitEnabled && commitIntervalPassed) {
+                                                 commitOffsets();
+No matter if fetch poll records                }
+are successfully processed or
+not.                                                                                                                                Process the events
+
+                                               for (ConsumerRecord record : records) {
+                                                         //business logic
+
+                                                }
+
+                                          If enable.auto.commit=false, we must call:                                                If auto-commit is false, then
+                                              � consumer.commitSync(); // blocks until broker confirms                              Manually send the commit request
+                                              � consumer.commitAsync(); // fire-and-forget, no guarantee
+
+                                       }
+
+                                    }
+
+                                    finally {
+
+                                          consumer.close(); // leaves consumer group
+
+                                          no heartbeat send by consumer background thread to broker, broker consider it dead and triggers rebalance
+
+                                    }
+
+                                 }
+
+Now good thing is, we don't have to write all of this by ourself, its all provided within Spring Kafka framework.
+
+                                                                                                                                                                      We have to provide this
+
+                    Properties props = new Properties();                                                                            application.properties  spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+                       props.put("bootstrap.servers", "localhost:9092,localhost:9192");                                                                     spring.kafka.consumer.group-id=order-consumer-group
+                       props.put("group.id", "order-consumer-group");                                                                                       spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+                       props.put("key.deserializer", StringDeserializer.class);                                                                             spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+                       props.put("value.deserializer", JsonDeserializer.class);                                                                             spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+                       props.put("auto.offset.reset", "latest");                                                                                            spring.kafka.consumer.auto-offset-reset=latest //default
+                       props.put("enable.auto.commit", "true");                                                                                             spring.kafka.consumer.enable-auto-commit=true //default
+
+                                                                                                                                                                      ConsumerFactory
+
+                    KafkaConsumer consumer = new KafkaConsumer<>(props);                                  ConsumerFactory used to creates an object of
+                                                                                                          KafkaConsumer using application.properties
+
+                                                                                                                                                                      DeafultKafkaConsumerFactory  Framework provided this
+
+                    consumer.subscribe(Arrays.asList("order-events"));
+
+                    Connect with 1 of the broker and fetch cluster metadata and store it
+
+                    try {                                                                                                                                   @KafkaListener
+                              while (true) {
+                                     ConsumerRecords records = consumer.poll()                                                                               @KafkaListener(topics = "order-events")
+                                                                                                                                                                    public void consume(Order order) {
+                                          //commitIntervalPassed default is 5sec, after every 5 second, make offset commit request
+                                                                                                                                                                      //business logic
+                                     if (autoCommitEnabled && commitIntervalPassed) {
+                                            commitOffsets();                                                                                                        System.out.println("Received order event: " + order);
+                                                                                                                                                             }
+                                     }
+
+KafkaListenerContainer           for (ConsumerRecord record : records) {
+                                           //business logic
+
+                                  }
+
+                                                                                                                                                                      We have to provide this
+
+Framework provided            If enable.auto.commit=false, we must call:
+this                              � consumer.commitSync(); // blocks until broker confirms
+                                  � consumer.commitAsync(); // fire-and-forget, no guarantee
+
+                           }
+                        }
+                        finally {
+
+                              consumer.close(); // leaves consumer group
+                              no heartbeat send by consumer background thread to broker, broker consider it dead and triggers rebalance
+                        }
+                    }
+                                                                Flow is:
+
+Spring boot Application starts
+             KafkaAutoConfiguration Triggered by spring-kafka on class path
+                                              Creates Bean: ConsumerFactory reads spring.kafka.consumer.* props, stores as Map
+                                              Creates Bean: ConcurrentKafkaListenerContainerFactory holds reference of ConsumerFactory, no Kafka Consumer
+
+                                                                                                                                                            object created as of now.
+
+@EnableKafka  Automatically added by Spring boot based on class path.
+              Then only it will enable Kafka listener processing
+
+              Create Bean: KafkaListenerAnnotationBeanPostProcessor
+
+              Scan @KafkaListener
+
+              For each @KafkaListener, ask
+              ConcurrentKafkaListenerContainerFactory to create
+              KafkaListenerContainer bean
+
+                                      KafkaListenerContainer gets
+                                      KafkaConsumer object from Consumer Factory
+
+                                                                       Poll loop starts
+

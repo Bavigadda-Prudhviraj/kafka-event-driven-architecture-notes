@@ -1,0 +1,783 @@
+<!--meta
+{
+  "lead": "Hands-on: build a real KRaft-based Kafka cluster on one machine — two controllers and two brokers — from the Kafka 4.2.0 binary. Every configuration property is explained, then we format the storage, start the nodes, verify the quorum and finally produce and consume messages from the CLI.",
+  "date": "Thursday, 26 February 2026",
+  "related": [
+    { "n": 2, "why": "The theory behind this setup: brokers, controllers, KRaft quorum, ISR and replication." },
+    { "n": 4, "why": "Connect a Spring Boot producer to the brokers started here (localhost:9092 / 9192)." },
+    { "n": 6, "why": "Connect a Spring Boot consumer to this cluster." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">What we will build</b>
+    <p>In <a href="02-kafka-architecture.html">Kafka Architecture</a> we learned what brokers, controllers and KRaft do. Today we set up that cluster for real: <strong>2 KRaft controllers</strong> (node ids 1 and 2) and <strong>2 brokers</strong> (node ids 3 and 4), all running locally, and then test it with the console producer and consumer.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="target-cluster"><span class="sec-num">1</span>The Cluster We Will Set Up</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Target Kafka cluster</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:clusterSetup-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Components</h4>
+    <ul>
+      <li><strong>Kafka Broker-1 and Kafka Broker-2</strong> store the partitions of topic <code>order-events</code>. Each partition has a leader on one broker and a follower on the other (P0 leader on Broker-1, P1 leader on Broker-2, and so on).</li>
+      <li><strong>Controller1 (Active)</strong> and <strong>Controller2 (Stand-by)</strong> form the KRaft quorum and manage the cluster metadata. They exchange <strong>heartbeats</strong> with each other.</li>
+      <li>The brokers exchange <strong>heartbeats</strong> with the controllers and receive <strong>metadata updates</strong> from them.</li>
+      <li><strong>Producer1</strong> writes into the cluster and a <strong>Consumer Group</strong> reads from it.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Node</th><th>node.id</th><th>process.roles</th><th>Listener (port)</th><th>log.dirs</th></tr></thead>
+    <tbody>
+      <tr><td>Controller1</td><td>1</td><td>controller</td><td><code>CONTROLLER://:9093</code></td><td><code>/tmp/controller1-logs</code></td></tr>
+      <tr><td>Controller2</td><td>2</td><td>controller</td><td><code>CONTROLLER://:9193</code></td><td><code>/tmp/controller2-logs</code></td></tr>
+      <tr><td>Broker1</td><td>3</td><td>broker</td><td><code>BROKER://:9092</code></td><td><code>/tmp/broker1-logs</code></td></tr>
+      <tr><td>Broker2</td><td>4</td><td>broker</td><td><code>BROKER://:9192</code></td><td><code>/tmp/broker2-logs</code></td></tr>
+    </tbody>
+  </table>
+</div>
+<p>Every node runs on <code>localhost</code>, so each one needs its <strong>own port</strong> and its <strong>own data directory</strong>.</p>
+
+<!-- ======================================================= -->
+<h2 id="download"><span class="sec-num">2</span>Step 1: Download the Latest Kafka Binary</h2>
+<div class="callout note">
+  <span class="ci">&#128051;</span>
+  <div>
+    <b class="ct">Note: Binary vs Docker</b>
+    <p>Instead of downloading the binary, we can also use the Kafka Docker image. Since Docker hasn't been covered yet, this setup uses the binary download. It is also a good way to understand things — once understood properly, running via a Docker image is no different and would be very easy.</p>
+  </div>
+</div>
+<ol class="steps">
+  <li>Download the latest Kafka binary from <a href="https://kafka.apache.org/community/downloads/" target="_blank" rel="noopener">https://kafka.apache.org/community/downloads/</a>.</li>
+  <li>Version used here: <strong>4.2.0</strong> — the latest, released on <strong>17th Feb 2026</strong>.</li>
+  <li>Binary download: <code>kafka_2.13-4.2.0.tgz</code> (the page also offers its <code>asc</code> and <code>sha512</code> files to verify the download). <code>2.13</code> is the Scala version the binary is built with, <code>4.2.0</code> is the Kafka version.</li>
+</ol>
+<p>Extract the archive and move into the Kafka folder — all later commands are run from here:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">extract — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ tar -xzf kafka_2.13-4.2.0.tgz
+$ cd kafka_2.13-4.2.0</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">extract — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">REM tar is built into Windows 10 and later. Extract to a SHORT path such as C:\kafka
+&gt; cd C:\
+&gt; tar -xzf %USERPROFILE%\Downloads\kafka_2.13-4.2.0.tgz
+&gt; ren kafka_2.13-4.2.0 kafka
+&gt; cd C:\kafka</code></pre>
+</div>
+</div>
+<div class="callout warn"><span class="ci">&#129695;</span><div><b class="ct">Windows tips</b><p>Keep Kafka in a short folder path without spaces (for example <code>C:\kafka</code>). The <code>.bat</code> scripts build a long classpath, and a deep path can fail with <em>“The input line is too long”</em>. Run every command from a <strong>Command Prompt</strong> opened in that folder. Kafka on Windows is fine for learning and local development; production clusters normally run on Linux.</p></div></div>
+<p>Once downloaded and extracted, you will see these sub-folders within the Kafka folder:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka_2.13-4.2.0/</span><span class="lang">text</span></div>
+<pre><code data-lang="text">kafka_2.13-4.2.0/
+ ├── bin/
+ ├── config/
+ ├── libs/
+ ├── LICENSE
+ ├── licenses/
+ ├── logs/
+ ├── NOTICE
+ └── site-docs/</code></pre>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="folders"><span class="sec-num">3</span>Step 2: Understand Each Sub-folder</h2>
+
+<h3 id="bin">bin/</h3>
+<p>This folder contains <strong>executable shell scripts</strong>, used to perform tasks like:</p>
+<div class="grid grid-3">
+  <div class="card feature violet"><span class="icon">&#9881;</span><h4>Start servers</h4><p>Start the controller server and the broker server.</p></div>
+  <div class="card feature"><span class="icon">&#128450;</span><h4>Manage topics</h4><p>Create topic, delete topic.</p></div>
+  <div class="card feature teal"><span class="icon">&#8644;</span><h4>Messages</h4><p>Publish messages, consume messages, etc.</p></div>
+</div>
+<p>These scripts are <strong>wrappers around Kafka's internal Java APIs</strong>, so that we can run and manage Kafka components from the CLI itself. The folder contains (partial list from the download):</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">bin/</span><span class="lang">text</span></div>
+<pre><code data-lang="text">connect-distributed.sh          kafka-console-share-consumer.sh   kafka-features.sh
+connect-mirror-maker.sh         kafka-consumer-groups.sh          kafka-get-offsets.sh
+connect-plugin-path.sh          kafka-consumer-perf-test.sh       kafka-groups.sh
+connect-standalone.sh           kafka-delegation-tokens.sh        kafka-jmx.sh
+kafka-acls.sh                   kafka-delete-records.sh           kafka-leader-election.sh
+kafka-broker-api-versions.sh    kafka-dump-log.sh                 kafka-log-dirs.sh
+kafka-client-metrics.sh         kafka-e2e-latency.sh              kafka-metadata-quorum.sh
+kafka-cluster.sh                kafka-console-consumer.sh         kafka-metadata-shell.sh
+kafka-configs.sh                kafka-console-producer.sh         kafka-producer-perf-test.sh
+...</code></pre>
+</div>
+<div class="callout tip"><span class="ci">&#129695;</span><div><p><strong>On Windows</strong>, the same tools are provided as <code>.bat</code> files under <code>bin\windows\</code> (for example <code>bin\windows\kafka-server-start.bat</code>). The commands in this chapter use the <code>.sh</code> scripts, as shown in the source (macOS).</p></div></div>
+
+<h3 id="config">config/</h3>
+<p>This folder is <strong>important for us</strong>, as it contains all the configuration for our controller and broker nodes. The key default templates are:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>File</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>broker.properties</code></td><td>Default template for a <strong>Broker</strong> node</td></tr>
+      <tr><td><code>controller.properties</code></td><td>Default template for a <strong>Controller</strong> node</td></tr>
+      <tr><td><code>server.properties</code></td><td>Default template for a node which acts as <strong>both Controller and Broker</strong></td></tr>
+      <tr><td><code>consumer.properties</code></td><td>Default template for a <strong>Consumer</strong></td></tr>
+      <tr><td><code>producer.properties</code></td><td>Default template for a <strong>Producer</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+<p>The folder also contains Kafka Connect templates (<code>connect-console-sink.properties</code>, <code>connect-console-source.properties</code>, <code>connect-distributed.properties</code>, <code>connect-file-sink.properties</code>, <code>connect-file-source.properties</code>, <code>connect-mirror-maker.properties</code>, <code>connect-standalone.properties</code>, <code>connect-log4j2.yaml</code>), logging configs (<code>log4j2.yaml</code>, <code>tools-log4j2.yaml</code>) and <code>trogdor.conf</code>.</p>
+
+<h3 id="other-folders">Other folders</h3>
+<div class="grid grid-2">
+  <div class="card feature blue"><span class="icon">&#128218;</span><h4>libs/</h4><p>Contains the Kafka JAR files and their dependencies. The scripts within <code>bin/</code> use these JARs.</p></div>
+  <div class="card feature amber"><span class="icon">&#128221;</span><h4>logs/</h4><p>Contains Kafka runtime/application logs (INFO, WARN, ERROR messages) generated when brokers or controllers start and run.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="controller-config"><span class="sec-num">4</span>Step 3: Write the Configuration for the Controllers</h2>
+<p>These configuration files need to be put in the <code>/config</code> folder.</p>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">config/controller1.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">process.roles=controller
+node.id=1
+listeners=CONTROLLER://:9093
+controller.listener.names=CONTROLLER
+controller.quorum.voters=1@localhost:9093,2@localhost:9193
+# PLAINTEXT (no encryption). In production, we should use SSL.
+listener.security.protocol.map=CONTROLLER:PLAINTEXT
+log.dirs=/tmp/controller1-logs
+# Default partitions when creating a topic without specifying
+num.partitions=3
+default.replication.factor=2</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">config/controller2.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">process.roles=controller
+node.id=2
+listeners=CONTROLLER://:9193
+controller.listener.names=CONTROLLER
+controller.quorum.voters=1@localhost:9093,2@localhost:9193
+# PLAINTEXT (no encryption). In production, we should use SSL.
+listener.security.protocol.map=CONTROLLER:PLAINTEXT
+log.dirs=/tmp/controller2-logs
+# Default partitions when creating a topic without specifying
+num.partitions=3
+default.replication.factor=2</code></pre>
+  </div>
+</div>
+<p>The two files differ only in <code>node.id</code> (1 vs 2), the listener port (<code>9093</code> vs <code>9193</code>) and <code>log.dirs</code>. Everything that describes the <em>cluster</em> — the voter list, listener name and security map — is identical.</p>
+<div class="callout note"><span class="ci">&#129695;</span><div><b class="ct">On Windows: change <code>log.dirs</code></b><p><code>/tmp/...</code> is a macOS/Linux path. On Windows point every node to its own folder and use <strong>forward slashes</strong> (a single backslash is an escape character inside <code>.properties</code> files):</p>
+<div class="code" style="margin:8px 0 0">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Windows log.dirs for each node</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># controller1.properties
+log.dirs=C:/kafka-data/controller1-logs
+# controller2.properties
+log.dirs=C:/kafka-data/controller2-logs
+# broker1.properties
+log.dirs=C:/kafka-data/broker1-logs
+# broker2.properties
+log.dirs=C:/kafka-data/broker2-logs</code></pre>
+</div>
+<p>All other properties stay exactly the same on Windows.</p></div></div>
+
+<h3 id="controller-props">What each property means</h3>
+
+<h4><code>process.roles</code></h4>
+<p>Tells Kafka what role this node should perform:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>controller</code></td><td>Only performs controller tasks</td></tr>
+      <tr><td><code>broker</code></td><td>Only performs broker tasks</td></tr>
+      <tr><td><code>controller,broker</code></td><td>Performs the tasks of both controller and broker</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h4><code>node.id</code></h4>
+<p>A <strong>unique id for the node</strong> within a cluster.</p>
+
+<h4><code>listeners</code></h4>
+<p>The list of ports which are running on this node; for each port we can give a <strong>logical name</strong>. Internally it does something like <code>new ServerSocket(9093)</code> — a TCP socket waiting for connections.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">anatomy of a listener</span><span class="lang">text</span></div>
+<pre><code data-lang="text">listeners=CONTROLLER://:9093
+          ^^^^^^^^^^   ^^^^
+          |            port; IP omitted -&gt; Kafka listens on every IP address on the machine
+          logical name (label) for this socket
+
+Specific IP address:  CONTROLLER://192.168.1.10:9093</code></pre>
+</div>
+<p>Multiple listeners open multiple sockets. For example:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">two listeners</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">listeners=CONTROLLER://:9093,BROKER://:9092</code></pre>
+</div>
+<p>This tells Kafka to open 2 sockets: one named <strong>CONTROLLER</strong> and one named <strong>BROKER</strong>.</p>
+
+<h4><code>controller.listener.names</code></h4>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">choosing the controller listener</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">listeners=CONTROLLER://:9093, INTERNAL://:9092, EXTERNAL://:9094
+controller.listener.names=CONTROLLER</code></pre>
+</div>
+<p>This tells Kafka: among all the listeners defined, use the one named <strong>“CONTROLLER”</strong> for controller-to-controller communication.</p>
+
+<h4><code>controller.quorum.voters</code></h4>
+<p>Each controller maintains a <strong>static list of the nodes which act as controllers</strong>, in the format <code>nodeId@host:port</code>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">voters</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">controller.quorum.voters=1@localhost:9093,2@localhost:9193</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p><strong>Quorum with 2 controllers:</strong> using the formula from the architecture chapter, quorum = (2 / 2) + 1 = <strong>2</strong>. So with two voters, <em>both</em> controllers must be up to elect a leader or commit metadata — if one stops, there is no majority. Two controllers are fine for learning on a laptop; production clusters normally use an <strong>odd number (3 or 5)</strong> so that one (or two) controllers can fail.</p></div></div>
+
+<h4><code>listener.security.protocol.map</code></h4>
+<p>For which listener, which security protocol needs to be used:</p>
+<ul>
+  <li><strong>PLAINTEXT</strong> — no encryption, no authentication; used for local.</li>
+  <li><strong>SSL</strong> — TLS encryption; used in production.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">security map</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties"># For the CONTROLLER listener, use the PLAINTEXT security protocol.
+listener.security.protocol.map=CONTROLLER:PLAINTEXT</code></pre>
+</div>
+
+<h4>Remaining properties</h4>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Property</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>log.dirs</code></td><td>Directory where the node stores its data.</td></tr>
+      <tr><td><code>num.partitions</code></td><td>During topic creation, if the producer or CLI does not say how many partitions, the controller uses this default value.</td></tr>
+      <tr><td><code>default.replication.factor</code></td><td>Default value for RF — how many replicas for each partition.</td></tr>
+      <tr><td><code>offsets.topic.replication.factor</code></td><td>Default replication factor for the <code>__consumer_offsets</code> topic (set in the broker files below).</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="broker-config"><span class="sec-num">5</span>Step 4: Write the Configuration for the Brokers</h2>
+<p>These configuration files also need to be put in the <code>/config</code> folder.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">config/broker1.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">process.roles=broker
+node.id=3
+
+# WHERE to fetch metadata from (which controllers to connect to)
+controller.quorum.voters=1@localhost:9093,2@localhost:9193
+
+# This is where our Spring Boot apps (producer/consumer) will connect
+listeners=BROKER://:9092
+
+# passed this address to controller to store in their cluster metadata
+advertised.listeners=BROKER://localhost:9092
+
+# internally when follower broker try to fetch from leader, what listener they need to use.
+inter.broker.listener.name=BROKER
+
+# when broker try to communicate with controller what listener they need to use.
+controller.listener.names=CONTROLLER
+
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT
+
+log.dirs=/tmp/broker1-logs
+
+# Keep messages for 7 days (168 hours)
+log.retention.hours=168
+
+# Max size of a single log segment file (1GB)
+log.segment.bytes=1073741824
+
+# __consumer_offsets topic RF
+offsets.topic.replication.factor=2</code></pre>
+</div>
+
+<h3 id="broker-props">What each broker property means</h3>
+<ol class="points blue">
+  <li><b><code>controller.quorum.voters</code></b>Each broker also maintains the <strong>static list of controller nodes</strong> — this is <em>where</em> it fetches cluster metadata from.</li>
+  <li><b><code>listeners=BROKER://:9092</code></b>Opens up port 9092 and names it <strong>BROKER</strong>. This is where our Spring Boot producer/consumer apps will connect.</li>
+  <li><b><code>advertised.listeners=BROKER://localhost:9092</code></b>
+    <p>This address is passed to the controller, and the controller stores it in its metadata.</p>
+    <p>When a producer wants to push to Topic-A, Partition0, it asks <em>any</em> broker &rarr; the broker goes to the controller &rarr; the controller returns the metadata, which has all the details like which broker is the leader of which topic partition, <strong>and this address</strong> — so that the producer can directly call that specific broker.</p>
+  </li>
+  <li><b><code>inter.broker.listener.name=BROKER</code></b>Among all the listeners defined, use the one named <strong>“BROKER”</strong> for broker-to-broker communication. As we know, a follower broker talks to the leader broker to fetch the data.</li>
+  <li><b><code>controller.listener.names=CONTROLLER</code></b>
+    <p>This has 2 uses:</p>
+    <ul>
+      <li>The broker uses this controller listener name to map the <strong>security protocol</strong> (via <code>listener.security.protocol.map</code>).</li>
+      <li>It is used to pick the controller's listener from the metadata.</li>
+    </ul>
+  </li>
+  <li><b><code>log.dirs=/tmp/broker1-logs</code></b>Directory in which this node's data will persist.</li>
+  <li><b><code>log.retention.hours=168</code></b>Keep messages for 7 days. Kafka deletes <strong>whole segments</strong> once they are older than 168 hours (7 days).</li>
+  <li><b><code>log.segment.bytes=1073741824</code></b>Each segment size is fixed at <strong>1 GB</strong>. After that, a new segment is created for the partition.</li>
+  <li><b><code>offsets.topic.replication.factor=2</code></b>Replication factor of the internal <code>__consumer_offsets</code> topic.</li>
+</ol>
+
+<h4>How <code>controller.listener.names</code> picks the controller endpoint</h4>
+<p>Let's say this information is present in the cluster metadata:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">controller registration (cluster metadata)</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{
+  "controllerId": 1,
+  "endPoints": [
+    {
+      "name": "CONTROLLER",
+      "host": "localhost",
+      "port": 9093,
+      "securityProtocol": 0
+    },
+    {
+      "name": "INTERNAL",
+      "host": "localhost",
+      "port": 9097,
+      "securityProtocol": 1
+    }
+  ]
+}</code></pre>
+</div>
+<p>Say the broker has decided it needs to communicate with the controller with <strong>ID 1</strong> (as it is ACTIVE). It will pick the endpoint whose name matches <code>controller.listener.names</code>, i.e. the listener named <strong>“CONTROLLER”</strong> (port 9093). And that's one reason why <strong>all the different controllers have the same listener name</strong>.</p>
+
+<div class="callout note"><span class="ci">&#8505;</span><div><p><strong>Precise retention rule:</strong> time-based retention looks at the <em>newest</em> record in a closed segment — a segment is deleted once even its latest record is older than 168 hours. Since retention works per segment (see <a href="02-kafka-architecture.html#segment-retention">Retention is applied per segment</a>), the bigger <code>log.segment.bytes</code> is, the longer some records can live beyond 7 days.</p></div></div>
+
+<h3 id="broker2">Similarly, broker2.properties</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">config/broker2.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">process.roles=broker
+node.id=4
+
+# WHERE to fetch metadata from (which controllers to connect to)
+controller.quorum.voters=1@localhost:9093,2@localhost:9193
+
+# This is where our Spring Boot apps (producer/consumer) will connect
+listeners=BROKER://:9192
+
+# passed this address to controller to store in their cluster metadata
+advertised.listeners=BROKER://localhost:9192
+
+# internally when follower broker try to fetch from leader, what listener they need to use.
+inter.broker.listener.name=BROKER
+
+# when broker try to communicate with controller what listener they need to use.
+controller.listener.names=CONTROLLER
+
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT
+
+log.dirs=/tmp/broker2-logs
+
+# Keep messages for 7 days (168 hours)
+log.retention.hours=168
+
+# Max size of a single log segment file (1GB)
+log.segment.bytes=1073741824
+
+# __consumer_offsets topic RF
+offsets.topic.replication.factor=2</code></pre>
+</div>
+<p>Broker2 differs from Broker1 only in <code>node.id=4</code>, port <strong>9192</strong> (both in <code>listeners</code> and <code>advertised.listeners</code>) and <code>log.dirs=/tmp/broker2-logs</code>.</p>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Which listener is used for which conversation</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    APP["Spring Boot producer / consumer"] -->|"BROKER listener · localhost:9092 / 9192"| B1["Broker1 (node 3)"]
+    B2["Broker2 (node 4)"] -->|"BROKER listener · inter.broker.listener.name (follower fetch)"| B1
+    B1 -->|"CONTROLLER listener · controller.listener.names"| C1["Controller1 (node 1) :9093"]
+    C1 <-->|"CONTROLLER listener · quorum"| C2["Controller2 (node 2) :9193"]
+    classDef app fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef brk fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef ctl fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class APP app
+    class B1,B2 brk
+    class C1,C2 ctl
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><strong>Clients &rarr; brokers</strong> use the <code>BROKER</code> listener, reached through the address in <code>advertised.listeners</code>.</li>
+      <li><strong>Broker &rarr; broker</strong> (a follower fetching from the leader) uses the listener named by <code>inter.broker.listener.name</code> — also <code>BROKER</code>.</li>
+      <li><strong>Broker &rarr; controller</strong> and <strong>controller &harr; controller</strong> use the listener named by <code>controller.listener.names</code> — <code>CONTROLLER</code>.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="format"><span class="sec-num">6</span>Step 5: Map All Node IDs (2 Brokers + 2 Controllers) to One Kafka Cluster</h2>
+<p>Generate a cluster ID using the script present in the <code>bin/</code> folder:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-storage.sh random-uuid
+zJVVVZAkS9aIBfjY0BlYJA</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-storage.bat random-uuid
+zJVVVZAkS9aIBfjY0BlYJA</code></pre>
+</div>
+</div>
+<p>Sample output: <code>zJVVVZAkS9aIBfjY0BlYJA</code>. Now map each node to this cluster id:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash"># 1. Controller1
+$ bin/kafka-storage.sh format -t zJVVVZAkS9aIBfjY0BlYJA -c config/controller1.properties
+# 2. Controller2
+$ bin/kafka-storage.sh format -t zJVVVZAkS9aIBfjY0BlYJA -c config/controller2.properties
+# 3. Broker1
+$ bin/kafka-storage.sh format -t zJVVVZAkS9aIBfjY0BlYJA -c config/broker1.properties
+# 4. Broker2
+$ bin/kafka-storage.sh format -t zJVVVZAkS9aIBfjY0BlYJA -c config/broker2.properties</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">REM 1. Controller1
+&gt; bin\windows\kafka-storage.bat format -t zJVVVZAkS9aIBfjY0BlYJA -c config\controller1.properties
+REM 2. Controller2
+&gt; bin\windows\kafka-storage.bat format -t zJVVVZAkS9aIBfjY0BlYJA -c config\controller2.properties
+REM 3. Broker1
+&gt; bin\windows\kafka-storage.bat format -t zJVVVZAkS9aIBfjY0BlYJA -c config\broker1.properties
+REM 4. Broker2
+&gt; bin\windows\kafka-storage.bat format -t zJVVVZAkS9aIBfjY0BlYJA -c config\broker2.properties</code></pre>
+</div>
+</div>
+<ul>
+  <li><code>-t</code> — the cluster id (the same for every node, so they all belong to <em>one</em> cluster).</li>
+  <li><code>-c</code> — the node's configuration file; the script reads its <code>log.dirs</code> and <code>node.id</code>.</li>
+</ul>
+<p>This creates a <code>meta.properties</code> file within each <code>log.dirs</code> path (e.g. <code>/tmp/controller1-logs/meta.properties</code>, next to <code>bootstrap.checkpoint</code>):</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">/tmp/controller1-logs/meta.properties</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">#
+#Thu Feb 26 22:04:56 IST 2026
+cluster.id=zJVVVZAkS9aIBfjY0BlYJA
+directory.id=LYSuEbfGps8gnV7YsC9JHA
+node.id=1
+version=1</code></pre>
+</div>
+<p>The node will refuse to join a cluster whose id does not match this file — that is how the four independent processes know they belong together.</p>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p>Formatting is a <strong>one-time</strong> step per data directory. Since the data directories here are under <code>/tmp</code>, they may be cleared when the machine restarts — in that case, format again before starting the nodes.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="start"><span class="sec-num">7</span>Step 6: Start All the Node Servers</h2>
+<div class="callout key"><span class="ci">&#8595;</span><div><p><strong>Order matters:</strong> start the <strong>controllers first</strong> and then the brokers, because a broker calls the controller to load the cluster metadata information.</p></div></div>
+
+<h3 id="start-controllers">Start the controllers</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 1 / terminal 2 — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash"># Controller1
+$ bin/kafka-server-start.sh config/controller1.properties
+# Controller2
+$ bin/kafka-server-start.sh config/controller2.properties</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 1 / terminal 2 — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">REM Controller1
+&gt; bin\windows\kafka-server-start.bat config\controller1.properties
+REM Controller2
+&gt; bin\windows\kafka-server-start.bat config\controller2.properties</code></pre>
+</div>
+</div>
+<p>Each server runs in the foreground, so use a separate terminal per node. After the controllers start, the controller's data directory looks like this:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">/tmp/controller1-logs</span><span class="lang">text</span></div>
+<pre><code data-lang="text">/tmp/controller1-logs/
+ ├── __cluster_metadata-0/
+ │    ├── 00000000000000000000.index
+ │    ├── 00000000000000000000.log
+ │    ├── 00000000000000000000.timeindex
+ │    ├── leader-epoch-checkpoint
+ │    ├── partition.metadata
+ │    └── quorum-state
+ ├── bootstrap.checkpoint
+ └── meta.properties</code></pre>
+</div>
+<p>Notice that the cluster metadata is itself stored as a <strong>log partition</strong> (<code>__cluster_metadata-0</code>) with the same segment files we saw in the architecture chapter: <code>.log</code>, <code>.index</code> and <code>.timeindex</code>. The <code>quorum-state</code> file shows the KRaft state:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">__cluster_metadata-0/quorum-state</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{"clusterId":"","leaderId":1,"leaderEpoch":1,"votedId":-1,"appliedOffset":0,"currentVoters":[{"voterId":1},{"voterId":2}],"data_version":0}</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Field</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>leaderId</code></td><td>1</td><td><strong>Controller with ID 1 is the leader</strong> (active controller).</td></tr>
+      <tr><td><code>leaderEpoch</code></td><td>1</td><td>The election “term” — it increases every time a new leader is elected.</td></tr>
+      <tr><td><code>votedId</code></td><td>-1</td><td>This node has not cast a vote in the current epoch.</td></tr>
+      <tr><td><code>currentVoters</code></td><td>1, 2</td><td>The controllers taking part in the quorum — matches <code>controller.quorum.voters</code>.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="start-brokers">Start the brokers</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 3 — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash"># Broker1
+$ bin/kafka-server-start.sh config/broker1.properties</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 3 — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">REM Broker1
+&gt; bin\windows\kafka-server-start.bat config\broker1.properties</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Broker1 (node 3) start-up log</span><span class="lang">log</span></div>
+<pre><code data-lang="log">[2026-02-26 22:13:08,139] INFO [BrokerServer id=3] Waiting for the broker to be unfenced (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,180] INFO [BrokerLifecycleManager id=3] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.server.BrokerLifecycleManager)
+[2026-02-26 22:13:08,180] INFO [BrokerServer id=3] Finished waiting for the broker to be unfenced (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,182] INFO authorizerStart completed for endpoint BROKER. Endpoint is now READY. (org.apache.kafka.server.network.EndpointReadyFutures)
+[2026-02-26 22:13:08,182] INFO [SocketServer listenerType=BROKER, nodeId=3] Enabling request processing. (kafka.network.SocketServer)
+[2026-02-26 22:13:08,183] INFO Awaiting socket connections on 0.0.0.0:9092. (kafka.network.DataPlaneAcceptor)
+[2026-02-26 22:13:08,184] INFO [BrokerServer id=3] Waiting for all of the authorizer futures to be completed (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,184] INFO [BrokerServer id=3] Finished waiting for all of the authorizer futures to be completed (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,184] INFO [BrokerServer id=3] Waiting for all of the SocketServer Acceptors to be started (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,184] INFO [BrokerServer id=3] Finished waiting for all of the SocketServer Acceptors to be started (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,185] INFO [BrokerServer id=3] Transition from STARTING to STARTED (kafka.server.BrokerServer)
+[2026-02-26 22:13:08,185] INFO Kafka version: 4.2.0 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:08,185] INFO Kafka commitId: a18251bae0b825c6 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:08,185] INFO Kafka startTimeMs: 1772124188185 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:08,186] INFO [KafkaRaftServer nodeId=3] Kafka Server started (kafka.server.KafkaRaftServer)</code></pre>
+</div>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 4 — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash"># Broker2
+$ bin/kafka-server-start.sh config/broker2.properties</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal 4 — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">REM Broker2
+&gt; bin\windows\kafka-server-start.bat config\broker2.properties</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Broker2 (node 4) start-up log</span><span class="lang">log</span></div>
+<pre><code data-lang="log">[2026-02-26 22:13:10,836] INFO [BrokerServer id=4] Waiting for the broker to be unfenced (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,876] INFO [BrokerLifecycleManager id=4] The broker has been unfenced. Transitioning from RECOVERY to RUNNING. (kafka.server.BrokerLifecycleManager)
+[2026-02-26 22:13:10,876] INFO [BrokerServer id=4] Finished waiting for the broker to be unfenced (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,878] INFO authorizerStart completed for endpoint BROKER. Endpoint is now READY. (org.apache.kafka.server.network.EndpointReadyFutures)
+[2026-02-26 22:13:10,878] INFO [SocketServer listenerType=BROKER, nodeId=4] Enabling request processing. (kafka.network.SocketServer)
+[2026-02-26 22:13:10,879] INFO Awaiting socket connections on 0.0.0.0:9192. (kafka.network.DataPlaneAcceptor)
+[2026-02-26 22:13:10,881] INFO [BrokerServer id=4] Waiting for all of the authorizer futures to be completed (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,881] INFO [BrokerServer id=4] Finished waiting for all of the authorizer futures to be completed (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,881] INFO [BrokerServer id=4] Waiting for all of the SocketServer Acceptors to be started (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,881] INFO [BrokerServer id=4] Finished waiting for all of the SocketServer Acceptors to be started (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,881] INFO [BrokerServer id=4] Transition from STARTING to STARTED (kafka.server.BrokerServer)
+[2026-02-26 22:13:10,881] INFO Kafka version: 4.2.0 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:10,881] INFO Kafka commitId: a18251bae0b825c6 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:10,881] INFO Kafka startTimeMs: 1772124190881 (org.apache.kafka.common.utils.AppInfoParser)
+[2026-02-26 22:13:10,882] INFO [KafkaRaftServer nodeId=4] Kafka Server started (kafka.server.KafkaRaftServer)</code></pre>
+</div>
+
+<h4>Reading the broker start-up logs</h4>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Broker start-up sequence (from the logs)</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant B as Broker (node 3)
+    participant C as Active Controller (node 1)
+    Note over B: Waiting for the broker to be unfenced
+    B->>C: register and heartbeat over the CONTROLLER listener
+    C-->>B: broker unfenced
+    Note over B: RECOVERY to RUNNING
+    Note over B: Endpoint BROKER is READY, request processing enabled
+    Note over B: Awaiting socket connections on 0.0.0.0:9092
+    Note over B: STARTING to STARTED - Kafka Server started (version 4.2.0)
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>What each log line tells us</h4>
+    <ol class="steps">
+      <li><strong>Waiting for the broker to be unfenced</strong> — a new broker starts <em>fenced</em>: it is registered but not yet allowed to lead partitions or serve clients until the controller accepts it.</li>
+      <li><strong>The broker has been unfenced. Transitioning from RECOVERY to RUNNING</strong> — the active controller accepted the broker; it is now a full member of the cluster. This only works because the controllers were started first.</li>
+      <li><strong>authorizerStart completed for endpoint BROKER. Endpoint is now READY</strong> and <strong>Enabling request processing</strong> — the <code>BROKER</code> listener from <code>listeners=BROKER://:9092</code> is open.</li>
+      <li><strong>Awaiting socket connections on 0.0.0.0:9092</strong> — because no IP was given in the listener, Kafka listens on <em>every</em> IP (<code>0.0.0.0</code>). Broker2 shows <code>0.0.0.0:9192</code>.</li>
+      <li><strong>Transition from STARTING to STARTED</strong>, <strong>Kafka version: 4.2.0</strong>, <strong>Kafka Server started</strong> — the broker is up. <code>[BrokerServer id=3]</code> / <code>id=4</code> confirm the <code>node.id</code> of each broker.</li>
+    </ol>
+  </div>
+</div>
+
+<h3 id="quorum-status">Check the cluster status</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-metadata-quorum.sh --bootstrap-controller localhost:9093 describe --status</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-metadata-quorum.bat --bootstrap-controller localhost:9093 describe --status</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">output</span><span class="lang">text</span></div>
+<pre><code data-lang="text">ClusterId:              zJVVVZAkS9aIBfjY0BlYJA
+LeaderId:               1
+LeaderEpoch:            1
+HighWatermark:          719
+MaxFollowerLag:         0
+MaxFollowerLagTimeMs:   0
+CurrentVoters:          [{"id": 1, "endpoints": ["CONTROLLER://localhost:9093"]}, {"id": 2, "endpoints": ["CONTROLLER://localhost:9193"]}]
+CurrentObservers:       [{"id": 4, "directoryId": "4if9DpGPB_YwhAer14GCZA"}, {"id": 3, "directoryId": "Hczf6rWh7YvteyLMVvfVUg"}]</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ClusterId</code></td><td>The id we generated with <code>random-uuid</code> and formatted every node with.</td></tr>
+      <tr><td><code>LeaderId: 1</code>, <code>LeaderEpoch: 1</code></td><td>Controller 1 is the active controller (same as in <code>quorum-state</code>).</td></tr>
+      <tr><td><code>HighWatermark: 719</code></td><td>The metadata log is committed up to this offset (records agreed by the quorum).</td></tr>
+      <tr><td><code>MaxFollowerLag: 0</code>, <code>MaxFollowerLagTimeMs: 0</code></td><td>The stand-by controller is fully caught up with the leader.</td></tr>
+      <tr><td><code>CurrentVoters</code></td><td><strong>The controllers</strong> (ids 1 and 2 with their CONTROLLER endpoints) — they vote in the quorum.</td></tr>
+      <tr><td><code>CurrentObservers</code></td><td><strong>The brokers</strong> (ids 3 and 4) — they replicate the metadata log but do not vote.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="test-topic"><span class="sec-num">8</span>Step 7: Setup Completed — Create a Test Topic</h2>
+<p>All setup is completed; now let's test the producer and consumer using scripts. First create a sample topic. Here we are <strong>not passing</strong> how many partitions and what replication factor, so the active controller uses its defaults (<code>num.partitions=3</code>, <code>default.replication.factor=2</code>).</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --topic order-events-topic</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --create --topic order-events-topic</code></pre>
+</div>
+</div>
+<p><code>--bootstrap-server localhost:9092</code> is only required for the first contact, because the request needs to go to <em>some</em> broker, which ultimately passes it to the leader controller.</p>
+
+<p>Once done, we can check the status of the topic:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic order-events-topic</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --describe --topic order-events-topic</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">output</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Topic: order-events-topic   TopicId: FGBARB40QkC4MbwWuaNk2A  PartitionCount: 3  ReplicationFactor: 2  Configs: min.insync.replicas=1,segment.bytes=1073741824
+    Topic: order-events-topic  Partition: 0  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:
+    Topic: order-events-topic  Partition: 1  Leader: 4  Replicas: 4,3  Isr: 4,3  Elr:   LastKnownElr:
+    Topic: order-events-topic  Partition: 2  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Partition placement reported by --describe</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:describePlacement-->
+  </div>
+  <div class="diagram-explain">
+    <h4>Reading the describe output</h4>
+    <ul>
+      <li><strong>PartitionCount: 3, ReplicationFactor: 2</strong> — the controller's defaults were applied, because the create command did not specify them.</li>
+      <li><strong>Leader</strong> — the <code>node.id</code> of the broker leading that partition: node 3 (Broker1) leads P0 and P2; node 4 (Broker2) leads P1. Leadership is spread across both brokers.</li>
+      <li><strong>Replicas</strong> — the brokers holding a copy, the preferred leader first (<code>3,4</code> or <code>4,3</code>).</li>
+      <li><strong>Isr</strong> — the in-sync replicas: both copies of every partition are caught up with the leader.</li>
+      <li><strong>Configs</strong> — <code>segment.bytes=1073741824</code> comes from our <code>log.segment.bytes</code>; <code>min.insync.replicas=1</code> is the default (we did not set it).</li>
+      <li><strong>Elr / LastKnownElr</strong> — Eligible Leader Replicas fields shown by newer Kafka versions; empty here because nothing has failed.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="producer-test"><span class="sec-num">9</span>Step 8: Producer Test</h2>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — console producer — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic order-events-topic
+&gt;hello
+&gt;this is shrayansh
+&gt;how are you
+&gt;</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — console producer — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-console-producer.bat --bootstrap-server localhost:9092 --topic order-events-topic
+&gt;hello
+&gt;this is shrayansh
+&gt;how are you
+&gt;</code></pre>
+</div>
+</div>
+<p>Every line typed after the <code>&gt;</code> prompt is sent as one message (event) to <code>order-events-topic</code>. No key is given, so the messages are spread across the partitions by the producer.</p>
+
+<!-- ======================================================= -->
+<h2 id="consumer-test"><span class="sec-num">10</span>Step 9: Consumer Test</h2>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — console consumer — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic order-events-topic --from-beginning
+hello
+this is shrayansh
+how are you</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">terminal — console consumer — Windows (Command Prompt, from the Kafka folder)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-console-consumer.bat --bootstrap-server localhost:9092 --topic order-events-topic --from-beginning
+hello
+this is shrayansh
+how are you</code></pre>
+</div>
+</div>
+<p><code>--from-beginning</code> makes the consumer start from the earliest offset, so it receives the three messages that were produced <em>before</em> it started — the streaming model's replay in action. The consumer keeps running and prints new messages as they arrive.</p>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Here the messages came back in the same order they were sent. Across multiple partitions Kafka only guarantees order <em>within</em> a partition (see <a href="02-kafka-architecture.html#ordered">Ordered</a>), so with more traffic the console consumer may print messages from different partitions interleaved.</p></div></div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">End-to-end test</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant CLI as kafka-topics.sh
+    participant P as console producer
+    participant B as Brokers (3, 4)
+    participant C as Active Controller (1)
+    participant K as console consumer
+    CLI->>B: create order-events-topic (via localhost:9092)
+    B->>C: pass request to the leader controller
+    C-->>B: 3 partitions, RF 2, leaders 3 / 4 / 3
+    P->>B: hello, this is shrayansh, how are you
+    K->>B: fetch from beginning
+    B-->>K: hello, this is shrayansh, how are you
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The topic is created through a broker, which forwards the request to the active controller; the controller applies the defaults and decides the leaders. The console producer then writes three messages and the console consumer, reading from the beginning, receives all of them — the cluster works end to end.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li>Downloaded <strong>Kafka 4.2.0</strong> (<code>kafka_2.13-4.2.0.tgz</code>); <code>bin/</code> holds the CLI scripts, <code>config/</code> the property templates.</li>
+    <li>Two <strong>controllers</strong> (node 1 :9093, node 2 :9193) with <code>process.roles=controller</code> and a shared <code>controller.quorum.voters</code> list.</li>
+    <li>Two <strong>brokers</strong> (node 3 :9092, node 4 :9192) with <code>listeners</code>, <code>advertised.listeners</code>, <code>inter.broker.listener.name</code>, <code>controller.listener.names</code>, retention (168 h) and segment size (1 GB).</li>
+    <li><code>kafka-storage.sh random-uuid</code> + <code>format -t &lt;id&gt; -c &lt;config&gt;</code> ties every node to one cluster via <code>meta.properties</code>.</li>
+    <li>Start <strong>controllers first, then brokers</strong>; verify with <code>kafka-metadata-quorum.sh ... describe --status</code> (voters = controllers, observers = brokers).</li>
+    <li>Created <code>order-events-topic</code> with defaults (3 partitions, RF 2), then produced and consumed messages with the console tools.</li>
+  </ul>
+</div>

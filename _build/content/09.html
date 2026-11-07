@@ -1,0 +1,530 @@
+<!--meta
+{
+  "lead": "The consumer read flow again, step by step, but this time answering the doubts at each step with the configuration that controls it: metadata refresh, partition assignment strategies and rebalancing (Range, RoundRobin, Sticky, CooperativeSticky), auto-offset-reset, poll timeout and fetch size limits, max.poll.records and the internal buffer, heartbeats and liveness, and auto vs manual offset commit with every ack-mode.",
+  "date": "Wednesday, 18 March 2026",
+  "related": [
+    { "n": 2, "why": "Where the 13-step consumer read flow and __consumer_offsets were first introduced." },
+    { "n": 7, "why": "Part 2 — one consumer on many topics, many consumers on one topic, concurrency." },
+    { "n": 8, "why": "Step 10 doubts — exceptions during deserialization and processing." },
+    { "n": 11, "why": "Transactional consumers and how offset commits fit into a transaction." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">How this chapter is organised</b>
+    <p>We walk the same consumer read flow from <a href="02-kafka-architecture.html">Kafka Architecture</a> and <a href="06-consumer-setup-part1.html">Consumer Setup Part 1</a>. At every step there is a <strong>doubt</strong>, and each doubt is answered with the <strong>configuration</strong> that controls that behaviour.</p>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Roadmap: the consumer read flow</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:consumerReadFlowBoxes-->
+  </div>
+  <div class="diagram-explain"><p>The step numbers in the headings below match the boxes in this diagram (Steps 1 → 11).</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step1"><span class="sec-num">1</span>Step 1: Consumer Starts and Wants to Join a Group</h2>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> can a consumer join more than 1 group?<br><strong>Answer:</strong> No — <strong>1 consumer can join only 1 group</strong>. A consumer has exactly one <code>group.id</code>. To read the same data for two groups, run two consumers (for example two <code>@KafkaListener</code>s with different <code>groupId</code>s).</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step2"><span class="sec-num">2</span>Step 2: Find the <code>__consumer_offsets</code> Partition</h2>
+<p>The consumer works out which partition of the internal topic <code>__consumer_offsets</code> stores its group's data:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">coordinator partition</span><span class="lang">text</span></div>
+<pre><code data-lang="text">partition = hash(group.id) % N        // N = partitions of __consumer_offsets (50 by default)</code></pre>
+</div>
+<p>The leader broker of that partition becomes the group's <strong>Group Coordinator</strong> (Step 4).</p>
+
+<!-- ======================================================= -->
+<h2 id="step3"><span class="sec-num">3</span>Step 3: Consumer Requests Metadata</h2>
+<p>The consumer invokes one of the <strong>bootstrap servers</strong> (any broker), asks for <strong>metadata</strong> (which broker leads which partition) and <strong>caches it</strong>.</p>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> how frequently is this metadata refreshed?<br><strong>Answer:</strong> multiple factors make the consumer start a metadata refresh — on a timer, or on demand.</p></div></div>
+<div class="vs">
+  <div class="side a">
+    <h4>Periodic refresh</h4>
+    <div class="sb">
+      <p>Even when nothing goes wrong, the cache is refreshed after a maximum age:</p>
+<pre class="mini"><code># default 5 minutes
+spring.kafka.consumer.properties.metadata.max.age.ms=300000</code></pre>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>On-demand refresh</h4>
+    <div class="sb">
+      <ul>
+        <li>The consumer invoked a broker, but the broker returned <code>NOT_LEADER_FOR_PARTITION</code> (named <code>NOT_LEADER_OR_FOLLOWER</code> in newer Kafka versions) — leadership moved.</li>
+        <li>Information is missing from the cache (for example a new topic or partition).</li>
+        <li>etc.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step4"><span class="sec-num">4</span>Step 4: Find the Group Coordinator and Send JoinGroupRequest</h2>
+<p>The request contains:</p>
+<ul class="points">
+  <li>The <strong>consumer group</strong> it needs to join.</li>
+  <li>The <strong>topics</strong> it wants to subscribe to.</li>
+</ul>
+<div class="callout note"><span class="ci">&#10067;</span><div>
+  <p><strong>Doubt 1:</strong> can 1 consumer request to join more than 1 topic?<br>
+  <strong>Doubt 2:</strong> can multiple consumers in a group request to join different topics?<br>
+  <strong>Doubt 3:</strong> can multiple consumers in a group request to join the same topic?</p>
+  <p>All three are covered in <a href="07-consumer-setup-part2.html">Consumer Setup Part 2</a>.</p>
+</div></div>
+
+<!-- ======================================================= -->
+<h2 id="step5"><span class="sec-num">5</span>Step 5: Partition Assignment</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Broker3 (Group Coordinator)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Group: order-consumer-group
+  Topic: order-events
+    Consumer1 : handle Partition-0
+    Consumer2 : handle Partition-1
+    Consumer3 : handle Partition-2</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> how are partitions divided among the consumers in the group? That is decided by the <strong>partition assignment strategy</strong>. All the examples below use consumers <strong>C1, C2, C3</strong> on topic <code>order-events</code> with partitions <strong>P0 – P5</strong>.</p></div></div>
+
+<h3 id="range">Range Assignor</h3>
+<ul class="points">
+  <li>Lays out the <strong>partitions in numeric order</strong>.</li>
+  <li>Lays out the <strong>consumers in alphabetical order</strong>.</li>
+  <li>Logic: partitions / consumers = 6 / 3 = <strong>2 consecutive partitions</strong> each.</li>
+</ul>
+<div class="logviz">
+  <div class="row"><span class="lab">C1</span><div class="cells"><span class="cell">P0</span><span class="cell">P1</span></div></div>
+  <div class="row"><span class="lab">C2</span><div class="cells"><span class="cell">P2</span><span class="cell">P3</span></div></div>
+  <div class="row"><span class="lab">C3</span><div class="cells"><span class="cell">P4</span><span class="cell">P5</span></div></div>
+</div>
+
+<h3 id="roundrobin">Round Robin Assignor</h3>
+<p>Just distributes the partitions <strong>1 by 1</strong> to all consumers.</p>
+<div class="logviz">
+  <div class="row"><span class="lab">C1</span><div class="cells"><span class="cell">P0</span><span class="cell">P3</span></div></div>
+  <div class="row"><span class="lab">C2</span><div class="cells"><span class="cell">P1</span><span class="cell">P4</span></div></div>
+  <div class="row"><span class="lab">C3</span><div class="cells"><span class="cell">P2</span><span class="cell">P5</span></div></div>
+</div>
+
+<h3 id="sticky">Sticky Assignor</h3>
+<p>Starts with the <strong>same result as Round Robin</strong> (C1: P0, P3 · C2: P1, P4 · C3: P2, P5). Its main advantage comes during a <strong>rebalance</strong> — when a new consumer is added to the group or an existing consumer is removed.</p>
+
+<h3 id="rebalance">What happens on a rebalance: say C3 crashed</h3>
+<p>Starting point: <strong>C1: P0, P3 · C2: P1, P4 · C3: P2, P5</strong>.</p>
+<div class="vs">
+  <div class="side a">
+    <h4>Range / Round Robin: full recalculation</h4>
+    <div class="sb">
+      <ul>
+        <li>Every consumer (C1, C2) <strong>drops</strong> the partitions it was allotted.</li>
+        <li>Every consumer <strong>stops reading</strong>.</li>
+        <li>The algorithm runs a <strong>full recalculation from the start</strong> for the remaining 2 consumers.</li>
+      </ul>
+      <div class="logviz">
+        <div class="row"><span class="lab">C1</span><div class="cells"><span class="cell">P0</span><span class="cell gone">P3</span><span class="cell new">P2</span><span class="cell new">P4</span></div></div>
+        <div class="row"><span class="lab">C2</span><div class="cells"><span class="cell">P1</span><span class="cell gone">P4</span><span class="cell new">P3</span><span class="cell new">P5</span></div></div>
+      </div>
+      <p><strong>Problem:</strong> earlier C1 had P0 and P3; after rebalancing P3 is removed and P2 and P4 are added. So C1 has to do all the clean-up, like clearing its cache for P3, and maintain new offsets for P2 and P4 — even though only C3's partitions really needed a new owner.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Sticky: keep what you already have</h4>
+    <div class="sb">
+      <ul>
+        <li>It is smarter: during a rebalance it tries to achieve an <strong>even distribution</strong> (as much as possible).</li>
+        <li>It also tries to keep each consumer <strong>attached to the partitions it already had</strong>.</li>
+      </ul>
+      <div class="logviz">
+        <div class="row"><span class="lab">C1</span><div class="cells"><span class="cell">P0</span><span class="cell">P3</span><span class="cell new">P2</span></div></div>
+        <div class="row"><span class="lab">C2</span><div class="cells"><span class="cell">P1</span><span class="cell">P4</span><span class="cell new">P5</span></div></div>
+        <div class="row"><span class="lab">C3</span><div class="cells"><span class="cell gone">P2</span><span class="cell gone">P5</span></div><span class="ptr">crashed</span></div>
+      </div>
+      <p>It picks only the partitions allotted to C3 and distributes them evenly to the available consumers. C1 and C2 <strong>still hold</strong> the partitions they had before.</p>
+    </div>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The round-robin result is shown on the left (C1: P0, P2, P4 · C2: P1, P3, P5). With the <strong>Range</strong> assignor the recalculation gives consecutive blocks instead (C1: P0, P1, P2 · C2: P3, P4, P5) — still a full reshuffle.</p></div></div>
+
+<h3 id="cooperative">Cooperative Sticky Assignor</h3>
+<p>Range, Round Robin and Sticky are all <strong>eager</strong> rebalancers: when a rebalance happens, consumers <strong>stop reading from all their partitions</strong> until the new assignments are made (“stop the world”). With the <strong>cooperative</strong> protocol:</p>
+<ol class="steps">
+  <li>The algorithm decides which <strong>old partitions each consumer will still hold</strong>.</li>
+  <li>Consumers <strong>continue reading</strong> from those partitions. Only the partitions being removed from them, or newly added to them, are updated later.</li>
+</ol>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Eager vs cooperative rebalance after C3 crashes</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant GC as Group Coordinator
+    participant C1 as C1 (P0, P3)
+    participant C2 as C2 (P1, P4)
+    Note over GC: C3 is gone, rebalance starts
+    rect rgb(253, 236, 234)
+    Note over GC,C2: Eager (Range / RoundRobin / Sticky)
+    GC->>C1: rebalance
+    GC->>C2: rebalance
+    Note over C1,C2: revoke ALL partitions &lt;br/&gt; nobody reads
+    GC-->>C1: new assignment
+    GC-->>C2: new assignment
+    Note over C1,C2: resume reading
+    end
+    rect rgb(232, 247, 245)
+    Note over GC,C2: Cooperative Sticky
+    GC->>C1: rebalance (keep P0, P3)
+    GC->>C2: rebalance (keep P1, P4)
+    Note over C1,C2: keep reading owned partitions
+    GC-->>C1: add P2
+    GC-->>C2: add P5
+    end
+</div>
+  </div>
+  <div class="diagram-explain"><p>In the eager case there is a window where <strong>no partition is being read</strong>. In the cooperative case C1 and C2 never stop reading P0, P3, P1 and P4; only the orphaned partitions P2 and P5 are handed over, possibly in a follow-up round.</p></div>
+</div>
+
+<h3 id="assignor-config">Choosing the strategy</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — pick one</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.consumer.properties.partition.assignment.strategy=org.apache.kafka.clients.consumer.RangeAssignor
+# or
+spring.kafka.consumer.properties.partition.assignment.strategy=org.apache.kafka.clients.consumer.RoundRobinAssignor
+# or
+spring.kafka.consumer.properties.partition.assignment.strategy=org.apache.kafka.clients.consumer.StickyAssignor
+# or
+spring.kafka.consumer.properties.partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Assignor</th><th>Initial layout (6 partitions, 3 consumers)</th><th>On rebalance</th><th>Protocol</th></tr></thead>
+    <tbody>
+      <tr><td><code>RangeAssignor</code></td><td>Consecutive blocks: P0-P1, P2-P3, P4-P5</td><td>Full recalculation</td><td>Eager</td></tr>
+      <tr><td><code>RoundRobinAssignor</code></td><td>One by one: P0-P3, P1-P4, P2-P5</td><td>Full recalculation</td><td>Eager</td></tr>
+      <tr><td><code>StickyAssignor</code></td><td>Like round robin</td><td>Keeps existing partitions, moves only orphans</td><td>Eager</td></tr>
+      <tr><td><code>CooperativeStickyAssignor</code></td><td>Like sticky</td><td>Keeps existing partitions <strong>and keeps reading them</strong></td><td>Cooperative</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The notes label Range as the default. In Kafka 3.x/4.x clients the default value of <code>partition.assignment.strategy</code> is the list <code>[RangeAssignor, CooperativeStickyAssignor]</code>: Range is used, and the cooperative assignor is listed so a group can later be upgraded to it with rolling restarts.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step6-7"><span class="sec-num">6</span>Steps 6 &amp; 7: Fetch the Committed Offset</h2>
+<p>The consumer is assigned <strong>P0 of topic order-events</strong>. It asks the Group Coordinator how far P0 has been read, and the coordinator looks it up in the <code>__consumer_offsets</code> topic.</p>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> what if there is no offset info present (a brand-new group, or the saved offset was deleted)?</p></div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Where does the consumer start reading?</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["Consumer receives partition assignment · (order-events, P0)"] --> B["Consumer asks Group Coordinator for offset details · coordinator reads __consumer_offsets"]
+    B --> Q{"Offset exists?"}
+    Q -- "YES" --> Y["Fetch the saved offset and return it"]
+    Q -- "NO" --> R["Look at spring.kafka.consumer.auto-offset-reset"]
+    R -- "latest (default)" --> L["Read only new records produced after the partition assignment"]
+    R -- "none" --> N["Throw an exception"]
+    R -- "earliest" --> E["Start from the earliest available offset (after clean-up)"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class A,B,Q,R step
+    class Y,L,E ok
+    class N bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><strong>latest</strong> (default) — skips everything already in the partition; only records produced after the assignment are read.</li>
+      <li><strong>none</strong> — throws an exception, so you decide in code what to do.</li>
+      <li><strong>earliest</strong> — starts from the oldest offset still available. Older data may already be gone because of retention clean-up.</li>
+    </ul>
+    <p>This setting is used <strong>only when there is no committed offset</strong>. Once the group has committed, it always resumes from the committed offset.</p>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># latest (default) | earliest | none
+spring.kafka.consumer.auto-offset-reset=latest</code></pre>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step8-9"><span class="sec-num">7</span>Steps 8 &amp; 9: Fetch Records from the Leader</h2>
+<p>The consumer checks the metadata and invokes the <strong>leader broker</strong> of topic <code>order-events</code>, Partition-0, to fetch from the offset found in the previous step.</p>
+
+<h3 id="poll-timeout">If there is no event, how long does the consumer wait?</h3>
+<ul class="points">
+  <li>A Kafka consumer is <strong>single threaded</strong>; it processes the records one by one.</li>
+  <li><code>poll(timeout)</code> takes a timeout: the consumer waits at most this long for the brokers to respond. Otherwise it proceeds with whatever it received, or an empty list.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># 5 seconds
+spring.kafka.listener.poll-timeout=5000</code></pre>
+</div>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">poll loop (conceptual)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">while (true) {
+    ConsumerRecords records = consumer.poll(timeout);
+    for (ConsumerRecord record : records) {
+        // business logic
+    }
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">FetchRequest / FetchResponse</span><span class="lang">text</span></div>
+<pre><code data-lang="text">FetchRequest:                 FetchResponse:
+  Topic: order-events           Topic: order-events
+    Partition: P0                 Partition: P0
+      • Offset: X                   • Records
+    Partition: P2                 Partition: P2
+      • Offset: Y                   • Records</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">One poll(): one request per broker</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C1 as C1 poll(timeout)
+    participant B1 as Broker1
+    participant B2 as Broker2
+    C1->>B1: FetchRequest for (P0, P2)
+    C1->>B2: FetchRequest for (P1)
+    B1-->>C1: FetchResponse from B1
+    B2-->>C1: FetchResponse from B2
+    Note over C1: Merge the responses &lt;br/&gt; Create ConsumerRecords object
+</div>
+  </div>
+  <div class="diagram-explain"><p>The consumer sends <strong>1 request per broker</strong>, covering every partition that broker leads, and merges the responses.</p></div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">ConsumerRecords object</span><span class="lang">text</span></div>
+<pre><code data-lang="text">ConsumerRecords
+ ├── Topic: order-events, Partition: P0
+ │     ├── ConsumerRecord(offset=10, value=A)
+ │     └── ConsumerRecord(offset=11, value=B)
+ ├── Topic: order-events, Partition: P1
+ │     └── ConsumerRecord(offset=5, value=C)
+ └── Topic: order-events, Partition: P2
+       ├── ConsumerRecord(offset=20, value=D)
+       └── ConsumerRecord(offset=21, value=E)</code></pre>
+</div>
+<p style="font-size:13.5px;color:var(--muted)">(The notes label the third group “Partition: P1” a second time; it is P2, the partition fetched from Broker1 together with P0.)</p>
+
+<h3 id="fetch-size">In one poll(), how much data is sent?</h3>
+<p>A consumer can ask a broker for multiple partitions and topics in 1 single request. But how much data will the broker send for 1 FetchRequest?</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — fetch limits (defaults)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># Max data the Broker returns PER partition (1MB)
+spring.kafka.consumer.properties.max.partition.fetch.bytes=1048576
+
+# Maximum data (total) the Broker can return in one request (52MB)
+spring.kafka.consumer.properties.fetch.max.bytes=52428800
+
+# Minimum data (in bytes) the Broker must have before responding
+spring.kafka.consumer.properties.fetch.min.bytes=1
+
+# How long the Broker can hold the request to meet fetch.min.bytes (0.5sec)
+spring.kafka.consumer.properties.fetch.max.wait.ms=500
+
+# Max number of records returned in a single poll() call
+spring.kafka.consumer.properties.max.poll.records=500</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Byte limits of one FetchRequest</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:fetchLimits-->
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li><code>max.partition.fetch.bytes</code> — the max number of bytes fetched <strong>from each partition</strong>.</li>
+      <li><code>fetch.max.bytes</code> — the <strong>combined total</strong> fetched from all partitions; the per-partition amounts together must stay ≤ 52 MB.</li>
+    </ul>
+    <p><code>52428800</code> bytes is exactly 50 × 1024 × 1024 (50 MiB), which is about 52 MB in decimal units. Also, if the first record batch of a partition is bigger than these limits it is still returned, so the consumer can always make progress.</p>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Broker decides when to respond</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["FetchRequest arrives at the broker"] --> Q{"Data accumulated &gt;= fetch.min.bytes?"}
+    Q -- "Yes · Condition 1" --> S["Send response to consumer"]
+    Q -- "No" --> W{"fetch.max.wait.ms (500 ms) reached?"}
+    W -- "No" --> Q
+    W -- "Yes · Condition 2" --> S2["Send anyway, whatever data was fetched"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A,Q,W step
+    class S,S2 ok
+</div>
+  </div>
+  <div class="diagram-explain"><p>With the default <code>fetch.min.bytes=1</code> the broker answers as soon as <strong>any</strong> data exists. Raising it trades latency for fewer, larger responses; <code>fetch.max.wait.ms</code> caps how long the broker may hold the request.</p></div>
+</div>
+
+<h3 id="max-poll-records">max.poll.records and the internal buffer</h3>
+<p>The response from the broker is limited by <strong>bytes</strong>, not by the number of records. So the broker may send up to 52 MB that contains, say, 2000 records. Then what does <code>max.poll.records=500</code> do?</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Records beyond max.poll.records stay in the buffer</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["Consumer receives data · internal buffer contains more than 500 records"] --> B["Consumer applies max.poll.records=500"]
+    B --> C["poll() returns at most 500 records"]
+    B --> D["Remaining records stay in the buffer"]
+    E["Next poll()"] --> Q{"Records in buffer?"}
+    Q -- "Yes" --> F["Return them · no network call to the broker"]
+    Q -- "No" --> G["Send a new FetchRequest"]
+    D -.-> Q
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A,B,E,Q step
+    class C,D,F,G ok
+</div>
+  </div>
+  <div class="diagram-explain"><p><code>max.poll.records</code> is applied <strong>on the consumer side</strong>. It does not change what the broker sends; it only limits how many records one <code>poll()</code> hands to your code. The rest are served from memory on the next poll.</p></div>
+</div>
+
+<h3 id="idle-between-polls">Can there be a gap between polls?</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># Sleep time between two poll() calls (0ms is default, means as soon as possible)
+spring.kafka.listener.idle-between-polls=0</code></pre>
+</div>
+
+<h3 id="liveness">How do we know if a consumer is stuck or dead?</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — liveness (defaults)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># with this consumer sends Heartbeat Pulse to Group coordinator every 3 Seconds
+spring.kafka.consumer.properties.heartbeat.interval.ms=3000
+# Max time Group coordinator will wait for the heartbeat (generally its higher than heartbeat.interval.ms)
+# after this say 45s it will consider Consumer as dead and initiate rebalance
+spring.kafka.consumer.properties.session.timeout.ms=45000
+
+# Group Coordinator expects 1 poll() call every 5 mins,
+# if say consumer took 6 minutes to process records
+# group coordinator will think that Consumer got stuck
+# initiates rebalance
+spring.kafka.consumer.properties.max.poll.interval.ms=300000</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Setting</th><th>Detects</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td><code>heartbeat.interval.ms</code> = 3 s</td><td>—</td><td>A background thread sends a heartbeat to the Group Coordinator every 3 s.</td></tr>
+      <tr><td><code>session.timeout.ms</code> = 45 s</td><td>Dead consumer (crash, network loss)</td><td>No heartbeat for 45 s → consumer considered dead → rebalance.</td></tr>
+      <tr><td><code>max.poll.interval.ms</code> = 5 min</td><td>Stuck consumer (alive, but processing too long)</td><td>No <code>poll()</code> for 5 min → consumer considered stuck → it leaves the group → rebalance.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>Heartbeats come from a <strong>separate thread</strong>, so a consumer busy processing a huge batch keeps heartbeating — that is why <code>max.poll.interval.ms</code> exists as a second check. If processing is slow, lower <code>max.poll.records</code> or raise <code>max.poll.interval.ms</code>. Keep <code>heartbeat.interval.ms</code> at about one third of <code>session.timeout.ms</code> or less.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step10"><span class="sec-num">8</span>Step 10: Consumer Processes Events</h2>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> what if an exception comes during deserialization? What if an exception comes while processing the record?<br>Both are covered in <a href="08-consumer-exception-handling.html">Consumer Setup: Exception Handling</a>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step11"><span class="sec-num">9</span>Step 11: Offset Commit</h2>
+<div class="callout note"><span class="ci">&#10067;</span><div><p><strong>Doubt:</strong> how do we manage commits — automatic or manual?</p></div></div>
+<div class="vs">
+  <div class="side a">
+    <h4>Auto-commit</h4>
+    <div class="sb">
+<pre class="mini"><code># Kafka commits offsets every 5 seconds (background thread)
+spring.kafka.consumer.enable-auto-commit=true
+spring.kafka.consumer.properties.auto.commit.interval.ms=5000</code></pre>
+      <p>The Kafka client itself commits the latest polled offsets on a timer. Simple, but a crash between commits can cause re-reads, and a commit can happen before processing finishes.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Manual commit (Spring listener container)</h4>
+    <div class="sb">
+<pre class="mini"><code>spring.kafka.consumer.enable-auto-commit=false
+spring.kafka.listener.ack-mode=   # see the modes below</code></pre>
+      <p>Spring's listener container commits for you, according to the <strong>ack-mode</strong>.</p>
+    </div>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>If <code>enable-auto-commit</code> is not set at all, Spring Kafka sets <code>enable.auto.commit=false</code> on the consumer and uses the container ack-mode (<code>BATCH</code>) — the opposite of the plain Kafka client default (<code>true</code>).</p></div></div>
+
+<h3 id="ack-modes">ack-mode options</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>ack-mode</th><th>How it commits</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td><code>batch</code> (default)</td><td><code>poll()</code> gets 500 records → process all 500 → commit once.</td><td>If, say, the last record of the batch fails, the entire batch is retried.</td></tr>
+      <tr><td><code>record</code></td><td>Process record1 → commit; process record2 → commit …</td><td>More commit overhead.</td></tr>
+      <tr><td><code>time</code></td><td>Commit every 5 s: <code>ack-mode=time</code>, <code>ack-time=5000</code></td><td>Records processed since the last commit may be re-read after a crash.</td></tr>
+      <tr><td><code>count</code></td><td>Commit after every 10 records: <code>ack-mode=count</code>, <code>ack-count=10</code></td><td>Up to 10 records may be re-read after a crash.</td></tr>
+      <tr><td><code>manual</code></td><td>Your code calls <code>ack.acknowledge()</code>.</td><td>Even if you acknowledge after each record, the commits are queued and sent as <strong>one commit request</strong> when the records of the poll are finished.</td></tr>
+      <tr><td><code>manual_immediate</code></td><td>Your code calls <code>ack.acknowledge()</code>.</td><td>Each call sends a commit request <strong>immediately</strong>.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">time / count</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.listener.ack-mode=time
+spring.kafka.listener.ack-time=5000
+
+spring.kafka.listener.ack-mode=count
+spring.kafka.listener.ack-count=10</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">manual / manual_immediate listener</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@KafkaListener(topics = "order-events")
+public void process(ConsumerRecord&lt;String, Order&gt; rec,
+                    Acknowledgment ack) {
+    process(rec);       // business logic
+    ack.acknowledge();  // commit
+}</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">manual vs manual_immediate</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant L as Listener
+    participant K as Container
+    participant GC as Group Coordinator
+    Note over L,GC: ack-mode = manual
+    L->>K: ack.acknowledge() (record 1)
+    L->>K: ack.acknowledge() (record 2)
+    L->>K: ack.acknowledge() (record 3)
+    K->>GC: one commit after the poll's records are processed
+    Note over L,GC: ack-mode = manual_immediate
+    L->>K: ack.acknowledge() (record 1)
+    K->>GC: commit
+    L->>K: ack.acknowledge() (record 2)
+    K->>GC: commit
+</div>
+  </div>
+  <div class="diagram-explain"><p>Both modes let your code decide <strong>when</strong> a record counts as done. <code>manual</code> batches the commits for less overhead; <code>manual_immediate</code> commits right away for the smallest re-read window. (The notes spell it “manual_immdediate”; the correct value is <code>manual_immediate</code>.)</p></div>
+</div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Configuration cheat-sheet</b>
+  <div class="table-wrap" style="margin:8px 0 0">
+    <table>
+      <thead><tr><th>Step</th><th>Property</th><th>Default</th></tr></thead>
+      <tbody>
+        <tr><td>3 Metadata</td><td><code>metadata.max.age.ms</code></td><td>300000 (5 min)</td></tr>
+        <tr><td>5 Assignment</td><td><code>partition.assignment.strategy</code></td><td>Range (+ CooperativeSticky)</td></tr>
+        <tr><td>6–7 Offset</td><td><code>auto-offset-reset</code></td><td>latest</td></tr>
+        <tr><td>8–9 Fetch</td><td><code>listener.poll-timeout</code></td><td>5000 ms</td></tr>
+        <tr><td>8–9 Fetch</td><td><code>max.partition.fetch.bytes</code> / <code>fetch.max.bytes</code></td><td>1 MiB / 50 MiB</td></tr>
+        <tr><td>8–9 Fetch</td><td><code>fetch.min.bytes</code> / <code>fetch.max.wait.ms</code></td><td>1 byte / 500 ms</td></tr>
+        <tr><td>8–9 Fetch</td><td><code>max.poll.records</code></td><td>500</td></tr>
+        <tr><td>8–9 Fetch</td><td><code>listener.idle-between-polls</code></td><td>0</td></tr>
+        <tr><td>Liveness</td><td><code>heartbeat.interval.ms</code> / <code>session.timeout.ms</code> / <code>max.poll.interval.ms</code></td><td>3 s / 45 s / 5 min</td></tr>
+        <tr><td>11 Commit</td><td><code>listener.ack-mode</code></td><td>batch</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div></div>

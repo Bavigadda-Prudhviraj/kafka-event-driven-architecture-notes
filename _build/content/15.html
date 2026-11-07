@@ -1,0 +1,699 @@
+<!--meta
+{
+  "lead": "How Kafka Streams is built and how it runs. Streams and topologies (source, processors, sink), stateful processing with RocksDB, tasks as the unit of parallelism, why re-keying forces a repartition topic and splits a topology into sub-topologies, how tasks map to stream threads, and how changelog topics make local state fault-tolerant. Ends with a complete Spring Boot demo, checked topic by topic in the broker logs.",
+  "date": "Friday, 19 June 2026",
+  "related": [
+    { "n": 14, "why": "Why Kafka Streams is needed — the problems this architecture solves." },
+    { "n": 6, "why": "Consumer internals — Kafka Streams reuses the same group protocol and fetch flow." },
+    { "n": 16, "why": "KStream, KTable and GlobalKTable — the building blocks of a topology." },
+    { "n": 19, "why": "Stateful processing nodes such as count and aggregate, backed by state stores." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128218;</span>
+  <div>
+    <b class="ct">Prerequisites</b>
+    <ol style="margin:6px 0 0">
+      <li><a href="06-consumer-setup-part1.html">Consumer Setup Part 1</a> — Kafka Streams reuses much of the Kafka consumer architecture and framework. If you are comfortable with how consumers work (the <a href="06-consumer-setup-part1.html">13-step read flow</a>), Kafka Streams becomes much easier.</li>
+      <li><a href="14-need-for-kafka-streams.html">Need for Kafka Streams</a> — what it is and why it exists.</li>
+    </ol>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="stream"><span class="sec-num">1</span>Stream, Stream Processing and Kafka Streams</h2>
+<div class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <h4>Stream</h4>
+    <p>In simple terms, a stream has <strong>no start and no end</strong>: events keep arriving.</p>
+    <div class="logviz"><div class="row"><span class="lab">order-events</span><div class="cells"><span class="cell">Order1</span><span class="cell">Order2</span><span class="cell">Order3</span><span class="cell">Order4</span><span class="cell gone">…</span></div><span class="ptr">never ends</span></div></div>
+  </div>
+  <div class="card">
+    <h4>Stream processing</h4>
+    <p>Processing events <strong>as they arrive</strong>, continuously, in real time.</p>
+  </div>
+</div>
+<div class="callout tip"><span class="ci">&#128230;</span><div><p><strong>Kafka Streams</strong> is just a <strong>client library</strong> for building stream-processing applications on top of Kafka. It is <strong>not a separate cluster</strong> or infrastructure — it is a JAR file we add to our application.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="topology"><span class="sec-num">2</span>Topology</h2>
+<ul class="points">
+  <li>A <strong>logical flow</strong> of how data moves and gets processed, from source topics to sink topics.</li>
+  <li>The flow is a <strong>DAG</strong> (Directed Acyclic Graph): data flows in one direction, with no loops or cycles.</li>
+  <li>We define it <strong>once</strong>, during application start-up. After that, Kafka Streams executes it forever.</li>
+</ul>
+<div class="grid grid-2" style="align-items:start">
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Stateless processing — a factory line</span><span class="db">flowchart</span></div>
+    <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    S["Source · topic order-events · like raw material"] --> P["Processors · like cut, paint, package"]
+    P --> K["Sink · output topic · like shipping the finished goods"]
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class S src
+    class P proc
+    class K sink
+</div>
+    </div>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Stateful processing — with a state store</span><span class="db">flowchart</span></div>
+    <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    S["Source · topic order-events"] --> P["Processors"]
+    P <--> R[("State store · RocksDB")]
+    P --> K["Sink · output topic"]
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef db fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class S src
+    class P proc
+    class K sink
+    class R db
+</div>
+    </div>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Node</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Source</strong></td><td>Entry point: reads records from 1 or more Kafka topics. No parent processor. Deserializes bytes to key-value pairs. Forwards records to its child processors.</td></tr>
+      <tr><td><strong>Processor</strong></td><td>Business logic, where the transformation happens. Receives records from its parent processor, processes them, forwards results to its child processors.</td></tr>
+      <tr><td><strong>Sink</strong></td><td>Exit point: writes records to a Kafka topic. No child processor. Serializes key-value to bytes and writes to the output topic.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>For <strong>stateful</strong> processing, Kafka Streams stores data <strong>locally in RocksDB</strong> and keeps it fault-tolerant through <strong><a href="#changelog">changelog topics</a></strong>.</p>
+
+<h3 id="topology-examples">Different examples of topologies</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Linear · branching · multi-source join</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph L["Simple linear"]
+        L1["SOURCE order-events"] --> L2["FILTER"] --> L3["MAP"] --> L4["SINK filtered-orders"]
+    end
+    subgraph B["Branching"]
+        B1["SOURCE order-events"] --> B2["FILTER &gt;= 1000"] --> B3["SINK high-value-orders"]
+        B1 --> B4["FILTER &lt; 1000"] --> B5["SINK low-value-orders"]
+    end
+    subgraph J["Multi-source join"]
+        J1["SOURCE order-events"] --> J3["JOIN"]
+        J2["SOURCE payment-events"] --> J3
+        J3 --> J4["SINK enriched-orders"]
+    end
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class L1,B1,J1,J2 src
+    class L2,L3,B2,B4,J3 proc
+    class L4,B3,B5,J4 sink
+</div>
+  </div>
+  <div class="diagram-explain"><p>At this point, don't worry about <em>how</em> to create a source stream, what processors like filter and map do, or how to write to a sink. The agenda here is the <strong>architecture</strong>; those are covered in the <a href="16-kstream-ktable-globalktable.html">next chapters</a>.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="task"><span class="sec-num">3</span>Task — The Unit of Parallelism</h2>
+<ul class="points">
+  <li>A task is the <strong>unit of parallelism</strong>.</li>
+  <li>Each task has the <strong>complete topology</strong>.</li>
+  <li>Number of tasks = number of partitions; each task handles <strong>1 partition</strong>.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">order-events (P0, P1) → 2 tasks</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    T["Topic order-events · P0, P1"]
+    T --> A["Task1 · Source P0 → Processors → Sink"]
+    T --> B["Task2 · Source P1 → Processors → Sink"]
+    A <--> RA[("RocksDB")]
+    B <--> RB[("RocksDB")]
+    classDef t fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef task fill:#f3fbfa,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef db fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class T t
+    class A,B task
+    class RA,RB db
+</div>
+  </div>
+  <div class="diagram-explain"><p>“Each task has the complete topology” is <strong>not fully true</strong>. Why? Let's go one level deeper.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="sub-topology"><span class="sec-num">4</span>Sub-Topologies and Repartitioning</h2>
+<p>Sometimes the data needs to be <strong>re-partitioned</strong>. In that case one big topology is internally divided into multiple <strong>sub-topologies</strong>. What does re-partition mean? Use case:</p>
+<ul class="points">
+  <li>Read order events: <strong>key = orderId</strong>, value = Order <code>{ "orderId", "customerId", "productId" }</code>.</li>
+  <li>Find the <strong>product-wise order count</strong>, e.g. P1: 50 orders, P2: 100 orders.</li>
+</ul>
+
+<h3 id="no-repartition">The problem without repartitioning</h3>
+<p>Events are distributed across partitions <strong>by their key (orderId)</strong>. So product <code>P-1</code>'s orders end up in both partitions of <code>order-events</code>:</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events P0</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{ "orderId": "O-1", "customerId": "C-1", "productId": "P-1" }
+{ "orderId": "O-3", "customerId": "C-3", "productId": "P-1" }</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events P1</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{ "orderId": "O-2", "customerId": "C-2", "productId": "P-1" }</code></pre>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The count for P-1 is split across two tasks</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:tasksNoRepartition-->
+  </div>
+  <div class="diagram-explain"><p>Task1 says P-1 = 2, Task2 says P-1 = 1. The true answer, 3, exists nowhere. We need to <strong>re-partition by productId</strong>, so all orders of the same product go to the same partition and therefore to the same task.</p></div>
+</div>
+
+<h3 id="with-repartition">With repartitioning: two sub-topologies</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">One topology, split into sub-topologies by the framework</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph ST0["Sub-topology 0"]
+        A1["Source · order-events · key orderId"] --> A2["selectKey(productId)"] --> A3["Sink · repartition topic · key productId"]
+    end
+    subgraph ST1["Sub-topology 1"]
+        B1["Source · repartition topic"] --> B2["groupByKey"] --> B3["count"] --> B4["Sink · product-order-counts"]
+    end
+    A3 -.-> B1
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A1,B1 src
+    class A2,B2,B3 proc
+    class A3,B4 sink
+</div>
+  </div>
+  <div class="diagram-explain">
+    <p>We only write the <strong>topology</strong>: <em>source → selectKey → groupByKey → count → sink</em>. Based on the processors (when a repartition is required), the framework <strong>automatically creates a repartition topic</strong> and splits the topology into sub-topologies at that topic. The repartition topic gets the same partition count as the source topic.</p>
+  </div>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">order-events</span><div class="cells"><span class="cell">P0: O-1 (P-1)<small>key O-1</small></span><span class="cell">P0: O-3 (P-1)<small>key O-3</small></span><span class="cell">P1: O-2 (P-1)<small>key O-2</small></span></div></div>
+  <div class="row"><span class="lab">repartition-topic</span><div class="cells"><span class="cell new">P0: O-1<small>key P-1</small></span><span class="cell new">P0: O-2<small>key P-1</small></span><span class="cell new">P0: O-3<small>key P-1</small></span><span class="cell gone">P1<small>no P-1</small></span></div><span class="ptr t">all P-1 events in one partition</span></div>
+</div>
+
+<h3 id="task-again">Task, corrected</h3>
+<ul class="points">
+  <li>A task is still the <strong>unit of parallelism</strong>.</li>
+  <li>Each task runs <strong>one sub-topology for one specific partition</strong>.</li>
+  <li><strong>Number of tasks</strong> = for each sub-topology, one task per partition of its source topic.</li>
+</ul>
+<p>Here, 2 sub-topologies × 2 partitions = <strong>4 tasks</strong>, named <code>&lt;sub-topology&gt;_&lt;partition&gt;</code>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Tasks 0_0, 0_1, 1_0, 1_1</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:fourTasks-->
+  </div>
+  <div class="diagram-explain"><p>Only stateful operators (here <code>count</code>) get a RocksDB store, so only the sub-topology 1 tasks have one. The notes draw an “Order-store” in the sub-topology 0 tasks as well, but <code>selectKey</code> is stateless and creates no store.</p></div>
+</div>
+
+<h3 id="threads">Tasks are distributed over stream threads</h3>
+<div class="grid grid-2" style="align-items:center">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">spring.kafka.streams.properties[num.stream.threads]=2</code></pre>
+  </div>
+  <div class="mermaid">
+flowchart LR
+    subgraph APP["Spring Boot application"]
+        subgraph TH1["StreamThread-1"]
+            T00["Task 0_0"]
+            T10["Task 1_0 + RocksDB"]
+        end
+        subgraph TH2["StreamThread-2"]
+            T01["Task 0_1"]
+            T11["Task 1_1 + RocksDB"]
+        end
+    end
+    classDef task fill:#f3fbfa,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class T00,T10,T01,T11 task
+  </div>
+</div>
+<p>Each stream thread runs its own consumer and executes its tasks one after another. Tasks are the fixed unit; threads and instances just host them. To scale out, add threads or start another instance with the same <code>application.id</code>, up to the number of tasks.</p>
+
+<!-- ======================================================= -->
+<h2 id="changelog"><span class="sec-num">5</span>Changelog Topics — Fault-Tolerant State</h2>
+<div class="callout note"><span class="ci">&#10067;</span><div>
+  <p><strong>Doubt:</strong> RocksDB is just a key-value file store <strong>on local disk</strong>, and each task keeps its own RocksDB state. What happens when the machine dies or a rebalance occurs? The task may be assigned to another instance that <strong>does not have that local state</strong>. Then what?</p>
+</div></div>
+<p>That's where the <strong>changelog topic</strong> comes in:</p>
+<ol class="steps">
+  <li>Whenever a task updates its RocksDB store, it <strong>also publishes</strong> the change to a changelog topic. The Kafka Streams framework creates this topic itself.</li>
+  <li>When the task moves to another instance (rebalance) or the original machine is lost, Kafka Streams creates a <strong>new RocksDB store</strong> and <strong>restores</strong> its state by replaying the changelog.</li>
+</ol>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Write path and restore path</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant T as Task 1_0 (instance A)
+    participant R as RocksDB (A's disk)
+    participant CL as count-store-changelog P0
+    participant N as Task 1_0 (instance B)
+    T->>R: put(P-1, 3)
+    T->>CL: send(P-1, 3)
+    Note over T: instance A dies
+    Note over N: task 1_0 reassigned to B
+    N->>CL: read changelog P0 from the start
+    CL-->>N: P-1 → 3, ...
+    Note over N: new RocksDB rebuilt, processing resumes
+</div>
+  </div>
+  <div class="diagram-explain"><p>Changelog topics are <strong>compacted</strong>: only the latest value per key is kept, so a restore replays roughly one record per key instead of the whole history. Changelog partition N belongs to the task for partition N. The Kafka cluster for the example holds four topics:</p>
+  <div class="table-wrap" style="margin:8px 0 0"><table><thead><tr><th>Topic</th><th>Partitions</th><th>Used by</th></tr></thead><tbody>
+    <tr><td><code>order-events</code></td><td>P0, P1</td><td>sources of tasks 0_0, 0_1</td></tr>
+    <tr><td><code>repartition-topic</code></td><td>P0, P1</td><td>sink of sub-topology 0, source of 1_0, 1_1</td></tr>
+    <tr><td><code>count-store-changelog</code></td><td>P0, P1</td><td>backup of the RocksDB store of task 1_0 / 1_1</td></tr>
+    <tr><td><code>product-order-counts</code></td><td>…</td><td>final output</td></tr>
+  </tbody></table></div></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="flow"><span class="sec-num">6</span>Complete Flow (Same as a Consumer)</h2>
+<p>Now that we know the architecture, the runtime flow is <strong>exactly the consumer flow</strong> from <a href="06-consumer-setup-part1.html">Consumer Setup Part 1</a>, with three Streams-specific twists:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Kafka Streams start-up and processing</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant S as Stream app (S1, S2)
+    participant AB as Any broker
+    participant GC as Broker3 (Group Coordinator)
+    participant L as Partition leader (Broker2)
+    Note over S: Step1: start, join group.id = application.id ("stream-analytics")
+    Note over S: Step2: hash("stream-analytics") % 50 = 23 → __consumer_offsets P23
+    S->>AB: Step3: metadata request (first time or refresh)
+    AB-->>S: brokers vs partition leaders
+    S->>GC: Step4: JoinGroup
+    Note over GC: Step5: waits for members (group.initial.rebalance.delay.ms = 3000) &lt;br/&gt; picks one instance as group leader
+    Note over S: group leader runs StreamsPartitionAssignor: &lt;br/&gt; discover topology → sub-topologies → tasks &lt;br/&gt; create internal topics (repartition, changelog) &lt;br/&gt; distribute tasks, e.g. S1: Task0_0, Task0_1 · S2: Task0_2
+    S->>GC: assignment
+    GC-->>S: each member gets its tasks
+    S->>GC: Step6: fetch committed offset (order-events P2)
+    GC-->>S: Step7: P2 → 100
+    Note over S: Step8: restore state stores from changelog topics
+    S->>L: Step9: fetch from offset 101 (max bytes ...)
+    L-->>S: Step10: records 101 - 501
+    Note over S: Step11: process the records through the task's sub-topology
+    S->>GC: Step12: commit offset
+    Note over GC: Step13: write __consumer_offsets P23 · offset = 501
+    GC-->>S: ACK
+    Note over S: Step14: keep polling, back to Step9
+</div>
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li><strong>Group id</strong> = <code>application.id</code>.</li>
+      <li><strong>Step 5:</strong> instead of a simple partition assignor, the group leader runs <code>StreamsPartitionAssignor</code>, which assigns <strong>tasks</strong> (and creates the internal topics).</li>
+      <li><strong>Step 8:</strong> before processing, each stateful task <strong>restores its RocksDB store</strong> from the changelog topic.</li>
+    </ul>
+    <p>Kafka Streams commits every <code>commit.interval.ms</code> (default 30 s with at-least-once) rather than after each record. <code>group.initial.rebalance.delay.ms</code> is a <strong>broker</strong> setting.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="setup"><span class="sec-num">7</span>Setup with Spring Boot</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">pom.xml</span><span class="lang">xml</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.kafka&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-kafka&lt;/artifactId&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.apache.kafka&lt;/groupId&gt;
+    &lt;artifactId&gt;kafka-streams&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+<div class="os-tabs">
+<div class="code" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — macOS / Linux</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8090
+spring.application.name=kafka-streams-demo
+
+spring.kafka.streams.application-id=order-analytics
+spring.kafka.streams.bootstrap-servers=localhost:9092
+# number of stream processing threads
+spring.kafka.streams.properties[num.stream.threads]=2
+# where RocksDB files are stored on local disk
+spring.kafka.streams.properties[state.dir]=/tmp/kafka-streams</code></pre>
+</div>
+<div class="code" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — Windows</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8090
+spring.application.name=kafka-streams-demo
+
+spring.kafka.streams.application-id=order-analytics
+spring.kafka.streams.bootstrap-servers=localhost:9092
+# number of stream processing threads
+spring.kafka.streams.properties[num.stream.threads]=2
+# where RocksDB files are stored on local disk
+spring.kafka.streams.properties[state.dir]=C:/kafka-streams</code></pre>
+</div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaStreamsDemoApplication.java — enable Kafka Streams</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@SpringBootApplication
+@EnableKafkaStreams
+public class KafkaStreamsDemoApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaStreamsDemoApplication.class, args);
+    }
+}</code></pre>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderStreamTopology.java — define the topology</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.streams.config;
+
+import com.eda.streams.model.Order;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.serialization.Serdes;
+import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.kstream.*;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class OrderStreamTopology {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Bean
+    public KStream&lt;String, String&gt; orderCountTopology(StreamsBuilder builder) {
+
+        // SOURCE: read from "order-events" as raw JSON strings
+        KStream&lt;String, String&gt; orderStream =
+                builder.stream("order-events",
+                        Consumed.with(Serdes.String(), Serdes.String()));
+
+        // FILTER: only orders with totalAmount &gt; 100
+        KStream&lt;String, String&gt; highValueOrders =
+                orderStream.filter((key, value) -&gt; {
+                    try {
+                        Order order = objectMapper.readValue(value, Order.class);
+                        return order.getTotalAmount() != null
+                                &amp;&amp; order.getTotalAmount() &gt; 100;
+                    } catch (Exception e) {
+                        return false;
+                    }
+                });
+
+        // Re-key by productId
+        // This will trigger a REPARTITION topic
+        KStream&lt;String, String&gt; productKeyedOrders =
+                highValueOrders.selectKey((oldKey, value) -&gt; {
+                    try {
+                        Order order = objectMapper.readValue(value, Order.class);
+                        return order.getProductId();
+                    } catch (Exception e) {
+                        return "UNKNOWN";
+                    }
+                });
+
+        // RocksDB store name
+        KTable&lt;String, Long&gt; productCounts =
+                productKeyedOrders
+                        .groupByKey(Grouped.with(Serdes.String(), Serdes.String()))
+                        .count(Materialized.as("product-count-store"));
+
+        // output topic
+        productCounts
+                .toStream()
+                .mapValues(String::valueOf)
+                .to("product-counts",
+                        Produced.with(Serdes.String(), Serdes.String()));
+
+        return orderStream;
+    }
+}</code></pre>
+  </div>
+  <div>
+    <div class="code" style="margin:0 0 14px">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Order.java (POJO)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public class Order {
+    private String orderId;
+    private String customerId;
+    private String productId;
+    private Integer quantity;
+    private Double totalAmount;
+    private String status;
+
+    // getters and setters
+}</code></pre>
+    </div>
+    <div class="callout note" style="margin:0"><span class="ci">&#9998;</span><div><p>The notes declare <code>@Bean public void orderCountTopology(...)</code>. Spring rejects a <code>void</code> <code>@Bean</code> method, so here it returns the source <code>KStream</code>; an <code>@Autowired void buildPipeline(StreamsBuilder builder)</code> method also works. The topology is built once at start-up and then runs forever. Spring's <code>StreamsBuilderFactoryBean</code> starts <code>KafkaStreams</code> with it.</p></div></div>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Expectation: 3 partitions → 2 sub-topologies × 3 = 6 tasks</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+flowchart LR
+    subgraph ST0["Sub-topology 0 · Tasks 0_0, 0_1, 0_2"]
+        A1["Source order-events P0-P2"] --> A2["filter &gt; 100"] --> A3["selectKey(productId)"] --> A4["Sink · repartition"]
+    end
+    subgraph ST1["Sub-topology 1 · Tasks 1_0, 1_1, 1_2"]
+        B1["Source · repartition P0-P2"] --> B2["groupByKey"] --> B3["count"] --> B4["Sink · product-counts"]
+        B3 <--> R[("RocksDB product-count-store")]
+        R -.-> CL["changelog: product-count-store-changelog"]
+    end
+    A4 -.-> B1
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sink fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef db fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class A1,B1 src
+    class A2,A3,B2,B3 proc
+    class A4,B4,CL sink
+    class R db
+</div>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="test"><span class="sec-num">8</span>Let's Test</h2>
+<p>Start the Kafka cluster with 2 brokers (<a href="03-cluster-setup.html">Cluster Setup</a>) and the producer app.</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaProducerApplication — started</span><span class="lang">log</span></div>
+<pre><code data-lang="log">INFO --- [main] o.a.kafka.common.utils.AppInfoParser       : Kafka version: 3.9.1
+INFO --- [main] o.a.kafka.common.utils.AppInfoParser       : Kafka commitId: f745dfdcee2b9851
+INFO --- [main] o.a.kafka.common.utils.AppInfoParser       : Kafka startTimeMs: 1781942411214
+INFO --- [service-admin-0] o.a.kafka.common.utils.AppInfoParser : App info kafka.admin.client for kafka-producer-service-admin-0 unregistered
+INFO --- [service-admin-0] o.apache.kafka.common.metrics.Metrics : Metrics scheduler closed
+INFO --- [service-admin-0] o.apache.kafka.common.metrics.Metrics : Closing reporter org.apache.kafka.common.metrics.JmxReporter
+INFO --- [service-admin-0] o.apache.kafka.common.metrics.Metrics : Metrics reporters closed
+INFO --- [main] o.s.b.w.embedded.tomcat.TomcatWebServer    : Tomcat started on port 8081 (http) with context path '/'
+INFO --- [main] c.eda.producer.KafkaProducerApplication    : Started KafkaProducerApplication in 0.976 seconds</code></pre>
+</div>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe and list topics — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --topic order-events
+Topic: order-events  TopicId: 6QPZfo9TT9CCoMSsuxweLw  PartitionCount: 3  ReplicationFactor: 2  Configs: min.insync.replicas=2,segment.bytes=1073741824,retention.ms=604800000
+    Topic: order-events  Partition: 0  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:
+    Topic: order-events  Partition: 1  Leader: 4  Replicas: 4,3  Isr: 4,3  Elr:   LastKnownElr:
+    Topic: order-events  Partition: 2  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:
+$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+__consumer_offsets
+order-events</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe and list topics — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --describe --topic order-events
+Topic: order-events  TopicId: 6QPZfo9TT9CCoMSsuxweLw  PartitionCount: 3  ReplicationFactor: 2  Configs: min.insync.replicas=2,segment.bytes=1073741824,retention.ms=604800000
+    Topic: order-events  Partition: 0  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:
+    Topic: order-events  Partition: 1  Leader: 4  Replicas: 4,3  Isr: 4,3  Elr:   LastKnownElr:
+    Topic: order-events  Partition: 2  Leader: 3  Replicas: 3,4  Isr: 3,4  Elr:   LastKnownElr:
+&gt; bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+__consumer_offsets
+order-events</code></pre>
+</div>
+</div>
+<p>Broker id 3 leads partitions 0 and 2, broker id 4 leads partition 1. Only <strong>2 topics</strong> exist: <code>__consumer_offsets</code> (created internally) and <code>order-events</code> (created by the producer app). The <code>segment.bytes</code> value is cut off in the screenshot; 1073741824 is the 1 GB default.</p>
+
+<h3 id="start-streams">Start the Kafka Streams application</h3>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaStreamsDemoApplication — two stream threads join</span><span class="lang">log</span></div>
+<pre><code data-lang="log">5294 --- [kafka-streams-demo] [-StreamThread-1] k.c.c.i.ConsumerRebalanceListenerInvoker : [Consumer clientId=order-analytics-4c6fc4d3-...-StreamThread-1-consumer, groupId=order-analytics] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.s.p.internals.StreamThread         : stream-thread [order-analytics-4c6fc4d3-...-StreamThread-1] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.c.c.internals.SubscriptionState    : [Consumer clientId=order-analytics-4...] ...
+5294 --- [kafka-streams-demo] [-StreamThread-2] o.a.k.s.p.internals.StreamThread         : stream-thread [order-analytics-4c6fc4d3-...-StreamThread-2] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.c.c.i.ClassicKafkaConsumer         : [Consumer clientId=order-analytics-4...] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.c.c.internals.ConsumerCoordinator  : [Consumer clientId=order-analytics-4...] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.s.processor.internals.StreamTask   : stream-thread [order-analytics-4c6fc4d3-...] task [1_1] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.s.p.internals.StreamThread         : stream-thread [order-analytics-4c6fc4d3-...] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] org.apache.kafka.streams.KafkaStreams    : stream-client [order-analytics-4c6fc4d3-...] ...
+5294 --- [kafka-streams-demo] [-StreamThread-1] o.a.k.c.c.i.ClassicKafkaConsumer         : [Consumer clientId=order-analytics-4...] ...</code></pre>
+</div>
+<p style="font-size:13.5px;color:var(--muted)">The screenshot cuts the lines off on the right; the truncated parts are shown as “...”.</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">topics after start-up — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+__consumer_offsets
+order-analytics-product-count-store-changelog
+order-analytics-product-count-store-repartition
+order-events</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">topics after start-up — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-topics.bat --bootstrap-server localhost:9092 --list
+__consumer_offsets
+order-analytics-product-count-store-changelog
+order-analytics-product-count-store-repartition
+order-events</code></pre>
+</div>
+</div>
+<p>Now there are <strong>4 topics</strong>: the two internal ones were created by Kafka Streams and named <code>&lt;application.id&gt;-&lt;store name&gt;-changelog</code> and <code>&lt;application.id&gt;-&lt;store name&gt;-repartition</code>. The output topic <code>product-counts</code> is not created up front; it is auto-created on the first write, if broker auto-creation is on.</p>
+
+<h3 id="assignment">Which task is assigned to which thread?</h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe the streams group — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group order-analytics --describe</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">describe the streams group — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-consumer-groups.bat --bootstrap-server localhost:9092 --group order-analytics --describe</code></pre>
+</div>
+</div>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">output</span><span class="lang">text</span></div>
+<pre><code data-lang="text">GROUP            TOPIC                                            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID
+order-analytics  order-analytics-product-count-store-repartition  1          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-2-consumer-fe04f48e-...
+order-analytics  order-analytics-product-count-store-repartition  2          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-2-consumer-fe04f48e-...
+order-analytics  order-events                                     1          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-2-consumer-fe04f48e-...
+order-analytics  order-analytics-product-count-store-repartition  0          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-1-consumer-453df86a-...
+order-analytics  order-events                                     0          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-1-consumer-453df86a-...
+order-analytics  order-events                                     2          -               0               -    order-analytics-4c6fc4d3-b3b5-492c-ab88-caa00ccfaae7-StreamThread-1-consumer-453df86a-...</code></pre>
+</div>
+<div class="grid grid-2">
+  <div class="card"><h4>StreamThread-1 owns</h4><ul><li>order-events P0 → Task 0_0</li><li>order-events P2 → Task 0_2</li><li>…-repartition P0 → Task 1_0</li></ul></div>
+  <div class="card"><h4>StreamThread-2 owns</h4><ul><li>order-events P1 → Task 0_1</li><li>…-repartition P1 → Task 1_1</li><li>…-repartition P2 → Task 1_2</li></ul></div>
+</div>
+<p>6 tasks, 3 per thread, as expected. Changelog topics do not appear here, because they are only read (by a separate restore consumer) when state has to be rebuilt.</p>
+
+<h3 id="publish">Publish an event and follow it</h3>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">POST http://localhost:8081/api/orders/with-key</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{
+  "orderId": "O-1",
+  "customerId": "CUST-1",
+  "productId": "PROD-1",
+  "quantity": 1,
+  "totalAmount": 300,
+  "status": "CREATED"
+}</code></pre>
+  </div>
+  <div>
+    <div class="code terminal" style="margin:0 0 12px">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">response · 202 Accepted</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Order created and event published!</code></pre>
+    </div>
+    <div class="code log" style="margin:0">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">producer application log</span><span class="lang">log</span></div>
+<pre><code data-lang="log">2026-06-20T14:00:48.918+05:30  INFO 53795 --- [kafka-producer-service] [ad | producer-1] ...
+Order event sent successfully!
+Partition: 0
+Offset: 0</code></pre>
+    </div>
+  </div>
+</div>
+<p>Partition P0's leader is Broker1 (id = 3). Now look at every topic involved:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump each topic — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-events-0/00000000000000000000.log
+$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-analytics-product-count-store-repartition-0/00000000000000000000.log
+$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-analytics-product-count-store-changelog-0/00000000000000000000.log
+$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker2-logs/product-counts-0/00000000000000000000.log</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump each topic — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-events-0/00000000000000000000.log
+&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-analytics-product-count-store-repartition-0/00000000000000000000.log
+&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-analytics-product-count-store-changelog-0/00000000000000000000.log
+&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker2-logs/product-counts-0/00000000000000000000.log</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">1 · order-events-0 — key is the order id</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 1002 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1781944248918 size: 239 magic: 2 compresscodec: snappy crc: 284709179 isvalid: true
+| offset: 0 CreateTime: 1781944248918 keySize: 3 valueSize: 112 sequence: 0 headerKeys: [__TypeId__] key: O-1 payload: {"orderId":"O-1","customerId":"CUST-1","productId":"PROD-1","quantity":1,"totalAmount":300.0,"status":"CREATED"}</code></pre>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">2 · …-repartition-0 — key is now the product id</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 2 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1781944248918 size: 228 magic: 2 compresscodec: none crc: 1164846927 isvalid: true
+| offset: 0 CreateTime: 1781944248918 keySize: 6 valueSize: 112 sequence: 0 headerKeys: [__TypeId__] key: PROD-1 payload: {"orderId":"O-1","customerId":"CUST-1","productId":"PROD-1","quantity":1,"totalAmount":300.0,"status":"CREATED"}</code></pre>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">3 · …-changelog-0 — the RocksDB update</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 2 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1781944248918 size: 82 magic: 2 compresscodec: none crc: 1921361186 isvalid: true
+| offset: 0 CreateTime: 1781944248918 keySize: 6 valueSize: 8 sequence: 0 headerKeys: [] key: PROD-1 payload: </code></pre>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">4 · product-counts-0 — the output</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 2 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1781944248918 size: 115 magic: 2 compresscodec: none crc: 1597431120 isvalid: true
+| offset: 0 CreateTime: 1781944248918 keySize: 6 valueSize: 1 sequence: 0 headerKeys: [__TypeId__] key: PROD-1 payload: 2</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Topic</th><th>Key</th><th>Value</th><th>What it shows</th></tr></thead>
+    <tbody>
+      <tr><td>order-events</td><td><code>O-1</code></td><td>order JSON</td><td>the original event, keyed by order id</td></tr>
+      <tr><td>…-repartition</td><td><code>PROD-1</code></td><td>same order JSON</td><td>re-keyed by <code>selectKey</code>, so all PROD-1 orders go to one partition</td></tr>
+      <tr><td>…-changelog</td><td><code>PROD-1</code></td><td>8 bytes (blank in the dump)</td><td>the count as a binary <code>long</code> — the backup of the RocksDB entry</td></tr>
+      <tr><td>product-counts</td><td><code>PROD-1</code></td><td><code>2</code></td><td>the count turned into a String by <code>mapValues(String::valueOf)</code></td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div>
+  <ul style="margin:0">
+    <li>The changelog value is <strong>8 bytes</strong> because <code>count()</code> stores a <code>Long</code>; the dump prints the raw bytes, which are not readable text.</li>
+    <li>The output shows <code>2</code>, so PROD-1 has 2 high-value orders. The second order's records are not part of the screenshots.</li>
+    <li>All Streams-written records carry <code>producerId: 2</code>: the stream thread's producer is idempotent but not transactional. Set <code>processing.guarantee=exactly_once_v2</code> for <a href="11-transactions-consumer.html#eos">EOS</a>.</li>
+    <li>The <code>__TypeId__</code> header from the producer travels along into the repartition and output topics, because Kafka Streams forwards record headers.</li>
+  </ul>
+</div></div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">local RocksDB state — under state.dir (one folder per task)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">/tmp/kafka-streams/
+└── order-analytics/                 ← application.id
+    ├── 1_0/
+    │   └── rocksdb/product-count-store/   ← RocksDB files of task 1_0
+    ├── 1_1/
+    │   └── rocksdb/product-count-store/
+    └── 1_2/
+        └── rocksdb/product-count-store/</code></pre>
+</div>
+<p>Each task maintains its <strong>own local RocksDB state</strong>. Only the stateful sub-topology 1 tasks have store folders.</p>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>Kafka Streams is a <strong>library</strong>; the app is a group of stream threads that are Kafka consumers + producers.</li>
+    <li>A <strong>topology</strong> (DAG of source → processors → sink) is defined once and runs forever.</li>
+    <li>Re-keying before a grouping or join creates a <strong>repartition topic</strong> and splits the topology into <strong>sub-topologies</strong>.</li>
+    <li><strong>Tasks</strong> = sub-topologies × partitions; tasks are spread over threads and instances.</li>
+    <li>State lives in <strong>RocksDB</strong> per task and is backed up to compacted <strong>changelog topics</strong> for recovery.</li>
+  </ul>
+</div></div>

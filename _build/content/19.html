@@ -1,0 +1,320 @@
+<!--meta
+{
+  "lead": "Stateful processing nodes — operations that must remember earlier records, backed by RocksDB state stores. How groupByKey and groupBy turn a KStream into a KGroupedStream and trigger repartitioning, then count, aggregate (initializer + aggregator, step by step) and joins: KStream–KTable and KTable–KTable, and why a KTable–KStream lookup is not possible.",
+  "date": "Wednesday, 22 July 2026",
+  "related": [
+    { "n": 18, "why": "Stateless processing nodes — selectKey, map and friends that come before grouping." },
+    { "n": 15, "why": "RocksDB, changelog topics, repartition topics and tasks behind every stateful node." },
+    { "n": 16, "why": "KTable, GlobalKTable and co-partitioning, needed for joins." },
+    { "n": 20, "why": "Windowed aggregation — count and aggregate per time window." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="stateful"><span class="sec-num">1</span>What Is a Stateful Processing Node?</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Processors</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P["PROCESSORS"] --> A["Stateless processing nodes · Chapter 18"]
+    P --> B["Stateful processing nodes · this chapter"]
+    B <--> R[("State store · RocksDB")]
+    classDef off fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef on fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:2px
+    class P,A off
+    class B,R on
+</div>
+  </div>
+</div>
+<ul class="points">
+  <li>A stateful processing node <strong>must remember information from previous records</strong> to produce correct output.</li>
+  <li>Stateful operations use <strong>state stores (RocksDB)</strong> to keep intermediate state, backed by changelog topics (<a href="15-kafka-streams-architecture.html#changelog">Kafka Streams Architecture</a>).</li>
+  <li>Common examples: <strong>count</strong> records per key, <strong>sum</strong> amounts per user.</li>
+</ul>
+<p>The important stateful operations covered here:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Operation</th><th>Stores state?</th><th>Returns</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>groupByKey</code></td><td>No — entry point to stateful processing</td><td>KGroupedStream</td></tr>
+      <tr><td>2</td><td><code>groupBy</code></td><td>No — entry point to stateful processing</td><td>KGroupedStream</td></tr>
+      <tr><td>3</td><td><code>count</code></td><td>Yes</td><td>KTable&lt;K, Long&gt;</td></tr>
+      <tr><td>4</td><td><code>aggregate</code></td><td>Yes</td><td>KTable&lt;K, VR&gt;</td></tr>
+      <tr><td>5</td><td>KStream–KTable <code>join</code></td><td>Yes (reads the table's store)</td><td>KStream</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="grouping"><span class="sec-num">2</span>groupByKey and groupBy</h2>
+<p><code>groupByKey</code> and <code>groupBy</code> are <strong>not stateful operations themselves</strong>: they store no intermediate state. They are the <strong>entry point</strong> to stateful processing and have 2 major responsibilities:</p>
+<ol class="steps">
+  <li><strong>Convert KStream → KGroupedStream.</strong> This tells the downstream stateful operation which key to aggregate by — the existing key or a new one.</li>
+  <li><strong>Repartition if required.</strong> When the key has changed, they initiate the repartition.</li>
+</ol>
+
+<h3 id="groupbykey">groupByKey</h3>
+<ul class="points">
+  <li>Tells downstream stateful operations to use the <strong>existing key</strong> for aggregation.</li>
+  <li>Use it when the current key is already the key you want to aggregate by.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">groupByKey</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// optional: only if you want to change the key; otherwise skip selectKey
+KStream&lt;String, Order&gt; ordersByUser = orders.selectKey((orderId, order) -&gt; order.getUserId());
+
+KGroupedStream&lt;String, Order&gt; groupedOrders = ordersByUser.groupByKey();</code></pre>
+</div>
+<p>A <code>KGroupedStream</code> is not a normal stream: it has the aggregation methods — <code>count</code>, <code>aggregate</code>, <code>reduce</code>, and <code>windowedBy</code> for <a href="20-kafka-streams-window.html">windows</a>.</p>
+
+<h3 id="groupby">groupBy</h3>
+<p><code>groupBy</code> says: “I don't want the current key — I'll tell you a <strong>new key</strong> (which can even be a different type).”</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">groupBy</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KGroupedStream&lt;String, Order&gt; groupedOrders =
+        orders.groupBy((orderId, order) -&gt; order.getUserId());</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p>For both, if the key has changed, Kafka Streams must <strong>redistribute records (repartition)</strong> by the new key. <code>groupBy(f)</code> is effectively <code>selectKey(f).groupByKey()</code>. Plain <code>groupByKey()</code> on an unchanged key needs no repartition at all. Pass <code>Grouped.with(keySerde, valueSerde)</code> when the default SerDes don't match the types written to the repartition topic.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="count"><span class="sec-num">3</span>count</h2>
+<p><code>count</code> counts the number of records <strong>for each key</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KGroupedStream.count signatures</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KTable&lt;K, Long&gt; count();
+
+KTable&lt;K, Long&gt; count(Materialized&lt;K, Long, KeyValueStore&lt;Bytes, byte[]&gt;&gt; materialized);</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">count with a named store</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KTable&lt;String, Long&gt; orderCount = orders
+        .groupByKey()
+        .count(
+                Materialized.&lt;String, Long, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("order-count-store")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(Serdes.Long())
+        );</code></pre>
+</div>
+<p>SerDes are covered in <a href="17-kafka-streams-serdes.html">Chapter 17</a>; note the value SerDe is <code>Serdes.Long()</code> because a count is a Long.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">No repartition</span><span class="db">flowchart</span></div>
+    <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    S["Source topic · orders (KStream)"] --> G["groupByKey (KGroupedStream)"]
+    G --> C["count() · read RocksDB → update count → write RocksDB"]
+    C <--> R[("RocksDB")]
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef db fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class S src
+    class G,C proc
+    class R db
+</div>
+    </div>
+    <div class="diagram-explain"><p><code>count()</code> reads each record from the previous node and uses the KGroupedStream metadata (which key to aggregate by).</p></div>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">With repartition</span><span class="db">flowchart</span></div>
+    <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    S["Source topic (KStream)"] --> K["selectKey() (KStream)"]
+    K --> T["Repartition topic"]
+    T --> G["groupByKey() (KGroupedStream)"]
+    G --> C["count() · read RocksDB → update count → write RocksDB"]
+    C <--> R[("RocksDB")]
+    classDef src fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef proc fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef db fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class S,T src
+    class K,G,C proc
+    class R db
+</div>
+    </div>
+    <div class="diagram-explain"><p>Here <code>count()</code> reads records <strong>from the repartition topic</strong>, again using the KGroupedStream metadata.</p></div>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The same topology as tasks (2 partitions)</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:fourTasks-->
+  </div>
+  <div class="diagram-explain"><p>Only the sub-topology 1 tasks (groupByKey → count) own a RocksDB store. The notes' version of this picture also draws a RocksDB next to <code>selectKey</code> in tasks 0_0 / 0_1, but <code>selectKey</code> is stateless and creates no store.</p></div>
+</div>
+
+<h3 id="count-example">Example: order count per user</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">groupBy + count</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KTable&lt;String, Long&gt; orderCountByUser = orders
+        .groupBy((orderId, order) -&gt; order.getUserId())
+        .count();</code></pre>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="table-wrap" style="margin:0">
+    <table>
+      <thead><tr><th>Event</th><th>Order ID</th><th>User ID</th></tr></thead>
+      <tbody><tr><td>1</td><td>o1</td><td>u1</td></tr><tr><td>2</td><td>o2</td><td>u1</td></tr><tr><td>3</td><td>o3</td><td>u2</td></tr><tr><td>4</td><td>o4</td><td>u1</td></tr></tbody>
+    </table>
+  </div>
+  <div>
+    <p style="margin:0 0 6px;font-weight:700">State store after processing</p>
+    <div class="logviz">
+      <div class="row"><span class="lab">u1</span><div class="cells"><span class="cell">1<small>o1</small></span><span class="cell">2<small>o2</small></span><span class="cell new">3<small>o4</small></span></div></div>
+      <div class="row"><span class="lab">u2</span><div class="cells"><span class="cell new">1<small>o3</small></span></div></div>
+    </div>
+  </div>
+</div>
+<p>The resulting KTable emits an update every time a count changes (u1 → 1, 2, 3; u2 → 1). Converted with <code>.toStream()</code>, those updates can be written to an output topic, as in <a href="15-kafka-streams-architecture.html#setup">Chapter 15</a>.</p>
+
+<!-- ======================================================= -->
+<h2 id="aggregate"><span class="sec-num">4</span>aggregate</h2>
+<p>With <code>aggregate()</code>, <strong>you decide how the aggregation works</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KGroupedStream.aggregate signature</span><span class="lang">java</span></div>
+<pre><code data-lang="java">&lt;VR&gt; KTable&lt;K, VR&gt; aggregate(Initializer&lt;VR&gt; initializer,
+                             Aggregator&lt;? super K, ? super V, VR&gt; aggregator);</code></pre>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Initializer.java — first time a key is seen</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface Initializer&lt;VAgg&gt; {
+    VAgg apply();
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Aggregator.java — (key, new value, current aggregate)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface Aggregator&lt;K, V, VAgg&gt; {
+    VAgg apply(K var1, V var2, VAgg var3);
+}</code></pre>
+  </div>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="table-wrap" style="margin:0">
+    <table>
+      <thead><tr><th>Key</th><th>Value</th></tr></thead>
+      <tbody><tr><td>Alice</td><td>Order(100)</td></tr><tr><td>Bob</td><td>Order(200)</td></tr><tr><td>Alice</td><td>Order(150)</td></tr><tr><td>Alice</td><td>Order(50)</td></tr><tr><td>Bob</td><td>Order(300)</td></tr></tbody>
+    </table>
+  </div>
+  <div class="card" style="margin:0"><h4>Output we want</h4><div class="table-wrap" style="margin:6px 0 0"><table><thead><tr><th>Key</th><th>Total</th></tr></thead><tbody><tr><td>Alice</td><td>300</td></tr><tr><td>Bob</td><td>500</td></tr></tbody></table></div></div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">aggregate — total amount per key</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KGroupedStream&lt;String, Order&gt; groupedOrders = orders.groupByKey();
+
+KTable&lt;String, Double&gt; totalAmount = groupedOrders.aggregate(
+        () -&gt; 0.0,                                                    // initializer
+        (key, order, totalFromRocksDB) -&gt; totalFromRocksDB + order.getAmount(),   // aggregator
+        Materialized.&lt;String, Double, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("total-amount-store")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.Double())
+);</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Step by step for key Alice</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:aggregateSteps-->
+  </div>
+  <div class="diagram-explain"><p>When Alice arrives the first time, RocksDB has no key <code>Alice</code>, so the <strong>initializer</strong> provides the starting value <code>0</code>. Every record then calls the <strong>aggregator</strong> with the value currently in RocksDB, and the result is stored back. Bob follows the same path: 0 + 200 = 200, then 200 + 300 = 500.</p></div>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes call <code>aggregate(initializer, aggregator)</code> without a <code>Materialized</code>. That compiles, but the store then uses the <strong>default value SerDe</strong>; with String defaults (as in <a href="17-kafka-streams-serdes.html#priority">Chapter 17</a>) writing a <code>Double</code> fails at runtime. So the example above adds <code>Materialized...withValueSerde(Serdes.Double())</code>. A simpler alternative for “same type in, same type out” is <code>reduce()</code>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="kstream-ktable-join"><span class="sec-num">5</span>KStream–KTable Join</h2>
+<p>A KStream–KTable join <strong>enriches each stream event</strong> with the <strong>latest value</strong> for its key from a table.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KStream.join(KTable) signature</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// joiner receives (stream value, latest table value for the key)
+// and returns the enriched output
+&lt;VT, VR&gt; KStream&lt;K, VR&gt; join(KTable&lt;K, VT&gt; table,
+        ValueJoiner&lt;? super V, ? super VT, ? extends VR&gt; joiner);</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">ValueJoiner.java</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface ValueJoiner&lt;V1, V2, VR&gt; {
+    VR apply(V1 var1, V2 var2);
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">enrich orders with the user profile</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KStream&lt;String, Order&gt; ordersByUser = orders.selectKey((orderId, order) -&gt; order.getUserId());
+
+KTable&lt;String, UserProfile&gt; users = builder.table("users",
+        Consumed.with(Serdes.String(), userProfileSerde),
+        Materialized.&lt;String, UserProfile, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("users-store")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(userProfileSerde)
+);
+
+KStream&lt;String, EnrichedOrder&gt; enrichedOrders = ordersByUser.join(
+        users,
+        (order, user) -&gt; new EnrichedOrder(order, user)
+);</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Order for u1 + latest profile of u1</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    O["Order stream · u1 → { orderId: o1, userId: u1, amount: 500 }"] --> J["join"]
+    U[("User table · u1 → { name: Asha, city: Delhi } · u2 → { name: Ravi, city: Pune }")] -- "lookup u1" --> J
+    J --> E["Output · u1 → { orderId: o1, userId: u1, amount: 500, name: Asha, city: Delhi }"]
+    classDef s fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef t fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class O s
+    class U t
+    class J,E ok
+</div>
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li>The <strong>key</strong> of the KStream and the KTable must be the same (here the user id), which is why the orders are re-keyed with <code>selectKey</code> first. That re-keying causes a repartition before the join, and the topics must be <a href="16-kstream-ktable-globalktable.html#doubt3">co-partitioned</a>.</li>
+      <li>Only <strong>stream records</strong> trigger output: a new order looks up the table. A profile update does not re-emit old orders.</li>
+      <li>With <code>join</code>, an order whose user is not in the table produces nothing; <code>leftJoin</code> emits it with a <code>null</code> user.</li>
+    </ul>
+  </div>
+</div>
+
+<h3 id="ktable-ktable">KTable–KTable join</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">combine two tables by key</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KTable&lt;String, UserProfile&gt; profiles = builder.table("user-profiles");
+KTable&lt;String, UserPreference&gt; preferences = builder.table("user-preferences");
+
+KTable&lt;String, CompleteUser&gt; completeUsers = profiles.join(
+        preferences,
+        (profile, preference) -&gt; new CompleteUser(profile, preference)
+);</code></pre>
+</div>
+<p>Unlike the stream–table join, a KTable–KTable join produces a <strong>table</strong>, and it is updated when <strong>either side</strong> changes. These two <code>builder.table(...)</code> calls rely on default SerDes, which must therefore match <code>UserProfile</code> and <code>UserPreference</code>. Otherwise pass <code>Consumed.with(...)</code> as above.</p>
+
+<h3 id="ktable-kstream">KTable–KStream: not possible</h3>
+<div class="callout danger"><span class="ci">&#10060;</span><div><p>A KTable cannot look up into a KStream. A KStream is an <strong>unbounded sequence of events</strong>; it has no store and cannot be randomly looked up by key. The join must always be started from the stream side (<code>stream.join(table)</code>). Joining two streams is possible, but only inside a <strong>time window</strong> (<code>KStream.join(KStream, …, JoinWindows)</code>), because Kafka Streams can buffer events only for a bounded time — see <a href="20-kafka-streams-window.html">Kafka Streams Window</a>.</p></div></div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Left</th><th>Right</th><th>Possible?</th><th>Result</th><th>Triggered by</th></tr></thead>
+    <tbody>
+      <tr><td>KStream</td><td>KTable</td><td><span class="badge ok">Yes</span></td><td>KStream</td><td>stream records only</td></tr>
+      <tr><td>KTable</td><td>KTable</td><td><span class="badge ok">Yes</span></td><td>KTable</td><td>updates on either side</td></tr>
+      <tr><td>KStream</td><td>GlobalKTable</td><td><span class="badge ok">Yes</span></td><td>KStream</td><td>stream records; no co-partitioning needed</td></tr>
+      <tr><td>KStream</td><td>KStream</td><td><span class="badge ok">Yes, windowed</span></td><td>KStream</td><td>records on either side within the window</td></tr>
+      <tr><td>KTable</td><td>KStream</td><td><span class="badge bad">No</span></td><td>—</td><td>a stream cannot be looked up</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>Stateful nodes remember earlier records in RocksDB stores, backed by changelog topics.</li>
+    <li><code>groupByKey</code> / <code>groupBy</code> produce a KGroupedStream and repartition when the key changed.</li>
+    <li><code>count</code> → KTable&lt;K, Long&gt;; <code>aggregate</code> → your own logic with an initializer and an aggregator.</li>
+    <li>KStream–KTable joins enrich events with the latest table value (same key, co-partitioned); KTable–KTable joins combine tables; KTable–KStream is not possible.</li>
+  </ul>
+</div></div>

@@ -1,0 +1,475 @@
+<!--meta
+{
+  "lead": "SerDes — a serializer and a deserializer in one object — and the five places in a topology where Kafka Streams needs them. Built-in SerDes, default versus explicit SerDes and their priority, how to build a JsonSerde for your own classes, and what happens when serialization or deserialization fails: the default handlers, LogAndContinue, and writing custom deserialization and production exception handlers.",
+  "date": "Monday, 29 June 2026",
+  "related": [
+    { "n": 16, "why": "KStream, KTable and GlobalKTable — the Consumed / Materialized calls that take SerDes." },
+    { "n": 15, "why": "Repartition topics and RocksDB stores — two of the five places SerDes are used." },
+    { "n": 8, "why": "The same problem on a plain consumer: ErrorHandlingDeserializer and DLT." },
+    { "n": 12, "why": "Avro SerDes backed by Schema Registry, for a typed contract instead of JSON." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="recap"><span class="sec-num">1</span>Recap: Source Syntax</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">the three source types (Chapter 16)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// KStream
+KStream&lt;String, String&gt; orders = builder.stream("source-topic-name",
+        Consumed.with(Serdes.String(), Serdes.String()));
+
+// KTable
+KTable&lt;String, String&gt; orders = builder.table("source-topic-name",
+        Consumed.with(Serdes.String(), Serdes.String()),
+        Materialized
+                .&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("RocksDB-store-name")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.String()));
+
+// GlobalKTable
+GlobalKTable&lt;String, String&gt; countries = builder.globalTable("source-topic-name",
+        Consumed.with(Serdes.String(), Serdes.String()),
+        Materialized
+                .&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("RocksDB-store-name")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.String()));</code></pre>
+</div>
+<p>Every <code>Serdes.String()</code> in there is a <strong>SerDe</strong>. Let's see what that is.</p>
+
+<!-- ======================================================= -->
+<h2 id="serdes"><span class="sec-num">2</span>What Is a SerDe?</h2>
+<div class="grid grid-2" style="align-items:center">
+  <div>
+    <p><strong>SerDe = Serializer + Deserializer</strong>, combined into 1 object:</p>
+    <ul class="points">
+      <li><strong>Serializer:</strong> Java object → bytes</li>
+      <li><strong>Deserializer:</strong> bytes → Java object</li>
+      <li><strong>SerDe:</strong> both in one package</li>
+    </ul>
+  </div>
+  <div class="mermaid">
+flowchart LR
+    O["Java object"] -- "Serializer" --> B["bytes"]
+    B -- "Deserializer" --> O
+    classDef o fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef b fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    class O o
+    class B b
+  </div>
+</div>
+<p><strong>Why we need it:</strong> Kafka stores data as bytes, and so does RocksDB. Whenever we <strong>read</strong> from a Kafka topic or RocksDB we need deserialization (bytes → Java object); whenever we <strong>write</strong> to a Kafka topic or RocksDB we need serialization (Java object → bytes). Kafka Streams both reads and writes, so a plain consumer's deserializer or a producer's serializer is not enough: it needs both directions, often for the same type.</p>
+
+<h3 id="five-places">The 5 places in a topology that need SerDes</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Where bytes ↔ objects conversions happen</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    T1["Kafka · source topic"] -- "1 · Source: deserialize" --> P1["processors"]
+    P1 -- "3 · Repartition: serialize" --> RT["Kafka · repartition topic"]
+    RT -- "deserialize" --> P2["processors · count / join"]
+    P2 -- "4 · RocksDB write: serialize" --> DB[("RocksDB")]
+    DB -- "5 · RocksDB read: deserialize" --> P2
+    P2 -- "2 · Sink: serialize" --> T2["Kafka · output topic"]
+    classDef k fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef p fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef d fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class T1,RT,T2 k
+    class P1,P2 p
+    class DB d
+</div>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Place</th><th>Direction</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>Source</strong></td><td>deserialize</td><td>reading from a Kafka topic — <code>Consumed.with(...)</code></td></tr>
+      <tr><td>2</td><td><strong>Sink</strong></td><td>serialize</td><td>writing to a Kafka topic — <code>Produced.with(...)</code></td></tr>
+      <tr><td>3</td><td><strong>Repartition</strong> (sub-topology)</td><td>serialize (and deserialize when it is read back)</td><td>writing to the internal repartition topic — <code>Grouped.with(...)</code> / <code>Repartitioned.with(...)</code></td></tr>
+      <tr><td>4</td><td><strong>RocksDB write</strong></td><td>serialize</td><td>KTable, GlobalKTable, or processors like <code>count</code> that store data — <code>Materialized...withKeySerde/withValueSerde</code></td></tr>
+      <tr><td>5</td><td><strong>RocksDB read</strong></td><td>deserialize</td><td>a <strong>join</strong> or lookup reads from RocksDB</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>The changelog topic behind each store uses the same SerDes as the store itself.</p>
+
+<!-- ======================================================= -->
+<h2 id="builtin"><span class="sec-num">3</span>Built-in SerDes</h2>
+<p>Kafka Streams provides these out of the box:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>SerDe</th><th>Type ↔ bytes</th><th>SerDe</th><th>Type ↔ bytes</th></tr></thead>
+    <tbody>
+      <tr><td><code>Serdes.String()</code></td><td>String</td><td><code>Serdes.Bytes()</code></td><td>Bytes object</td></tr>
+      <tr><td><code>Serdes.Long()</code></td><td>Long (8 bytes)</td><td><code>Serdes.UUID()</code></td><td>UUID</td></tr>
+      <tr><td><code>Serdes.Integer()</code></td><td>Integer (4 bytes)</td><td><code>Serdes.Float()</code></td><td>Float</td></tr>
+      <tr><td><code>Serdes.Double()</code></td><td>Double</td><td><code>Serdes.Short()</code></td><td>Short</td></tr>
+      <tr><td><code>Serdes.ByteArray()</code></td><td>byte[]</td><td><code>Serdes.Boolean()</code></td><td>Boolean</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>This is why the <a href="15-kafka-streams-architecture.html#publish">changelog value</a> in Chapter 15 was 8 unreadable bytes: <code>count()</code> stores its result with <code>Serdes.Long()</code>.</p>
+
+<!-- ======================================================= -->
+<h2 id="priority"><span class="sec-num">4</span>SerDes Priority: Default vs Explicit</h2>
+<div class="vs">
+  <div class="side a">
+    <h4>Lowest priority — default SerDes</h4>
+    <div class="sb">
+      <p>Set once in <code>application.properties</code>; applied everywhere no SerDe is given.</p>
+<pre class="mini"><code>spring.kafka.streams.properties.default.key.serde=org.apache.kafka.common.serialization.Serdes$StringSerde
+spring.kafka.streams.properties.default.value.serde=org.apache.kafka.common.serialization.Serdes$StringSerde</code></pre>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Highest priority — explicit SerDes</h4>
+    <div class="sb">
+      <p>Passed in the code: <code>Consumed.with</code>, <code>Produced.with</code>, <code>Grouped.with</code>, <code>Materialized.withKeySerde/withValueSerde</code>. These always override the default for that one step.</p>
+    </div>
+  </div>
+</div>
+<p><strong>Without</strong> default SerDes, we must specify the key and value SerDes everywhere (as in the <a href="#recap">recap</a>). <strong>With</strong> them, the same source types become:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">relying on the default SerDes</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// KStream
+KStream&lt;String, String&gt; orders = builder.stream("source-topic-name");
+
+// KTable
+KTable&lt;String, String&gt; orders = builder.table("source-topic-name",
+        Materialized.&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("RocksDB-store-name"));
+
+// GlobalKTable
+GlobalKTable&lt;String, String&gt; countries = builder.globalTable("source-topic-name",
+        Materialized.&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("RocksDB-store-name"));</code></pre>
+</div>
+<p>Explicit SerDes at each of the places:</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">1 · Source and 3 · RocksDB write</span><span class="lang">java</span></div>
+<pre><code data-lang="java">KStream&lt;String, String&gt; orders = builder.stream("source-topic-name",
+        Consumed.with(Serdes.String(), Serdes.String()));
+
+KTable&lt;String, String&gt; table = builder.table("source-topic-name",
+        Consumed.with(Serdes.String(), Serdes.String()),
+        Materialized
+                .&lt;String, String, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("RocksDB-store-name")
+                .withKeySerde(Serdes.String())
+                .withValueSerde(Serdes.String()));</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">2 · Sink</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    @Autowired
+    public void kstreamDemo(StreamsBuilder builder) {
+
+        KStream&lt;String, String&gt; orders = builder.stream("order-events",
+                Consumed.with(Serdes.String(), Serdes.String()));
+
+        orders.peek((key, value) -&gt;
+                System.out.println("key=" + key + " value=" + value));
+
+        orders.to("order-events-output",
+                Produced.with(Serdes.String(), Serdes.String()));
+    }
+}</code></pre>
+  </div>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>Setting a default is convenient when most of the topology uses one type. But operators that <strong>change</strong> the type (e.g. <code>count()</code> turns values into <code>Long</code>, <code>mapValues</code> into anything) still need an explicit SerDe downstream, or the default String SerDe will fail at runtime with a <code>ClassCastException</code>. Using <code>@Bean</code> + <code>void</code> as in the notes is not allowed by Spring; <code>@Autowired</code> is used here as in <a href="16-kstream-ktable-globalktable.html#kstream">Chapter 16</a>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="json-serde"><span class="sec-num">5</span>Custom Java Objects: JsonSerde</h2>
+<p>How do we handle our own classes like <code>Order</code> or <code>Payment</code>? Use a <strong>JsonSerde</strong>. Spring Kafka already ships one (<code>org.springframework.kafka.support.serializer.JsonSerde</code>), but here is how we would write it ourselves.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">1 · JsonSerializer.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.serialization.Serializer;
+
+public class JsonSerializer&lt;T&gt; implements Serializer&lt;T&gt; {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public byte[] serialize(String topic, T data) {
+        if (data == null) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsBytes(data);
+        }
+        catch (Exception e) {
+            throw new RuntimeException("Error serializing", e);
+        }
+    }
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">2 · JsonDeserializer.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.serialization.Deserializer;
+
+public class JsonDeserializer&lt;T&gt; implements Deserializer&lt;T&gt; {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final Class&lt;T&gt; targetType;
+
+    public JsonDeserializer(Class&lt;T&gt; targetType) {
+        this.targetType = targetType;
+    }
+
+    @Override
+    public T deserialize(String topic, byte[] data) {
+        if (data == null) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(data, targetType);
+        } catch (Exception e) {
+            throw new RuntimeException("Error deserializing", e);
+        }
+    }
+}</code></pre>
+  </div>
+</div>
+<ul class="points">
+  <li>The serializer is <strong>generic</strong> (<code>&lt;T&gt;</code>), so it can handle any object: Order, Payment, etc.</li>
+  <li>Because of that, the deserializer must be told the <strong>target type</strong> to convert into — hence <code>Class&lt;T&gt; targetType</code>.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">3 · JsonSerde.java — both in one object</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import org.apache.kafka.common.serialization.Serde;
+
+public class JsonSerde&lt;T&gt; implements Serde&lt;T&gt; {
+
+    private final JsonSerializer&lt;T&gt; serializer;
+    private final JsonDeserializer&lt;T&gt; deserializer;
+
+    public JsonSerde(Class&lt;T&gt; targetType) {
+        this.serializer = new JsonSerializer&lt;&gt;();
+        this.deserializer = new JsonDeserializer&lt;&gt;(targetType);
+    }
+
+    @Override
+    public JsonSerializer&lt;T&gt; serializer() {
+        return serializer;
+    }
+
+    @Override
+    public JsonDeserializer&lt;T&gt; deserializer() {
+        return deserializer;
+    }
+}</code></pre>
+</div>
+<p>Like this, we can create any custom SerDe. Kafka also has a shortcut, <code>Serdes.serdeFrom(serializer, deserializer)</code>, which wraps an existing pair. Now let's use it:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SourceTypesTopology.java — typed Order stream</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class SourceTypesTopology {
+
+    @Autowired
+    public void kstreamDemo(StreamsBuilder builder) {
+
+        Serde&lt;Order&gt; orderSerde = new JsonSerde&lt;&gt;(Order.class);
+
+        KStream&lt;String, Order&gt; orders = builder.stream("order-events",
+                Consumed.with(Serdes.String(), orderSerde));
+
+        orders.filter((key, order) -&gt; order.getTotalAmount() &gt; 100)
+              .to("order-events-output",
+                      Produced.with(Serdes.String(), orderSerde));
+    }
+}</code></pre>
+</div>
+<p>Compare this with <a href="15-kafka-streams-architecture.html#setup">Chapter 15</a>, where each processor parsed a JSON String with <code>objectMapper.readValue</code> again and again. With a JsonSerde the stream is <strong>typed</strong> as <code>KStream&lt;String, Order&gt;</code>, so <code>order.getTotalAmount()</code> is used directly.</p>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes import <code>Serdes</code> in <code>JsonSerde</code> without using it; that import is dropped. In the filter, <code>order.getTotalAmount() &gt; 100</code> throws a <code>NullPointerException</code> if the amount is null (the field is a <code>Double</code>), so production code should check for null as in Chapter 15.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="errors"><span class="sec-num">6</span>What If Serialization or Deserialization Fails?</h2>
+<div class="vs">
+  <div class="side a">
+    <h4>Deserialization fails (reading)</h4>
+    <div class="sb">
+      <p class="lbl">Use case 1: wrong SerDe type</p>
+      <p>Topic has <code>{"orderId": "001", "amount": 150}</code> (a JSON string). We read with <code>Consumed.with(Serdes.String(), Serdes.Long())</code>. Result: it tries to read JSON bytes as an 8-byte Long → <strong>exception</strong>.</p>
+      <p class="lbl">Use case 2: corrupted data</p>
+      <p>Topic has garbage bytes that aren't valid JSON. We read with <code>new JsonSerde&lt;&gt;(Order.class)</code>. Result: Jackson can't parse → <code>JsonParseException</code> → <strong>exception</strong>.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Serialization fails (writing)</h4>
+    <div class="sb">
+      <p class="lbl">Use case 1: wrong output SerDe</p>
+      <p>We have a <code>Long</code> value but write with <code>Produced.with(Serdes.String(), Serdes.String())</code>. Result: serializing a Long as a String → <code>ClassCastException</code>.</p>
+      <p class="lbl">Use case 2: object can't be serialized</p>
+      <p>An <code>Order</code> with a circular reference, written with <code>JsonSerde&lt;&gt;(Order.class)</code>. Result: Jackson can't serialize → <code>JsonMappingException</code>.</p>
+    </div>
+  </div>
+</div>
+
+<h3 id="deser-handlers">Deserialization: 3 ways to handle it</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Handler</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>LogAndFailExceptionHandler</code> <strong>(default)</strong></td><td>Logs the error, throws the exception, the <strong>stream thread dies</strong>. If all threads die, the application dies.</td></tr>
+      <tr><td><code>LogAndContinueExceptionHandler</code></td><td>Logs the error, <strong>skips</strong> the bad record, continues with the next one. The bad record is <strong>lost forever</strong>.</td></tr>
+      <tr><td><strong>Custom handler</strong></td><td>Our own business logic: continue, fail fast, or insert into a <strong>dead-letter topic</strong>.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties — pick one</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># default: log and fail
+spring.kafka.streams.properties[default.deserialization.exception.handler]=org.apache.kafka.streams.errors.LogAndFailExceptionHandler
+# or: log and skip the record
+spring.kafka.streams.properties[default.deserialization.exception.handler]=org.apache.kafka.streams.errors.LogAndContinueExceptionHandler
+# or: custom
+spring.kafka.streams.properties[default.deserialization.exception.handler]=com.eda.streams.errorhandling.CustomDeserializationHandler</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">CustomDeserializationHandler.java — skip up to N bad records</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.streams.errorhandling;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.streams.errors.DeserializationExceptionHandler;
+import org.apache.kafka.streams.processor.ProcessorContext;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class CustomDeserializationHandler implements DeserializationExceptionHandler {
+
+    private long maxErrors;
+    private static final AtomicLong errorCount = new AtomicLong(0);
+
+    @Override
+    public DeserializationHandlerResponse handle(ProcessorContext context,
+                                                 ConsumerRecord&lt;byte[], byte[]&gt; record,
+                                                 Exception exception) {
+        long errors = errorCount.incrementAndGet();
+        // STRATEGY: skip bad records, if limit not crossed
+        if (errors &gt; maxErrors) {
+            return DeserializationHandlerResponse.FAIL;
+        }
+        return DeserializationHandlerResponse.CONTINUE;
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+        // we can read stream config properties here if needed
+        Object value = configs.get("stream.max.deserialization.errors");
+        if (value != null) {
+            maxErrors = Long.parseLong(value.toString());
+        } else {
+            maxErrors = 100;
+        }
+    }
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div>
+  <ul style="margin:0">
+    <li>The notes call <code>Long.parseLong(value.toString())</code> <strong>before</strong> the null check, which throws a <code>NullPointerException</code> when the property is missing; that line is removed, and <code>If</code> is fixed to <code>if</code>.</li>
+    <li><code>stream.max.deserialization.errors</code> is our own property; pass it as <code>spring.kafka.streams.properties[stream.max.deserialization.errors]=100</code> and it reaches <code>configure()</code>.</li>
+    <li>The <code>errorCount</code> is <code>static</code>, so it is shared by all stream threads and never resets; a real handler might count per time window instead.</li>
+    <li>In Kafka 3.9+ this <code>handle(ProcessorContext, …)</code> signature is deprecated in favour of <code>handle(ErrorHandlerContext, …)</code>; it still works.</li>
+  </ul>
+</div></div>
+
+<h3 id="prod-handlers">Serialization / production: 2 ways to handle it</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Handler</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>DefaultProductionExceptionHandler</code> <strong>(default)</strong></td><td>Always fails: the stream thread dies; if all threads die, the application dies.</td></tr>
+      <tr><td><strong>Custom handler</strong></td><td>Decide per exception whether to CONTINUE (skip) or FAIL.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">what the default does (conceptual)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public class DefaultProductionExceptionHandler
+        implements ProductionExceptionHandler {
+
+    @Override
+    public ProductionExceptionHandlerResponse handle(
+            ProducerRecord&lt;byte[], byte[]&gt; record,
+            Exception exception) {
+        return ProductionExceptionHandlerResponse.FAIL;
+    }
+}</code></pre>
+    <p style="font-size:13.5px;color:var(--muted)">We don't need to write this; it shows what the built-in handler does.</p>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">CustomProductionHandler.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.streams.errorhandling;
+
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.streams.errors.ProductionExceptionHandler;
+import java.util.Map;
+
+public class CustomProductionHandler implements ProductionExceptionHandler {
+
+    @Override
+    public ProductionExceptionHandlerResponse handle(
+            ProducerRecord&lt;byte[], byte[]&gt; record,
+            Exception exception) {
+
+        if (exception.getClass().getSimpleName().contains("RecordTooLarge")) {
+            return ProductionExceptionHandlerResponse.CONTINUE;
+        }
+        return ProductionExceptionHandlerResponse.FAIL;
+    }
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {
+    }
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># default
+spring.kafka.streams.properties[default.production.exception.handler]=org.apache.kafka.streams.errors.DefaultProductionExceptionHandler
+# or custom
+spring.kafka.streams.properties[default.production.exception.handler]=com.eda.streams.errorhandling.CustomProductionHandler</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div>
+  <p><strong>Which failures reach which handler?</strong> The <code>handle(ProducerRecord&lt;byte[], byte[]&gt; …)</code> method shown above receives records that were <strong>already serialized</strong> and then failed to be sent, e.g. <code>RecordTooLargeException</code> from the broker. A <code>ClassCastException</code> or <code>JsonMappingException</code> during <strong>serialization</strong> happens before that. Kafka 3.5+ routes those through a separate method, <code>handleSerializationException(...)</code>, which also defaults to FAIL — override it too if you want to skip unserializable records.</p>
+</div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Where each handler sits</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    I["Kafka source"] --> D{"Deserialize OK?"}
+    D -- "No" --> DH["DeserializationExceptionHandler · FAIL or CONTINUE"]
+    D -- "Yes" --> P["Processors"]
+    P --> S{"Serialize OK?"}
+    S -- "No" --> SH["handleSerializationException · FAIL or CONTINUE"]
+    S -- "Yes" --> SEND{"Send OK?"}
+    SEND -- "No" --> PH["ProductionExceptionHandler.handle · FAIL or CONTINUE"]
+    SEND -- "Yes" --> O["Kafka output"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef k fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    class D,P,S,SEND step
+    class DH,SH,PH bad
+    class I,O k
+</div>
+  </div>
+  <div class="diagram-explain"><p>Exceptions thrown inside your <strong>own processor code</strong> (e.g. a NullPointerException in a filter) are handled by neither of these; since Kafka 3.9 there is a third hook, <code>processing.exception.handler</code>, for that.</p></div>
+</div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>A SerDe converts both ways; Kafka Streams needs one at source, sink, repartition, RocksDB write and RocksDB read.</li>
+    <li>Built-in SerDes cover primitives and Strings; a <strong>JsonSerde</strong> (built in, or your own) handles custom classes.</li>
+    <li>Explicit SerDes in code override the <code>default.key.serde</code> / <code>default.value.serde</code> properties.</li>
+    <li>Bad input: LogAndFail (default), LogAndContinue, or a custom handler. Failed output: DefaultProductionExceptionHandler (fail) or a custom one.</li>
+  </ul>
+</div></div>

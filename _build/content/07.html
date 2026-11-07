@@ -1,0 +1,708 @@
+<!--meta
+{
+  "lead": "Beyond the basic consumer: how one consumer fetches from several partitions, how to make one consumer read several topics, how several consumers in one group read different topics, and how several consumers read the same topic with concurrency. Along the way, the complete JSON deserialization flow — __TypeId__ headers, type mapping, trusted packages — and why one shared ConsumerFactory breaks multi-type listeners.",
+  "date": "Saturday, 14 March 2026",
+  "related": [
+    { "n": 6, "why": "Part 1 — the basic consumer and the Spring start-up flow this chapter builds on." },
+    { "n": 4, "why": "The producer side: JsonSerializer and KafkaTemplate value types." },
+    { "n": 2, "why": "Consumer groups and the consumers-vs-partitions scenarios." },
+    { "n": 8, "why": "Handling exceptions such as deserialization failures." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">Where we are</b>
+    <p>In <a href="06-consumer-setup-part1.html">Part 1</a> we set up a basic consumer and saw how it reads from a topic. But what if:</p>
+    <ul style="margin:6px 0 0">
+      <li><strong>one consumer</strong> needs to join <strong>more than one topic</strong>?</li>
+      <li><strong>multiple consumers in a group</strong> need to join <strong>different topics</strong>?</li>
+      <li><strong>multiple consumers in a group</strong> need to join the <strong>same topic</strong>?</li>
+    </ul>
+    <p>How do we achieve this? This is where things get interesting.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="basic-recap"><span class="sec-num">1</span>Recap: The Basic Consumer Setup</h2>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderEventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderEventListener {
+
+    @KafkaListener(topics = "order-events")
+    public void consume(Order order) {
+        // business logic
+        System.out.println("Received:" + order.getOrderId());
+    }
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+  </div>
+</div>
+<p>And what happens at start-up (from <a href="06-consumer-setup-part1.html#startup-flow">Part 1</a>):</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Recap: Spring Boot start-up flow</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["Spring Boot application starts"] --> B["KafkaAutoConfiguration · triggered by spring-kafka on the class path"]
+    B --> B1["Creates bean: ConsumerFactory · reads spring.kafka.consumer.* props, stores them as a Map"]
+    B --> B2["Creates bean: ConcurrentKafkaListenerContainerFactory · holds a reference to ConsumerFactory · no KafkaConsumer object created yet"]
+    A --> C["@EnableKafka · added automatically by Spring Boot based on the class path · enables Kafka listener processing"]
+    C --> D["Creates bean: KafkaListenerAnnotationBeanPostProcessor"]
+    D --> D1["Scans for @KafkaListener"]
+    D --> D2["For each @KafkaListener, asks ConcurrentKafkaListenerContainerFactory to create a KafkaListenerContainer bean"]
+    D2 --> E1["KafkaListenerContainer gets a KafkaConsumer object from the ConsumerFactory"]
+    D2 --> E2["Poll loop starts"]
+    classDef start fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef auto fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ann fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef run fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A start
+    class B,B1,B2 auto
+    class C,D,D1,D2 ann
+    class E1,E2 run
+</div>
+  </div>
+    <div class="diagram-explain"><p><strong>Key point for this chapter:</strong> the step <em>“For each @KafkaListener …”</em> creates one KafkaListenerContainer — and therefore <strong>one KafkaConsumer</strong> — per listener method. Everything below builds on that.</p></div>
+</div>
+
+<p>Let's say <code>order-events</code> has 3 partitions (P0, P1 and P2). With the basic consumer setup, this is what we achieve:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Basic setup: one consumer, all partitions</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:basicOneConsumer-->
+  </div>
+  <div class="diagram-explain">
+    <div class="grid grid-2" style="margin:0;align-items:start">
+      <div>
+        <h4>Explanation</h4>
+        <p>Our application starts <strong>one</strong> <code>@KafkaListener</code>, so the group has <strong>one consumer, C1</strong>. Since it is the only member of <em>Consumer Group 1</em>, all three partitions are assigned to it, and C1 reads P0, P1 and P2.</p>
+      </div>
+      <div class="table-wrap" style="margin:0">
+        <table>
+          <thead><tr><th>Partition</th><th>Leader Broker</th></tr></thead>
+          <tbody><tr><td>P0</td><td>B1</td></tr><tr><td>P1</td><td>B2</td></tr><tr><td>P2</td><td>B1</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3 id="fetch-internals">Internally, what each consumer might be doing</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">poll loop (conceptual)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">while (true) {
+    ConsumerRecords records = consumer.poll();
+    for (ConsumerRecord record : records) {
+        // business logic
+    }
+}</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">One poll(): one FetchRequest per broker, merged into ConsumerRecords</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C1 as C1 poll()
+    participant B1 as Broker1 (leader of P0, P2)
+    participant B2 as Broker2 (leader of P1)
+    C1->>B1: FetchRequest for (P0, P2)
+    C1->>B2: FetchRequest for (P1)
+    B1-->>C1: FetchResponse from B1 (P0 records, P2 records)
+    B2-->>C1: FetchResponse from B2 (P1 records)
+    Note over C1: Merge the responses &lt;br/&gt; Create ConsumerRecords object
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The consumer groups its partitions <strong>by leader broker</strong> and sends <strong>one request per broker</strong>: P0 and P2 are both led by Broker1, so they share one FetchRequest; P1 goes to Broker2. The two responses are merged into a single <code>ConsumerRecords</code> object, which is what one <code>poll()</code> returns.</p>
+  </div>
+</div>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">FetchRequest looks like</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Topic: order-events
+  ○ Partition: P0
+      • Offset: X
+  ○ Partition: P2
+      • Offset: Y</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">FetchResponse looks like</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Topic: order-events
+  ○ Partition: P0
+      • Records
+  ○ Partition: P2
+      • Records</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">ConsumerRecords object (after merging)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">ConsumerRecords
+ ├── Topic: order-events, Partition: P0
+ │     ├── ConsumerRecord(offset=10, value=A)
+ │     └── ConsumerRecord(offset=11, value=B)
+ ├── Topic: order-events, Partition: P1
+ │     └── ConsumerRecord(offset=5, value=C)
+ └── Topic: order-events, Partition: P2
+       ├── ConsumerRecord(offset=20, value=D)
+       └── ConsumerRecord(offset=21, value=E)</code></pre>
+</div>
+<p>Records are grouped <strong>per partition</strong>, and within each partition they are in offset order. (The source notes label the third group “P1” again; it is the P2 data returned by Broker1.)</p>
+
+<!-- ======================================================= -->
+<h2 id="one-consumer-many-topics"><span class="sec-num">2</span>1st: One Consumer Joins More Than One Topic</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">C1 reads order-events and payment-events</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:oneConsumerTwoTopics-->
+  </div>
+</div>
+<p>There are two approaches for turning the JSON of two different topics into two different Java types.</p>
+
+<h3 id="approach1-manual">Approach 1: Manually taking care of JSON-to-object mapping</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.apache.kafka.common.serialization.StringDeserializer</code></pre>
+</div>
+<p>Now this consumer handles more than one topic, so <strong>we handle the deserialization ourselves</strong>: if it's <code>order-events</code>, convert it to an <code>Order</code> object; if it's <code>payment-events</code>, convert it to a <code>Payment</code> object. That's why the value deserializer here is <code>StringDeserializer</code> — we need to control the deserialization.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderEventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderEventListener {
+
+    @Autowired
+    ObjectMapper objectMapper;
+
+    // like this we can provide the list of topics which a consumer wants to subscribe to
+    @KafkaListener(topics = {"order-events", "payment-events"})
+    public void consume(ConsumerRecord&lt;String, String&gt; record) throws JsonProcessingException {
+        // the record is accepted as it is; the deserialization task is ours
+        if ("order-events".equals(record.topic())) {
+            Order order = objectMapper.readValue(record.value(), Order.class);
+            // business logic for order
+        } else if ("payment-events".equals(record.topic())) {
+            Payment payment = objectMapper.readValue(record.value(), Payment.class);
+            // business logic for payment
+        }
+    }
+}</code></pre>
+</div>
+<ul>
+  <li><code>topics = {"order-events", "payment-events"}</code> — one listener (one consumer) subscribed to <strong>both</strong> topics.</li>
+  <li>The parameter is the raw <code>ConsumerRecord&lt;String, String&gt;</code>: we get the topic name and the JSON string, and pick the target class ourselves.</li>
+  <li><code>readValue</code> throws a checked <code>JsonProcessingException</code>, so the method declares it (the source omits this).</li>
+</ul>
+
+<h3 id="approach2-auto">Approach 2: AUTO mapping JSON-to-object conversion</h3>
+<p>But before that, first understand the very important <strong>JSON DESERIALIZATION FLOW</strong>, where many of us get confused.</p>
+
+<h4 id="producer-typeid">At the PRODUCER side (during JSON serialization)</h4>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderProducerService.java</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Service
+public class OrderProducerService {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Order&gt; kafkaTemplate;
+
+    public void sendWithKey(Order order) {
+        String key = order.getOrderId();
+        kafkaTemplate.send("order-events", key, order);
+    }
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (producer)</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">#---------------SERIALIZER-------------
+# Key needs to be String
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# Value: JsonSerializer, auto-converts Java objects to JSON bytes
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer
+# By default this (json.add.type.headers) is true only
+spring.kafka.producer.properties.spring.json.add.type.headers=true</code></pre>
+  </div>
+</div>
+<p>With this, when the producer sends the event, it also adds <code>__TypeId__ = com.eda.producer.model.Order</code> in the <strong>event header</strong>. The type id is not part of the payload — it is hidden in the header. We can see it by dumping the partition's log segment:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">inspect a log segment — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-events-3/00000000000000000000.log</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">inspect a log segment — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-events-3/00000000000000000000.log</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">record with a type header</span><span class="lang">text</span></div>
+<pre><code data-lang="text">| offset: 0 CreateTime: 1773812798798 keySize: 3 valueSize: 112 sequence: 0 headerKeys: [__TypeId__] key: O-2 payload: {"orderId": ...
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTran...
+240 magic: 2 compresscodec: snappy crc: 2988695115 isvalid: true</code></pre>
+</div>
+<p><code>headerKeys: [__TypeId__]</code> — the type id header was added (its value is the producer's class name).</p>
+
+<div class="callout warn"><span class="ci">&#9888;</span><div><b class="ct">But it is not always 100% sure that the producer adds <code>__TypeId__</code></b><p>Even though <code>spring.json.add.type.headers=true</code> is the default, until now the header keys were <strong>empty</strong>:</p></div></div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka-dump-log output — no type header</span><span class="lang">text</span></div>
+<pre><code data-lang="text">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log \
+  --files /tmp/broker1-logs/order-events-3/00000000000000000000.log
+Dumping /tmp/broker1-logs/order-events-3/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 1000 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1773574261402 size: 135 magic: 2 compresscodec: snappy crc: 2489348583 isvalid: true
+| offset: 0 CreateTime: 1773574261402 keySize: 7 valueSize: 42 sequence: 0 headerKeys: [] key: O-32700 payload: {"orderId":"O-32700","productId":"PROD-3"}</code></pre>
+</div>
+<p>The source notes explain it like this: we were using <code>KafkaTemplate&lt;String, <strong>Order</strong>&gt;</code> — a <strong>specific value type</strong> — so the producer did not add <code>__TypeId__</code>; after switching to <code>KafkaTemplate&lt;String, <strong>Object</strong>&gt;</code>, the producer added <code>__TypeId__</code> to the header.</p>
+<div class="callout warn"><span class="ci">&#128269;</span><div><b class="ct">A closer look at that dump</b><p>The payload in the “empty headers” dump is <code>{"orderId":"O-32700","productId":"PROD-3"}</code> — only two fields. That is the output of the custom <code>OrderSummarySerializer</code> from <a href="04-producer-setup.html#custom-serializer">Producer Setup</a>, and a custom serializer does not add any type header. That is the reason <code>headerKeys</code> is empty in that record. The generic type of <code>KafkaTemplate</code> exists only at compile time (Java erases it at run time), so <code>JsonSerializer</code> cannot tell <code>Order</code> from <code>Object</code>. Whenever the value goes through <code>JsonSerializer</code> with <code>add.type.headers=true</code> (the default), the <code>__TypeId__</code> header is added. <strong>Rule of thumb:</strong> check your value serializer — <code>JsonSerializer</code> adds the header, a custom serializer does not.</p></div></div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The dump is also a nice confirmation of earlier chapters: <code>producerId: 1000</code>, <code>baseSequence: 0</code> / <code>lastSequence: 0</code> are the idempotence fields from <a href="05-idempotency.html#sequence">Idempotency</a>, <code>compresscodec: snappy</code> is our <code>compression.type</code>, and the payload <code>{"orderId":…,"productId":…}</code> is the output of the custom <code>OrderSummarySerializer</code> from <a href="04-producer-setup.html#custom-serializer">Producer Setup</a>.</p></div></div>
+<p>That's internal logic of the producer client, but what we have to understand is: when the value uses <strong>JsonSerializer</strong>, <code>spring.json.add.type.headers=true</code> is the default, so the producer adds <code>__TypeId__ = com.eda.producer.model.Order</code> in the event header (in the cases above).</p>
+
+<h4 id="consumer-flow">At the CONSUMER side (during JSON deserialization)</h4>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">JSON deserialization decision flow (per consumer record)</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    R["Per Kafka consumer record (bytes + headers)"] --> Q1{"Is JsonDeserializer?"}
+    Q1 -->|"No"| OTHER["other deserializer"]
+    Q1 -->|"Yes"| Q2{"spring.json.use.type.headers ?"}
+    Q2 -->|"false"| DEF["Default type config · spring.json.value.default.type = com.eda.consumer.model.Order"]
+    Q2 -->|"true (default)"| Q3{"Is __TypeId__ header present?"}
+    Q3 -->|"No"| DEF
+    Q3 -->|"Yes · e.g. com.producer.Order"| Q4{"Mapping present?"}
+    Q4 -->|"Yes"| TO["Use the 'to' class · spring.json.type.mapping = com.producer.Order:com.consumer.Order"]
+    Q4 -->|"No"| Q5{"Trusted package?"}
+    Q5 -->|"No"| E1["IllegalArgumentException · not in trusted package"]
+    Q5 -->|"Yes"| LOAD["Load class from __TypeId__"]
+    LOAD --> Q6{"Class exists in consumer class path?"}
+    Q6 -->|"No"| E2["ClassNotFoundException"]
+    Q6 -->|"Yes"| DES["Deserialize JSON → Object"]
+    TO --> DES
+    DEF --> DES
+    DES --> INV["@KafkaListener method invoked"]
+    classDef q fill:#fff8e6,stroke:#d97706,color:#78350f,stroke-width:1.5px
+    classDef ok fill:#ecfbf1,stroke:#16a34a,color:#14532d,stroke-width:1.5px
+    classDef bad fill:#fef1f1,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef box fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    class Q1,Q2,Q3,Q4,Q5,Q6 q
+    class DES,INV ok
+    class E1,E2 bad
+    class R,DEF,TO,LOAD,OTHER box
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Reading the flow</h4>
+    <ol class="steps">
+      <li><strong>Is the value deserializer a JsonDeserializer?</strong> If not, this flow does not apply.</li>
+      <li><strong><code>spring.kafka.consumer.properties.spring.json.use.type.headers</code></strong> — does the consumer have to read <code>__TypeId__</code> from the header or not? If <strong>false</strong>, it goes straight to the <strong>default type</strong> config.</li>
+      <li>If <strong>true</strong> (default): <strong>is the <code>__TypeId__</code> header present?</strong> If not, the default type is used.</li>
+      <li>If it is present (say <code>__TypeId__ = com.producer.Order</code>): <strong>is a mapping present?</strong> With <code>spring.json.type.mapping=com.producer.Order:com.consumer.Order</code> (<em>from</em> : <em>to</em>), the <strong>“to” class</strong> is used.</li>
+      <li>If there is <strong>no mapping</strong>, the consumer is forced to load the class the producer named (<code>com.producer.Order</code>). What if a hacker passed a malicious header such as <code>com.fake.hack.Order</code>? The consumer would try to load that class. So <strong>trusted packages</strong> are a security step before the consumer actually tries to load the class:
+        <ul>
+          <li><code>spring.kafka.consumer.properties.spring.json.trusted.packages=com.producer</code> — trust all classes within this package.</li>
+          <li><code>spring.kafka.consumer.properties.spring.json.trusted.packages=*</code> — trust everything.</li>
+        </ul>
+        Not trusted &rarr; <strong>IllegalArgumentException</strong> (not in trusted package).</li>
+      <li>If trusted, the class is loaded from <code>__TypeId__</code>; if it does not exist on the consumer's class path &rarr; <strong>ClassNotFoundException</strong>.</li>
+      <li>Otherwise: <strong>deserialize JSON &rarr; object</strong> and <strong>invoke the @KafkaListener method</strong>.</li>
+    </ol>
+  </div>
+</div>
+
+<h4 id="auto-mapping-setup">Now the flow is clear — back to AUTO mapping</h4>
+<p><strong>Producer:</strong> one <code>KafkaTemplate&lt;String, Object&gt;</code> for both event types, so the producer adds <code>__TypeId__</code> in the event header.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">ProducerService.java (producer)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Service
+public class ProducerService {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+
+    public void sendOrder(Order order) {
+        String key = order.getOrderId();
+        kafkaTemplate.send("order-events", key, order);
+    }
+
+    public void sendPayment(Payment payment) {
+        String key = payment.getPaymentId();
+        kafkaTemplate.send("payment-events", key, payment);
+    }
+}</code></pre>
+</div>
+<p><strong>Consumer:</strong> map the producer's classes to the consumer's classes:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (consumer)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+
+# __TypeId__ from the producer (from) : class in this consumer (to)
+spring.kafka.consumer.properties.spring.json.type.mapping=\
+  com.eda.producer.model.Order:com.eda.consumer.model.Order,\
+  com.eda.producer.model.Payment:com.eda.consumer.model.Payment
+
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+</div>
+<p>(A trailing <code>\</code> continues a value on the next line in a <code>.properties</code> file; the source writes the mapping across lines for readability.) The POJO classes in the consumer:</p>
+<div class="grid grid-2">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Order.java (consumer)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.consumer.model;
+
+public class Order {
+    private String orderId;
+    private String customerId;
+    private String productId;
+    private Integer quantity;
+    private Double totalAmount;
+    private String status;
+
+    // getters and setters
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Payment.java (consumer)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.consumer.model;
+
+public class Payment {
+    private String paymentId;
+    private String customerId;
+    private Double totalAmount;
+    private String status;
+
+    // getters and setters
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderEventListener.java (consumer)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderEventListener {
+
+    @KafkaListener(topics = {"order-events", "payment-events"})
+    public void consume(ConsumerRecord&lt;String, Object&gt; record) {
+        if ("order-events".equals(record.topic())) {
+            Order order = (Order) record.value();          // now no manual mapping is required
+            // business logic for order
+        } else if ("payment-events".equals(record.topic())) {
+            Payment payment = (Payment) record.value();
+            // business logic for payment
+        }
+    }
+}</code></pre>
+</div>
+<p><strong>Now no manual mapping is required</strong> — the JsonDeserializer reads <code>__TypeId__</code>, maps it to the consumer class and hands us a ready object; we only cast it. (The source declares the record as <code>ConsumerRecord&lt;String, String&gt;</code>; since the value is now an <code>Order</code> or <code>Payment</code> object, it must be <code>ConsumerRecord&lt;String, Object&gt;</code> for the casts to compile.)</p>
+
+<!-- ======================================================= -->
+<h2 id="consumers-different-topics"><span class="sec-num">3</span>2nd: Multiple Consumers in a Group Join Different Topics</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">C1 reads order-events, C2 reads payment-events</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:twoConsumersTwoTopics-->
+  </div>
+</div>
+
+<h3 id="two-apps">Approach 1: Two different consumer applications</h3>
+<p>The simplest: create <strong>2 different consumer applications</strong>. Whatever we have seen in the basic consumer setup will work, as it creates <strong>one consumer per application</strong>.</p>
+
+<h3 id="one-app-two-consumers">Approach 2: Two consumers in one application</h3>
+<p>Look at the start-up flow again: <strong>for each @KafkaListener, one KafkaConsumer is created</strong>. So two listener methods give us two consumers in the same group.</p>
+<div class="callout key"><span class="ci">&#128273;</span><div><p>In the start-up flow, the step <em>“For each @KafkaListener, ask ConcurrentKafkaListenerContainerFactory to create a KafkaListenerContainer bean”</em> runs once per listener method — <strong>each listener gets its own container and therefore its own KafkaConsumer</strong>.</p></div></div>
+<p>There are two ways to configure the JSON types:</p>
+<div class="vs">
+  <div class="side b">
+    <h4>&#10003; Way 1: <code>__TypeId__</code> + mapping</h4>
+    <div class="sb">
+<div class="code" style="margin:0 0 10px">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">EventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class EventListener {
+
+    @KafkaListener(topics = "order-events")
+    public void consumeOrder(Order order) {
+        // business logic
+        System.out.println("Received:" + order.getOrderId());
+    }
+
+    @KafkaListener(topics = "payment-events")
+    public void consumePayment(Payment payment) {
+        // business logic
+        System.out.println("Received:" + payment.getPaymentId());
+    }
+}</code></pre>
+</div>
+<div class="code" style="margin:0">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.type.mapping=\
+  com.eda.producer.model.Order:com.eda.consumer.model.Order,\
+  com.eda.producer.model.Payment:com.eda.consumer.model.Payment
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+</div>
+      <p><strong>This works fine and is recommended.</strong> Each record carries its own type in the header, so the right class is chosen per record.</p>
+    </div>
+  </div>
+  <div class="side a">
+    <h4>&#10007; Way 2: use type headers = false</h4>
+    <div class="sb">
+<div class="code" style="margin:0 0 10px">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">EventListener.java</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// same two listeners as Way 1:
+// consumeOrder(Order)     on "order-events"
+// consumePayment(Payment) on "payment-events"</code></pre>
+</div>
+<div class="code" style="margin:0">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span></div>
+<pre><code data-lang="properties">spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+</div>
+      <p><strong>This will not work</strong> when a payment event is sent: the consumer consumes it, type headers are ignored (<code>false</code>), so it goes to the <strong>default type</strong> config — <code>com.eda.consumer.model.Order</code> — and tries to turn a Payment into an Order.</p>
+    </div>
+  </div>
+</div>
+<p>The exception that comes:</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">payment listener failure</span><span class="lang">log</span></div>
+<pre><code data-lang="log">Caused by: org.springframework.messaging.converter.MessageConversionException: Cannot convert
+from [com.eda.consumer.model.Order] to [com.eda.consumer.model.Payment] for GenericMessage
+[payload=Order{orderId='null', customerId='CUST-2', productId='null', quantity=null, totalAmount=99.99,
+status='CREATED'}, headers={kafka_offset=0, ...</code></pre>
+</div>
+<p>Read the payload: the Payment JSON was deserialized <strong>as an Order</strong> — only the fields both classes share (<code>customerId</code>, <code>totalAmount</code>, <code>status</code>) were filled, <code>orderId</code>/<code>productId</code>/<code>quantity</code> are <code>null</code> — and then Spring could not convert that <code>Order</code> into the <code>Payment</code> parameter of <code>consumePayment</code>.</p>
+
+<h3 id="why-shared-factory">How to resolve this? Why it happens</h3>
+<p>This issue comes because we have <strong>only one ConsumerFactory object</strong>, created from the properties defined in <code>application.properties</code>. In that ConsumerFactory, the “default type” is what we set: <code>spring.json.value.default.type=com.eda.consumer.model.Order</code>.</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">One shared ConsumerFactory = one default type for every listener</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    AP["application.properties · default.type = Order"] --> CF["ConsumerFactory (only one)"]
+    CF --> K1["KafkaConsumer for order-events · default type Order"]
+    CF --> K2["KafkaConsumer for payment-events · default type Order"]
+    K1 --> L1["consumeOrder(Order) ✓"]
+    K2 --> L2["consumePayment(Payment) ✗ MessageConversionException"]
+    classDef cfg fill:#fff8e6,stroke:#d97706,color:#78350f
+    classDef cf fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#ecfbf1,stroke:#16a34a,color:#14532d
+    classDef bad fill:#fef1f1,stroke:#dc2626,color:#7f1d1d
+    class AP cfg
+    class CF,K1,K2 cf
+    class L1 ok
+    class L2 bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The same ConsumerFactory object is used to create <strong>both</strong> KafkaConsumers — the one for order events and the one for payment events — so both have <code>default type = com.eda.consumer.model.Order</code>. If we get this, the solution is very simple: <strong>have a different ConsumerFactory for each event type, with a default type specific to each event</strong>.</p>
+  </div>
+</div>
+
+<h3 id="per-type-factories">The fix: one ConsumerFactory and one container factory per event type</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">ConsumerConfig.java — Kafka consumer config</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">package com.eda.consumer.config;
+
+import com.eda.consumer.model.Order;
+import com.eda.consumer.model.Payment;
+import org.springframework.boot.autoconfigure.kafka.KafkaProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ConsumerFactory;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.serializer.JsonDeserializer;
+import java.util.Map;
+
+@Configuration
+public class ConsumerConfig {
+
+    @Bean
+    public ConsumerFactory&lt;String, Order&gt; orderConsumerFactory(KafkaProperties props) {
+        Map&lt;String, Object&gt; config = props.buildConsumerProperties();
+        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, Order.class.getName());
+        return new DefaultKafkaConsumerFactory&lt;&gt;(config);
+    }
+
+    @Bean
+    public ConsumerFactory&lt;String, Payment&gt; paymentConsumerFactory(KafkaProperties props) {
+        Map&lt;String, Object&gt; config = props.buildConsumerProperties();
+        config.put(JsonDeserializer.VALUE_DEFAULT_TYPE, Payment.class.getName());
+        return new DefaultKafkaConsumerFactory&lt;&gt;(config);
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory&lt;String, Order&gt; orderKafkaListenerFactory(ConsumerFactory&lt;String, Order&gt; orderConsumerFactory) {
+        ConcurrentKafkaListenerContainerFactory&lt;String, Order&gt; factory = new ConcurrentKafkaListenerContainerFactory&lt;&gt;();
+        factory.setConsumerFactory(orderConsumerFactory);
+        return factory;
+    }
+
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory&lt;String, Payment&gt; paymentKafkaListenerFactory(ConsumerFactory&lt;String, Payment&gt; paymentConsumerFactory) {
+        ConcurrentKafkaListenerContainerFactory&lt;String, Payment&gt; factory = new ConcurrentKafkaListenerContainerFactory&lt;&gt;();
+        factory.setConsumerFactory(paymentConsumerFactory);
+        return factory;
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">EventListener.java — pick the container factory per listener</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class EventListener {
+
+    @KafkaListener(topics = "order-events", containerFactory = "orderKafkaListenerFactory")
+    public void consumeOrder(Order order) {
+        // business logic
+        System.out.println("Received:" + order.getOrderId());
+    }
+
+    @KafkaListener(topics = "payment-events", containerFactory = "paymentKafkaListenerFactory")
+    public void consumePayment(Payment payment) {
+        // business logic
+        System.out.println("Received:" + payment.getPaymentId());
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (unchanged — use type headers = false)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Per-type factories: each listener gets the right default type</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    AP["application.properties · buildConsumerProperties()"] --> OCF["orderConsumerFactory · default type = Order"]
+    AP --> PCF["paymentConsumerFactory · default type = Payment"]
+    OCF --> OLF["orderKafkaListenerFactory"]
+    PCF --> PLF["paymentKafkaListenerFactory"]
+    OLF -->|"containerFactory"| L1["consumeOrder(Order) on order-events ✓"]
+    PLF -->|"containerFactory"| L2["consumePayment(Payment) on payment-events ✓"]
+    classDef cfg fill:#fff8e6,stroke:#d97706,color:#78350f
+    classDef cf fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#ecfbf1,stroke:#16a34a,color:#14532d
+    class AP cfg
+    class OCF,PCF,OLF,PLF cf
+    class L1,L2 ok
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li>Both ConsumerFactories start from <strong>all properties in application.properties</strong> (<code>buildConsumerProperties()</code>) and override <strong>only</strong> <code>VALUE_DEFAULT_TYPE</code>.</li>
+      <li>Each ConsumerFactory gets its own <code>ConcurrentKafkaListenerContainerFactory</code>.</li>
+      <li>Each <code>@KafkaListener</code> chooses its container factory by bean name with <code>containerFactory = "..."</code>, so the payment consumer is built from the payment factory and deserializes into <code>Payment</code> — even with type headers disabled.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="consumers-same-topic"><span class="sec-num">4</span>3rd: Multiple Consumers in a Group Join the Same Topic</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">C1 and C2 share the partitions of order-events</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:twoConsumersSameTopic-->
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">EventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class EventListener {
+
+    @KafkaListener(topics = "order-events")
+    public void consumeOrder(Order order) {
+        // business logic
+        System.out.println("Received:" + order.getOrderId());
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8082
+spring.application.name=kafka-consumer-service
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=org.springframework.kafka.support.serializer.JsonDeserializer
+spring.kafka.consumer.properties.spring.json.use.type.headers=false
+spring.kafka.consumer.properties.spring.json.value.default.type=com.eda.consumer.model.Order
+
+spring.kafka.listener.concurrency=3</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Where concurrency is applied in the start-up flow</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    A["Spring Boot application starts"] --> B["KafkaAutoConfiguration"]
+    B --> B1["Creates bean: ConsumerFactory · reads spring.kafka.consumer.* props"]
+    B --> B2["Creates bean: ConcurrentKafkaListenerContainerFactory · concurrency = 3 is set here"]
+    A --> C["@EnableKafka → KafkaListenerAnnotationBeanPostProcessor"]
+    C --> D1["Scans @KafkaListener"]
+    C --> D2["For each @KafkaListener, ask the container factory to create the container"]
+    D2 --> E["N = 3 KafkaListenerContainers · 3 KafkaConsumer objects"]
+    E --> F["3 poll loops start"]
+    B2 -.->|"concurrency"| D2
+    classDef start fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef auto fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ann fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef run fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A start
+    class B,B1,B2 auto
+    class C,D1,D2 ann
+    class E,F run
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li>The <code>spring.kafka.listener.concurrency</code> property is set on the <strong>ConcurrentKafkaListenerContainerFactory</strong>.</li>
+      <li>Then, for each <code>@KafkaListener</code>, it creates <strong>N KafkaListenerContainers</strong> and thus <strong>N KafkaConsumers</strong> — all in the same group, so Kafka splits the topic's partitions between them.</li>
+    </ul>
+  </div>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p><strong>Concurrency vs partitions:</strong> within one group a partition is read by only one consumer (see <a href="02-kafka-architecture.html#consumer-groups">Consumers &amp; Consumer Groups</a>). With <code>concurrency=3</code> and the 2 partitions in the diagram above, two consumers get one partition each and the <strong>third stays idle</strong>. Set concurrency to at most the number of partitions; the topic from our cluster setup has 3 partitions, so 3 consumers each get one.</p></div></div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li>One <code>poll()</code> sends <strong>one FetchRequest per leader broker</strong> and merges the responses into a <code>ConsumerRecords</code> object grouped by partition.</li>
+    <li><strong>One consumer, many topics:</strong> <code>@KafkaListener(topics = {"order-events", "payment-events"})</code> — map JSON manually (StringDeserializer + ObjectMapper) or automatically (<code>__TypeId__</code> + <code>spring.json.type.mapping</code>).</li>
+    <li>The producer's <code>JsonSerializer</code> adds a <code>__TypeId__</code> header by default (seen with <code>KafkaTemplate&lt;String, Object&gt;</code>); the consumer decides via <code>use.type.headers</code> &rarr; header &rarr; mapping &rarr; trusted packages &rarr; class path, or falls back to <code>value.default.type</code>.</li>
+    <li><strong>Many consumers, different topics:</strong> separate apps, or several <code>@KafkaListener</code> methods (one KafkaConsumer each). With headers off, a single shared ConsumerFactory gives every listener the same default type — fix it with <strong>one ConsumerFactory + container factory per type</strong> and <code>containerFactory = "..."</code>.</li>
+    <li><strong>Many consumers, same topic:</strong> <code>spring.kafka.listener.concurrency=N</code> creates N containers / KafkaConsumers per listener; keep N &le; partitions.</li>
+  </ul>
+</div>

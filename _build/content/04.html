@@ -1,0 +1,949 @@
+<!--meta
+{
+  "lead": "What really happens when a producer calls send(): the five internal stages — Serializer, Partitioner, Record Accumulator, Compression and Sender Thread — with batching, sticky partitioning, buffer and in-flight settings explained. Then a complete Spring Boot producer: dependency, bootstrap servers, topic creation with TopicBuilder, sending with and without a key, a custom serializer and multiple KafkaTemplates.",
+  "date": "Monday, 2 March 2026 (Producer Setup Part 8–9)",
+  "related": [
+    { "n": 3, "why": "The 2-broker / 2-controller cluster this producer connects to." },
+    { "n": 2, "why": "Partitioning strategies, acks, ISR and the complete producer write flow." },
+    { "n": 5, "why": "How idempotence removes the duplicate and re-ordering risk of retries." },
+    { "n": 17, "why": "Serializers again — SerDes in Kafka Streams." }
+  ]
+}
+-->
+
+<div class="callout key">
+  <span class="ci">&#128161;</span>
+  <div>
+    <b class="ct">Where we are</b>
+    <p>We have already set up the Kafka cluster in <a href="03-cluster-setup.html">Cluster Setup</a>: two brokers (localhost:9092 and localhost:9192) and two KRaft controllers. Before writing the producer code, let's understand the producer <strong>workflow</strong> — what happens inside the producer between <code>send()</code> and the broker.</p>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The cluster is ready</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:clusterSetup-->
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="workflow"><span class="sec-num">1</span>Producer Workflow: send() Is Not a Network Call</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Producer sends an event to the cluster</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P["Producer · send()"] -->|"Send Event"| K["Kafka Cluster · Kafka Broker"]
+    classDef prod fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef kaf fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    class P prod
+    class K kaf
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>What really happens</h4>
+    <ul>
+      <li>When the producer tries to send a message, it <strong>does not immediately send it to a broker</strong>.</li>
+      <li>Instead, the message goes through <strong>multiple internal stages inside the producer</strong> before any network call happens.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The five internal stages of the producer</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    S["send(topicName, key, json)"] --> A["Stage1 · SERIALIZER · object → byte[]"]
+    A --> B["Stage2 · PARTITIONER"]
+    B --> C["Stage3 · RECORD ACCUMULATOR"]
+    C --> D["Stage4 · COMPRESSION"]
+    D --> E["Stage5 · SENDER THREAD"]
+    E --> K["Kafka Broker"]
+    classDef cmd fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    classDef st fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef brk fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class S cmd
+    class A,B,C,D st
+    class E,K brk
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Overview</h4>
+    <p>Stages 1–3 run on the <strong>application thread</strong> that called <code>send()</code>. Once the record is in the Record Accumulator, a separate <strong>background sender thread</strong> compresses ready batches and talks to the brokers. Let's go through each stage.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="serializer"><span class="sec-num">2</span>Stage 1: Serializer</h2>
+<div class="stages"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st on">1 · Serializer</span><span class="ar">&rarr;</span><span class="st">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st">4 · Compression</span><span class="ar">&rarr;</span><span class="st">5 · Sender Thread</span></div>
+<ul>
+  <li>Our message (event) is generally a <strong>Java object</strong>, but Kafka understands <strong>only bytes</strong>. That's why a serializer is required.</li>
+  <li>Kafka does not know the data type of our message (Integer, String, custom POJO, JSON etc.). That's why it wants us to choose the proper <strong>SERIALIZER</strong>.</li>
+  <li>If the serialization stage fails, the message will <strong>not</strong> move to the next stage.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Key and value are serialized separately</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph APP["Our Application"]
+      O["Java Object (String, POJO, JSON)"]
+    end
+    subgraph SER["Serializer Layer"]
+      K1["Converts key → byte[]"]
+      V1["Converts value → byte[]"]
+    end
+    O -->|"key"| K1
+    O -->|"value"| V1
+    classDef obj fill:#fff8e6,stroke:#a16207,color:#78350f
+    classDef ser fill:#fff8e6,stroke:#a16207,color:#78350f
+    class O obj
+    class K1,V1 ser
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The record's <strong>key</strong> and <strong>value</strong> each go through their own serializer (configured separately as <code>key-serializer</code> and <code>value-serializer</code>), so a String key and a JSON value can be used together.</p>
+  </div>
+</div>
+<p>Every serializer implements this interface:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">org.apache.kafka.common.serialization.Serializer</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">public interface Serializer&lt;T&gt; {
+    byte[] serialize(String topic, T data);
+}</code></pre>
+</div>
+<p>There are many built-in serializers; some of them are:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Serializer</th><th>Java Type</th></tr></thead>
+    <tbody>
+      <tr><td>StringSerializer</td><td>String</td></tr>
+      <tr><td>IntegerSerializer</td><td>Integer</td></tr>
+      <tr><td>LongSerializer</td><td>Long</td></tr>
+      <tr><td>DoubleSerializer</td><td>Double</td></tr>
+      <tr><td>FloatSerializer</td><td>Float</td></tr>
+      <tr><td>ShortSerializer</td><td>Short</td></tr>
+      <tr><td>JsonSerializer</td><td>Any POJO (most useful — converts a Java object to bytes)</td></tr>
+      <tr><td>Custom Serializer</td><td>When we want full control: encrypt the data before byte conversion, remove sensitive fields before sending, etc.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>We will see the custom serializer with an example in <a href="#usecase2">Use case 2</a>.</p>
+
+<!-- ======================================================= -->
+<h2 id="partitioner"><span class="sec-num">3</span>Stage 2: Partitioner</h2>
+<div class="stages"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st done">1 · Serializer</span><span class="ar">&rarr;</span><span class="st on">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st">4 · Compression</span><span class="ar">&rarr;</span><span class="st">5 · Sender Thread</span></div>
+<p>At this stage, the producer decides: <strong>“Which partition should this message go to?”</strong></p>
+<div class="grid grid-2" style="align-items:center">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">org.apache.kafka.clients.producer.Partitioner</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">public interface Partitioner {
+
+    int partition(
+        String topic,
+        Object key,
+        byte[] keyBytes,
+        Object value,
+        byte[] valueBytes,
+        Cluster cluster
+    );
+}</code></pre>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    I["topic, key, keyBytes, value, valueBytes, cluster"] --> P["PARTITIONER"] --> R["returns partition number"]
+    classDef p fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:2px
+    class P p
+</div>
+    </div>
+  </div>
+</div>
+<p>The partitioner receives the topic, the key and value (as objects and as bytes) and the <code>Cluster</code> metadata (so it knows how many partitions the topic has), and returns the partition number. There are three cases:</p>
+
+<h3 id="case1">Case 1: Partition explicitly provided</h3>
+<p>We can explicitly provide the partition number; in this scenario the <strong>partitioner does nothing</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaTemplate.java (Spring Kafka)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Override
+public CompletableFuture&lt;SendResult&lt;K, V&gt;&gt; send(String topic, Integer partition, K key, @Nullable V data) {
+    ProducerRecord&lt;K, V&gt; producerRecord = new ProducerRecord&lt;&gt;(topic, partition, key, data);
+    return observeSend(producerRecord);
+}</code></pre>
+</div>
+
+<h3 id="case2">Case 2: Key is provided</h3>
+<p>Kafka ensures the <strong>same key always goes to the same partition</strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaTemplate.java (Spring Kafka)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Override
+public CompletableFuture&lt;SendResult&lt;K, V&gt;&gt; send(String topic, K key, @Nullable V data) {
+    ProducerRecord&lt;K, V&gt; producerRecord = new ProducerRecord&lt;&gt;(topic, key, data);
+    return observeSend(producerRecord);
+}</code></pre>
+</div>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">key-based partition</span><span class="lang">text</span></div>
+<pre><code data-lang="text">partition = hash(keyBytes) % numberOfPartitions</code></pre>
+</div>
+
+<h3 id="case3">Case 3: No key is provided</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaTemplate.java (Spring Kafka)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Override
+public CompletableFuture&lt;SendResult&lt;K, V&gt;&gt; send(String topic, @Nullable V data) {
+    ProducerRecord&lt;K, V&gt; producerRecord = new ProducerRecord&lt;&gt;(topic, data);
+    return observeSend(producerRecord);
+}</code></pre>
+</div>
+<div class="vs">
+  <div class="side a"><h4>Pre Kafka 2.4</h4><div class="sb"><p><strong>Round Robin</strong> strategy.</p></div></div>
+  <div class="side b"><h4>From Kafka 2.4 onwards</h4><div class="sb"><p><strong>Sticky Partitioning</strong> strategy.</p></div></div>
+</div>
+<p>What's the difference? It only makes sense once we know the next stage, the Record Accumulator — so it is explained <a href="#round-robin-vs-sticky">right after it</a>.</p>
+
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Case</th><th>KafkaTemplate call</th><th>How the partition is chosen</th></tr></thead>
+    <tbody>
+      <tr><td>1. Partition given</td><td><code>send(topic, partition, key, data)</code></td><td>Used as-is; partitioner does nothing</td></tr>
+      <tr><td>2. Key given</td><td><code>send(topic, key, data)</code></td><td><code>hash(keyBytes) % numberOfPartitions</code> — same key, same partition</td></tr>
+      <tr><td>3. No key</td><td><code>send(topic, data)</code></td><td>Round robin (before 2.4) / sticky partitioning (2.4+)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="accumulator"><span class="sec-num">4</span>Stage 3: Record Accumulator</h2>
+<div class="stages"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st done">1 · Serializer</span><span class="ar">&rarr;</span><span class="st done">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st on">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st">4 · Compression</span><span class="ar">&rarr;</span><span class="st">5 · Sender Thread</span></div>
+<ul>
+  <li>An <strong>in-memory buffer inside the Kafka producer</strong> that collects events <strong>per topic-partition</strong> and groups them into <strong>batches</strong>.</li>
+  <li>Because of this, the Kafka producer achieves <strong>very high throughput</strong> (the ability to transmit a large volume of data within a given timeframe).</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Event E1 lands in the batch of order-events / P0</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body">
+    <div style="text-align:center"><span class="flow-node">Partitioner</span></div>
+    <div class="flow-down">&darr;<small>Event: E1 · Topic: order-events · Partition: P0</small></div>
+    <div style="text-align:center"><span class="flow-node">Record Accumulator</span></div>
+    <div class="flow-down">&darr;</div>
+    <div class="batches">
+      <div class="batch"><div class="bh">Topic: order-events<br>Partition: P0</div><div class="bb"><span class="ev">E1</span></div><div class="bf">Batch</div></div>
+      <div class="batch empty"><div class="bh">Topic: order-events<br>Partition: P1</div><div class="bb"></div><div class="bf">Batch</div></div>
+      <div class="batch empty"><div class="bh">Topic: product-events<br>Partition: P0</div><div class="bb"></div><div class="bf">Batch</div></div>
+    </div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The accumulator keeps one open batch for every <strong>topic-partition</strong> the producer writes to — here order-events/P0, order-events/P1 and product-events/P0. The partitioner chose P0 for E1, so E1 is appended to the order-events/P0 batch.</p>
+    <p>So the producer always maintains <strong>topic-partition wise batches</strong>, and it sends <strong>batches</strong> to the broker — not individual events.</p>
+  </div>
+</div>
+
+<h3 id="round-robin-vs-sticky">Round Robin vs Sticky Partitioning</h3>
+<p>Now let's come back to the no-key case. <strong>Example:</strong> five events with no key are sent to <code>order-events</code>, which has partitions [P0, P1, P2]:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">example events</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Topic: order-events, Key = null, Value = E1
+Topic: order-events, Key = null, Value = E2
+Topic: order-events, Key = null, Value = E3
+Topic: order-events, Key = null, Value = E4
+Topic: order-events, Key = null, Value = E5</code></pre>
+</div>
+<div class="grid grid-2">
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Round Robin Partitioning (pre 2.4)</span></div>
+    <div class="diagram-body">
+      <div style="text-align:center"><span class="flow-node">Partitioner</span></div>
+      <div class="flow-down"><small>E1 &rarr; P0 · E2 &rarr; P1 · E3 &rarr; P2 · E4 &rarr; P0 · E5 &rarr; P1</small>&darr;</div>
+      <div style="text-align:center"><span class="flow-node">Record Accumulator</span></div>
+      <div class="flow-down">&darr;</div>
+      <div class="batches">
+        <div class="batch" style="width:96px"><div class="bh">order-events<br>P0</div><div class="bb"><span class="ev">E1</span><span class="ev">E4</span></div><div class="bf">Batch</div></div>
+        <div class="batch" style="width:96px"><div class="bh">order-events<br>P1</div><div class="bb"><span class="ev">E2</span><span class="ev">E5</span></div><div class="bf">Batch</div></div>
+        <div class="batch" style="width:96px"><div class="bh">order-events<br>P2</div><div class="bb"><span class="ev">E3</span></div><div class="bf">Batch</div></div>
+      </div>
+    </div>
+    <div class="diagram-explain">
+      <p>These <strong>3 batches</strong> will be sent to the broker.</p>
+      <p><strong>Problem:</strong> each batch is very small, and therefore there are <strong>multiple network calls</strong> to the Kafka broker.</p>
+    </div>
+  </div>
+  <div class="diagram" style="margin:0">
+    <div class="diagram-head"><span class="dt">Sticky Partitioning (2.4 onwards)</span></div>
+    <div class="diagram-body">
+      <div style="text-align:center"><span class="flow-node">Partitioner</span></div>
+      <div class="flow-down"><small>sticky: order-events &rarr; P1</small>&darr;</div>
+      <div style="text-align:center"><span class="flow-node">Record Accumulator</span></div>
+      <div class="flow-down">&darr;</div>
+      <div class="batches">
+        <div class="batch empty" style="width:96px"><div class="bh">order-events<br>P0</div><div class="bb"></div><div class="bf">Batch</div></div>
+        <div class="batch" style="width:96px"><div class="bh">order-events<br>P1</div><div class="bb"><span class="ev">E1</span><span class="ev">E2</span><span class="ev">E3</span><span class="ev">E4</span><span class="ev">E5</span></div><div class="bf">Batch</div></div>
+        <div class="batch empty" style="width:96px"><div class="bh">order-events<br>P2</div><div class="bb"></div><div class="bf">Batch</div></div>
+      </div>
+    </div>
+    <div class="diagram-explain">
+      <ol class="steps">
+        <li><strong>E1</strong> comes with no key. The partitioner picks a random partition of order-events, say <strong>P1</strong>, and stores this info in memory (sticky): <code>order-events &rarr; P1</code>. E1 goes to the P1 batch.</li>
+        <li>Similarly <strong>E2</strong> and the other events come with no key. The partitioner checks the in-memory sticky info for order-events (<code>&rarr; P1</code>) and sends them to P1 as well.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+<div class="callout tip"><span class="ci">&#10003;</span><div><b class="ct">Advantage of sticky partitioning</b><p>Events stick to the same partition <strong>until the current batch is closed or a new batch needs to be created</strong>. So there are fewer batches, and therefore fewer network calls. When the batch is closed, the partitioner sticks to a new partition, so over time the data is still spread across all partitions.</p></div></div>
+
+<h3 id="batch-control">How to control the batch?</h3>
+<div class="grid grid-2">
+  <div class="card">
+    <div class="card-title">&#128230; <code>batch.size=16384</code> &nbsp;<small style="font-weight:500;color:var(--muted)">16 KB (default)</small></div>
+    <ul>
+      <li>Means the <strong>maximum memory allocated per partition batch</strong>.</li>
+      <li>For example, if 1 event = 1 KB, the batch will hold ~16 messages.</li>
+      <li>When the batch size reaches its limit, the batch is <strong>closed and ready for sending</strong>.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <div class="card-title">&#9201; <code>linger.ms=10</code></div>
+    <ul>
+      <li>The <strong>maximum time the producer will wait</strong> for more records to fill the batch.</li>
+      <li>This makes sure the producer does not wait indefinitely for a batch to fill when traffic is low.</li>
+      <li>Example: batch size 16 KB, event size 1 KB &rarr; one batch can hold 16 messages. Traffic is low and only 5 events are in the batch so far. The producer waits <strong>at most 10 ms</strong> for more events; after 10 ms it closes the batch and it is ready to send.</li>
+    </ul>
+  </div>
+</div>
+<p>Whichever happens first — the batch is full (<code>batch.size</code>) or the wait time is over (<code>linger.ms</code>) — makes the batch ready to send.</p>
+
+<!-- ======================================================= -->
+<h2 id="compression"><span class="sec-num">5</span>Stage 4: Compression</h2>
+<div class="stages"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st done">1 · Serializer</span><span class="ar">&rarr;</span><span class="st done">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st done">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st on">4 · Compression</span><span class="ar">&rarr;</span><span class="st">5 · Sender Thread</span></div>
+<ul>
+  <li>Batches which are <strong>ready to send are compressed</strong> to reduce network usage and thus achieve higher throughput.</li>
+  <li>Kafka <strong>stores these compressed batches</strong>, which saves disk space too.</li>
+</ul>
+<div class="card">
+  <div class="card-title">Example</div>
+  <div class="compress-bar" style="width:100%;background:#475569">Batch before compression = 64 KB</div>
+  <div class="compress-bar" style="width:28%;min-width:200px;background:linear-gradient(135deg,var(--accent),var(--accent-2))">After compression = 18 KB</div>
+  <p style="margin-bottom:0">The whole <em>batch</em> is compressed (not each event separately) — the more similar records a batch holds, the better it compresses, which is another reason larger batches help. The compression type is set in properties — see <code>compression.type</code> in <a href="#usecase1">Use case 1</a>.</p>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="sender-thread"><span class="sec-num">6</span>Stage 5: Sender Thread</h2>
+<div class="stages"><span class="st done">send()</span><span class="ar">&rarr;</span><span class="st done">1 · Serializer</span><span class="ar">&rarr;</span><span class="st done">2 · Partitioner</span><span class="ar">&rarr;</span><span class="st done">3 · Record Accumulator</span><span class="ar">&rarr;</span><span class="st done">4 · Compression</span><span class="ar">&rarr;</span><span class="st on">5 · Sender Thread</span></div>
+<ul>
+  <li>The <strong>application thread never sends data</strong> to the Kafka broker.</li>
+  <li>A <strong>background sender thread</strong> does the actual communication.</li>
+  <li>The application thread's work ends at writing the record to the Record Accumulator; after that the sender thread comes into the picture.</li>
+</ul>
+<h3 id="sender-responsibility">Sender thread responsibilities</h3>
+<ol class="points">
+  <li><b>Check the RecordAccumulator for ready batches</b></li>
+  <li><b>Group batches by broker leader</b>
+    <p>For example: batch for TopicA-Partition0 &rarr; leader is Broker1; batch for TopicA-Partition5 &rarr; leader is Broker1; batch for TopicB-Partition1 &rarr; leader is Broker1. So it groups the batches leader-wise, wraps them up in <strong>one ProduceRequest</strong> and sends it in <strong>one network call</strong>.</p>
+  </li>
+  <li><b>Send the request using NetworkClient</b></li>
+  <li><b>Process responses</b> (acks, retries)</li>
+  <li><b>Handle retries</b> if needed</li>
+  <li><b>Complete the future and invoke callbacks</b> — this is what triggers <code>whenComplete(...)</code> in our code.</li>
+</ol>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Batches grouped by leader into one ProduceRequest</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    A["Batch · TopicA-Partition0"] --> G["Group by leader · Broker1"]
+    B["Batch · TopicA-Partition5"] --> G
+    C["Batch · TopicB-Partition1"] --> G
+    G --> R["1 ProduceRequest"] -->|"1 network call"| K["Broker1"]
+    K -->|"response (acks)"| CB["complete future · invoke callbacks"]
+    classDef bat fill:#eef4ff,stroke:#2563eb,color:#1e3a8a
+    classDef snd fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef brk fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class A,B,C bat
+    class G,R snd
+    class K,CB brk
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Three batches for three different topic-partitions all have the same leader, Broker1, so the sender thread combines them into a single request — three batches, one round trip. The broker's response (acks) then completes the futures of all records in those batches.</p>
+  </div>
+</div>
+
+<h3 id="in-flight">Can we control the sender thread?</h3>
+<p><strong>No</strong> — we don't have a way to control how many sender threads exist; Kafka manages it internally. But there is one thing we <em>can</em> control. Say we have 3 brokers: the sender thread creates <strong>3 TCP connections</strong> (one per broker) to send messages to the respective broker.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">producer config</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">max.in.flight.requests.per.connection=5   # default</code></pre>
+</div>
+<p>This parameter controls the <strong>maximum number of unacknowledged requests</strong> the client will send on a single connection before blocking. With 3 TCP connections, at most <strong>15 requests</strong> can be in flight across the cluster at once.</p>
+
+<div class="callout danger"><span class="ci">&#9888;</span><div><b class="ct">But very important</b><p>If <code>max.in.flight.requests.per.connection &gt; 1</code> <strong>and</strong> <code>retries &gt; 0</code>, there is a <strong>risk of message reordering</strong>.</p></div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">How a retry re-orders two requests</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant S as Sender Thread
+    participant L as Partition Leader
+    S->>L: Request A (in-flight)
+    S->>L: Request B (in-flight)
+    L--xS: Request A fails
+    L-->>S: Request B success - written in partition
+    S->>L: Request A retried
+    L-->>S: Request A success - written AFTER Request B
+    Note over L: Partition log order is B, A (not A, B)
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>Both requests are on the wire at the same time. A fails transiently, B succeeds and is appended, then A's retry succeeds — so A lands <em>after</em> B even though it was sent first. This risk is resolved by setting <strong>idempotence to true</strong>, which is covered separately in <a href="05-idempotency.html">Idempotency</a>.</p>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="setup-dependency"><span class="sec-num">7</span>Producer Setup — Step 1: Dependency</h2>
+<p>Now that we know a bit about the producer, let's start our producer setup (a Spring Boot application).</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">pom.xml</span><span class="lang">xml</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="xml">&lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.kafka&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-kafka&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+<p>This single dependency pulls: <strong>spring-kafka = Spring wrapper layer + Kafka client dependency</strong>.</p>
+<div class="grid grid-2">
+  <div class="card feature"><span class="icon">&#127793;</span><h4>Spring wrapper layer</h4><p><code>KafkaTemplate</code> — required to send messages. <code>KafkaAdmin</code> — required to manage topics. Etc. These are Spring abstractions built on top of the Apache Kafka client.</p></div>
+  <div class="card feature blue"><span class="icon">&#9749;</span><h4>Kafka client library</h4><p>The actual Apache Kafka client — the real implementation that <code>KafkaTemplate</code>, <code>KafkaAdmin</code> etc. use (the producer stages above live here).</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="setup-bootstrap"><span class="sec-num">8</span>Step 2: Add Bootstrap Brokers</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8081
+spring.application.name=kafka-producer-service
+
+# Both brokers: if one is down, producer connects to the other
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+# Metadata refresh interval, default is 5 minutes only
+spring.kafka.producer.properties.metadata.max.age.ms=300000</code></pre>
+</div>
+<p>This bootstrap info is required because initially the producer does not know which broker is the leader of which partition, and for topic creation it cannot talk to the controller directly — so it needs <strong>one starting communication point</strong>.</p>
+<ul>
+  <li>If it's a <strong>topic creation request</strong>, that broker passes the request to the active controller.</li>
+  <li>If it's a <strong>cluster metadata fetch</strong>, the broker sends the info if it has it; otherwise it fetches it from the controller and sends it back to the producer.</li>
+  <li>The producer <strong>stores the metadata in memory</strong> and refreshes it every 5 minutes (default, <code>metadata.max.age.ms</code>) or when an issue comes up while connecting to the leader of a partition.</li>
+</ul>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Listing both brokers is for redundancy at start-up only: after the first successful contact, the producer learns about <em>every</em> broker from the metadata and connects directly to partition leaders.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="setup-topic"><span class="sec-num">9</span>Step 3: Topic Creation</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaProducerConfig.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Configuration
+public class KafkaProducerConfig {
+
+    @Bean
+    public NewTopic orderEventsTopic() {
+        return TopicBuilder.name("order-events").build();
+    }
+}</code></pre>
+</div>
+<p>We saw in the cluster setup that if partitions and replication factor are not provided during topic creation, the default values from the <strong>controller properties</strong> are picked. Similarly, we can provide default values of segment size, cleanup policy etc. in the <strong>broker properties</strong>.</p>
+<p>The same configs can also be provided during topic creation — <code>TopicBuilder</code> gives us a way to set them. There are many configurations; some important ones:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaProducerConfig.java — with explicit topic config</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public NewTopic orderEventsTopic() {
+    return TopicBuilder.name("order-events")
+            // if not provided here, will be picked from controller properties
+            .partitions(3)
+            .replicas(2)
+            // if not provided here, will be picked from broker properties
+            .config(TopicConfig.RETENTION_MS_CONFIG, "604800000")
+            // if not provided here, will be picked from broker properties
+            .config(TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+            // if not provided here, will be picked from broker properties
+            .config(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, "2")
+            // if not provided here, will be picked from broker properties
+            .config(TopicConfig.SEGMENT_BYTES_CONFIG, "1073741824")
+            .build();
+}</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>TopicBuilder setting</th><th>Value</th><th>Default comes from</th></tr></thead>
+    <tbody>
+      <tr><td><code>.partitions(3)</code></td><td>3</td><td>controller properties — <code>num.partitions=3</code></td></tr>
+      <tr><td><code>.replicas(2)</code></td><td>2</td><td>controller properties — <code>default.replication.factor=2</code></td></tr>
+      <tr><td><code>RETENTION_MS_CONFIG</code></td><td>604800000 (7 days)</td><td>broker properties — <code>log.retention.hours=168</code></td></tr>
+      <tr><td><code>CLEANUP_POLICY_CONFIG</code></td><td>delete</td><td>broker properties</td></tr>
+      <tr><td><code>MIN_IN_SYNC_REPLICAS_CONFIG</code></td><td>2</td><td>broker properties</td></tr>
+      <tr><td><code>SEGMENT_BYTES_CONFIG</code></td><td>1073741824 (1 GB)</td><td>broker properties — <code>log.segment.bytes</code></td></tr>
+    </tbody>
+  </table>
+</div>
+<p>During application start-up, Spring's <code>KafkaAdmin</code> checks whether the topic exists; if not, it sends the create-topic request.</p>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p><code>min.insync.replicas=2</code> with <code>replicas(2)</code> means <strong>both</strong> replicas must be in sync for an <code>acks=all</code> write to succeed. In our 2-broker cluster, if one broker is down, such writes will fail until it is back — a deliberate trade of availability for durability (see <a href="02-kafka-architecture.html#min-isr">min.insync.replicas</a>).</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="usecase1"><span class="sec-num">10</span>Step 4: Send Event — Use Case 1 (Key + JSON)</h2>
+<div class="grid grid-3">
+  <div class="card"><div class="card-title">Serializer</div><ul><li>Key: <strong>String</strong></li><li>Value: <strong>JSON</strong></li></ul></div>
+  <div class="card"><div class="card-title">Partitioner</div><ul><li>Send <strong>with key</strong>, so related events go to the same partition.</li></ul></div>
+  <div class="card"><div class="card-title">Record Accumulator</div><ul><li>Max batch size: <strong>32 KB</strong></li><li>Linger: <strong>20 ms</strong></li><li>Overall buffer for batches: <strong>32 MB</strong></li><li>When the overall buffer is full, <code>send()</code> waits <strong>60 s</strong>, after that it starts throwing an exception.</li></ul></div>
+  <div class="card"><div class="card-title">Compression</div><ul><li>Use one out of many: <strong>snappy</strong>, gzip, lz4, zstd etc.</li></ul></div>
+  <div class="card"><div class="card-title">Sender Thread</div><ul><li>In-flight requests per connection = <strong>5</strong></li><li><strong>3 retries</strong> on transient failures</li></ul></div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Request flow of use case 1</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    C["Client · POST /api/orders/with-key"] --> OC["OrderController"]
+    OC --> S["OrderProducerService.sendWithKey"]
+    S -->|"send(order-events, orderId, order)"| T["KafkaTemplate"]
+    T --> K["Topic order-events"]
+    T -.->|"whenComplete callback"| S
+    OC -->|"202 Accepted"| C
+    classDef app fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef kaf fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class OC,S,T app
+    class K kaf
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <p>The controller hands the order to the service and immediately returns <strong>202 Accepted</strong>. The service calls <code>kafkaTemplate.send(...)</code>, which only puts the record into the producer pipeline and returns a <code>CompletableFuture</code>. When the sender thread later gets the broker's ack (or the send fails), the <code>whenComplete</code> callback prints the partition and offset (or the error).</p>
+  </div>
+</div>
+
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderController.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired
+    OrderProducerService orderProducerService;
+
+    @PostMapping("/with-key")
+    public ResponseEntity&lt;String&gt; sendWithKey(@RequestBody Order order) {
+        orderProducerService.sendWithKey(order);
+        return ResponseEntity.accepted().body("Order created and event published!");
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderProducerService.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class OrderProducerService {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Order&gt; kafkaTemplate;
+
+    public void sendWithKey(Order order) {
+        String key = order.getOrderId();
+
+        CompletableFuture&lt;SendResult&lt;String, Order&gt;&gt; future = kafkaTemplate.send("order-events", key, order);
+
+        future.whenComplete((result, ex) -&gt; {
+            if (ex == null) {
+                System.out.println("Order event sent successfully");
+                System.out.println("Partition: " + result.getRecordMetadata().partition());
+                System.out.println("Offset: " + result.getRecordMetadata().offset());
+            } else {
+                System.out.println("Failed to send order event: " + ex.getMessage());
+            }
+        });
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Order.java (POJO class)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">public class Order {
+    private String orderId;
+    private String customerId;
+    private String productId;
+    private Integer quantity;
+    private Double totalAmount;
+    private String status;
+
+    // getters and setters
+}</code></pre>
+</div>
+
+<h3 id="usecase1-properties">application.properties for use case 1</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8081
+spring.application.name=kafka-producer-service
+
+# Both brokers listed for redundancy, if one is down, producer connects to the other
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+# Metadata refresh interval: how often producer re-fetches cluster info (default 5 min)
+spring.kafka.producer.properties.metadata.max.age.ms=300000
+
+# Asking broker to reply only when all ISR successfully get the events
+spring.kafka.producer.acks=all
+
+#---------------SERIALIZER-------------
+# Key needs to be String
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# Value: JsonSerializer, auto-converts Java objects to JSON bytes
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer
+
+#---------------RECORD ACCUMULATOR-------
+# Batching, wait 20ms to collect more messages before sending
+spring.kafka.producer.properties.linger.ms=20
+# Max batch size, send when batch reaches 32KB (even if linger.ms hasn't expired)
+spring.kafka.producer.properties.batch.size=32768
+# Total buffer memory for all batches: 32MB (if full, send() will get blocked till space created or max block time)
+spring.kafka.producer.properties.buffer.memory=33554432
+# Max time send() blocks if buffer is full (default 60s), after this time, send() call will fail immediately
+spring.kafka.producer.properties.max.block.ms=60000
+
+#---------------COMPRESSION-------
+# compresses entire batch before sending
+spring.kafka.producer.properties.compression.type=snappy
+
+#---------------SENDER THREAD-------
+# Retry on transient failures (network timeout, leader change, etc.)
+spring.kafka.producer.retries=3
+# Max in-flight requests
+spring.kafka.producer.properties.max.in.flight.requests.per.connection=5</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Stage</th><th>Property</th><th>Value</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td>Durability</td><td><code>acks</code></td><td>all</td><td>Broker replies only after all ISR replicas have the event.</td></tr>
+      <tr><td>Serializer</td><td><code>key-serializer</code> / <code>value-serializer</code></td><td>StringSerializer / JsonSerializer</td><td>String key, Order object &rarr; JSON bytes.</td></tr>
+      <tr><td>Accumulator</td><td><code>linger.ms</code></td><td>20</td><td>Wait up to 20 ms to fill a batch.</td></tr>
+      <tr><td>Accumulator</td><td><code>batch.size</code></td><td>32768</td><td>Send when a partition batch reaches 32 KB.</td></tr>
+      <tr><td>Accumulator</td><td><code>buffer.memory</code></td><td>33554432</td><td>32 MB total for all batches.</td></tr>
+      <tr><td>Accumulator</td><td><code>max.block.ms</code></td><td>60000</td><td><code>send()</code> blocks up to 60 s when the buffer is full, then fails.</td></tr>
+      <tr><td>Compression</td><td><code>compression.type</code></td><td>snappy</td><td>Compresses each whole batch.</td></tr>
+      <tr><td>Sender</td><td><code>retries</code></td><td>3</td><td>Retry transient failures (network timeout, leader change).</td></tr>
+      <tr><td>Sender</td><td><code>max.in.flight.requests.per.connection</code></td><td>5</td><td>Up to 5 unacknowledged requests per broker connection.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Spring Boot maps a few common settings to their own keys (<code>spring.kafka.producer.acks</code>, <code>retries</code>, <code>key-serializer</code>, …). Any other Kafka producer setting can be passed through as <code>spring.kafka.producer.properties.&lt;kafka-property-name&gt;</code>, which is why <code>linger.ms</code>, <code>batch.size</code> etc. use that prefix.</p></div></div>
+
+<h3 id="try-it">Try it</h3>
+<p>Start the application and post an order (the body matches the <code>Order</code> POJO):</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">send an order — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ curl -X POST http://localhost:8081/api/orders/with-key -H "Content-Type: application/json" -d '{"orderId":"ORD-1001","customerId":"CUST-1","productId":"PROD-9","quantity":2,"totalAmount":499.0,"status":"CREATED"}'
+Order created and event published!</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">send an order — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; curl -X POST http://localhost:8081/api/orders/with-key -H "Content-Type: application/json" -d "{\"orderId\":\"ORD-1001\",\"customerId\":\"CUST-1\",\"productId\":\"PROD-9\",\"quantity\":2,\"totalAmount\":499.0,\"status\":\"CREATED\"}"
+Order created and event published!</code></pre>
+</div>
+</div>
+<p>The application console then prints the callback output. The partition and offset depend on your data (the same <code>orderId</code> always gives the same partition):</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application console (example)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Order event sent successfully
+Partition: 1
+Offset: 0</code></pre>
+</div>
+<p>To see the JSON that was written, use the console consumer from <a href="03-cluster-setup.html#consumer-test">Cluster Setup</a> with <code>--topic order-events --from-beginning</code>.</p>
+
+<!-- ======================================================= -->
+<h2 id="usecase2"><span class="sec-num">11</span>Use Case 2: No Key + Custom Serializer</h2>
+<div class="grid grid-2">
+  <div class="card"><div class="card-title">Serializer</div><ul><li>Key: <strong>String</strong></li><li>Value: <strong>Custom Serializer</strong></li></ul></div>
+  <div class="card"><div class="card-title">Partitioner</div><ul><li>Send <strong>without key</strong> (sticky partitioning).</li></ul><p style="margin:0">Rest all is the same as the previous use case.</p></div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderController.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired
+    OrderProducerService orderProducerService;
+
+    @PostMapping("/with-no-key")
+    public ResponseEntity&lt;String&gt; sendWithoutKey(@RequestBody Order order) {
+        orderProducerService.sendWithoutKey(order);
+        return ResponseEntity.accepted().body("Order created and event published!");
+    }
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderProducerService.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class OrderProducerService {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Order&gt; kafkaTemplate;
+
+    public void sendWithoutKey(Order order) {
+        String key = order.getOrderId();
+
+        CompletableFuture&lt;SendResult&lt;String, Order&gt;&gt; future = kafkaTemplate.send("order-events", order);
+
+        future.whenComplete((result, ex) -&gt; {
+            if (ex == null) {
+                System.out.println("Order event sent successfully");
+                System.out.println("Partition: " + result.getRecordMetadata().partition());
+                System.out.println("Offset: " + result.getRecordMetadata().offset());
+            } else {
+                System.out.println("Failed to send order event: " + ex.getMessage());
+            }
+        });
+    }
+}</code></pre>
+</div>
+<p>The only change is <code>kafkaTemplate.send("order-events", order)</code> — no key is passed (the <code>key</code> variable is computed but not used), so the record has a <code>null</code> key and the sticky partitioner chooses the partition.</p>
+
+<h3 id="custom-serializer">The custom serializer</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderSummarySerializer.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.common.serialization.Serializer;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class OrderSummarySerializer implements Serializer&lt;Order&gt; {
+
+    private final ObjectMapper objectMapper;
+
+    public OrderSummarySerializer() {
+        this.objectMapper = new ObjectMapper();
+    }
+
+    @Override
+    public byte[] serialize(String topic, Order order) {
+        if (order == null) {
+            return null;
+        }
+
+        try {
+            // Build a map with only the fields we want to expose, rest I removed it
+            Map&lt;String, Object&gt; summary = new LinkedHashMap&lt;&gt;();
+            summary.put("orderId", order.getOrderId());
+            summary.put("productId", order.getProductId());
+            return objectMapper.writeValueAsBytes(summary);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException("Failed to serialize Order summary", e);
+        }
+    }
+}</code></pre>
+</div>
+<ul>
+  <li>It implements the same <code>Serializer&lt;T&gt;</code> interface we saw in <a href="#serializer">Stage 1</a>.</li>
+  <li>Only <code>orderId</code> and <code>productId</code> are written; customer, quantity, amount and status are <strong>removed before sending</strong> — the “remove sensitive fields” use case.</li>
+  <li>If serialization fails it throws, so — as in Stage 1 — the record never reaches the partitioner and the send fails.</li>
+</ul>
+<p>The properties are the same as use case 1 except the value serializer, which now points to the custom class:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (difference from use case 1)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">#---------------SERIALIZER-------------
+# Key needs to be String
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# Value: custom serializer
+spring.kafka.producer.value-serializer=com.eda.producer.serializer.OrderSummarySerializer
+
+# (all other properties: same as use case 1 — acks=all, linger.ms=20, batch.size=32768,
+#  buffer.memory=33554432, max.block.ms=60000, compression.type=snappy,
+#  retries=3, max.in.flight.requests.per.connection=5)</code></pre>
+</div>
+<details class="card" style="cursor:pointer">
+  <summary style="font-weight:700">Show the full application.properties for use case 2</summary>
+<div class="code" style="cursor:auto">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8081
+spring.application.name=kafka-producer-service
+
+# Both brokers listed for redundancy, if one is down, producer connects to the other
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+
+# Metadata refresh interval: how often producer re-fetches cluster info (default 5 min)
+spring.kafka.producer.properties.metadata.max.age.ms=300000
+
+# Asking broker to reply only when all ISR successfully get the events
+spring.kafka.producer.acks=all
+
+#---------------SERIALIZER-------------
+# Key needs to be String
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+# Value: custom serializer
+spring.kafka.producer.value-serializer=com.eda.producer.serializer.OrderSummarySerializer
+
+#---------------RECORD ACCUMULATOR-------
+# Batching, wait 20ms to collect more messages before sending
+spring.kafka.producer.properties.linger.ms=20
+# Max batch size, send when batch reaches 32KB (even if linger.ms hasn't expired)
+spring.kafka.producer.properties.batch.size=32768
+# Total buffer memory for all batches: 32MB (if full, send() will get blocked till space created or max block time)
+spring.kafka.producer.properties.buffer.memory=33554432
+# Max time send() blocks if buffer is full (default 60s), after this time, send() call will fail immediately
+spring.kafka.producer.properties.max.block.ms=60000
+
+#---------------COMPRESSION-------
+# compresses entire batch before sending
+spring.kafka.producer.properties.compression.type=snappy
+
+#---------------SENDER THREAD-------
+# Retry on transient failures (network timeout, leader change, etc.)
+spring.kafka.producer.retries=3
+# Max in-flight requests
+spring.kafka.producer.properties.max.in.flight.requests.per.connection=5</code></pre>
+</div>
+</details>
+
+<!-- ======================================================= -->
+<h2 id="multiple-templates"><span class="sec-num">12</span>Many Producers, Different Serializers: Multiple KafkaTemplates</h2>
+<p>But what if we have many producers — some need <code>JsonSerializer</code>, some need a custom serializer? How do we define that in one <code>application.properties</code>? We can define a <strong>@Bean</strong>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">KafkaProducerConfig.java — extra KafkaTemplate bean</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Bean
+public KafkaTemplate&lt;String, Order&gt; customSerializerKafkaTemplate(KafkaProperties kafkaProperties) {
+
+    // Start with all producer properties from application.properties
+    Map&lt;String, Object&gt; props =
+            new HashMap&lt;&gt;(kafkaProperties.buildProducerProperties(null));
+
+    // Override ONLY the value serializer - everything else stays the same
+    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, OrderSummarySerializer.class);
+
+    DefaultKafkaProducerFactory&lt;String, Order&gt; factory =
+            new DefaultKafkaProducerFactory&lt;&gt;(props);
+
+    return new KafkaTemplate&lt;&gt;(factory);
+}</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderProducerService.java — using both templates</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.SendResult;
+import org.springframework.stereotype.Service;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+public class OrderProducerService {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Order&gt; kafkaTemplate;                 // uses values from application.properties
+
+    @Autowired
+    @Qualifier("customSerializerKafkaTemplate")
+    private KafkaTemplate&lt;String, Order&gt; customSerializerKafkaTemplate;  // picks value from the configuration @Bean
+
+    public void sendWithoutKey(Order order) {
+        String key = order.getOrderId();
+
+        CompletableFuture&lt;SendResult&lt;String, Order&gt;&gt; future = customSerializerKafkaTemplate.send("order-events", order);
+
+        future.whenComplete((result, ex) -&gt; {
+            if (ex == null) {
+                System.out.println("Order event sent successfully");
+                System.out.println("Partition: " + result.getRecordMetadata().partition());
+                System.out.println("Offset: " + result.getRecordMetadata().offset());
+            } else {
+                System.out.println("Failed to send order event: " + ex.getMessage());
+            }
+        });
+    }
+}</code></pre>
+</div>
+<p>In <code>application.properties</code> we can keep the default <strong>JsonSerializer</strong>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties (default serializer stays JSON)</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># Value: JsonSerializer, auto-converts Java objects to JSON bytes
+spring.kafka.producer.value-serializer=org.springframework.kafka.support.serializer.JsonSerializer
+# (everything else: same as use case 1)</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Two KafkaTemplates, one application.properties</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    AP["application.properties · value-serializer = JsonSerializer"] --> T1["kafkaTemplate (auto-configured)"]
+    AP -->|"buildProducerProperties()"| B["@Bean customSerializerKafkaTemplate · override VALUE_SERIALIZER = OrderSummarySerializer"]
+    B --> T2["customSerializerKafkaTemplate"]
+    T1 -->|"full Order as JSON"| K["order-events"]
+    T2 -->|"orderId + productId only"| K
+    classDef cfg fill:#fff8e6,stroke:#d97706,color:#78350f
+    classDef tpl fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef kaf fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class AP,B cfg
+    class T1,T2 tpl
+    class K kaf
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>Explanation</h4>
+    <ul>
+      <li><code>kafkaTemplate</code> is Spring Boot's auto-configured template — it <strong>uses the values from application.properties</strong> (JsonSerializer).</li>
+      <li><code>customSerializerKafkaTemplate</code> starts from <strong>the same properties</strong> (<code>buildProducerProperties</code>) and overrides <strong>only</strong> the value serializer, so batching, compression, acks and retries stay identical.</li>
+      <li><code>@Qualifier("customSerializerKafkaTemplate")</code> (the bean's method name) tells Spring which of the two templates to inject. Put the <code>@Bean</code> method inside a <code>@Configuration</code> class such as <code>KafkaProducerConfig</code>.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="reordering"><span class="sec-num">13</span>Last Part: The Re-ordering Risk</h2>
+<p>We discussed that when:</p>
+<div class="code terminal">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">risky combination</span><span class="lang">text</span></div>
+<pre><code data-lang="text">max.in.flight.requests.per.connection &gt; 1
+and
+retries &gt; 0
+
+Then there is risk of message reordering.
+
+Ex:
+Request A -&gt; in-flight
+Request B -&gt; in-flight
+
+Request A -&gt; fails
+Request B -&gt; success (written successfully in partition)
+
+Request A -&gt; retries and Success (written after Request B)</code></pre>
+</div>
+<p>Our use-case configuration (<code>max.in.flight.requests.per.connection=5</code>, <code>retries=3</code>) is exactly this combination. <strong>How do we resolve this risk?</strong> With <strong>idempotence</strong> — the topic of the next chapter.</p>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Since Kafka 3.0 the producer has <code>enable.idempotence=true</code> by default, as long as the other settings are compatible with it (<code>acks=all</code>, <code>retries &gt; 0</code>, <code>max.in.flight.requests.per.connection &le; 5</code> — all true here). <a href="05-idempotency.html">Idempotency</a> explains how it prevents both duplicates and this re-ordering.</p></div></div>
+
+<!-- ======================================================= -->
+<div class="summary">
+  <h3>&#9989; Chapter Summary</h3>
+  <ul>
+    <li><code>send()</code> does not hit the network: the record passes through <strong>Serializer &rarr; Partitioner &rarr; Record Accumulator &rarr; Compression &rarr; Sender Thread</strong>.</li>
+    <li><strong>Serializer</strong> turns key and value into <code>byte[]</code> (String, Integer, …, JsonSerializer, or a custom one).</li>
+    <li><strong>Partitioner</strong>: explicit partition &rarr; used as-is; key &rarr; <code>hash(keyBytes) % partitions</code>; no key &rarr; round robin (pre 2.4) or <strong>sticky</strong> (2.4+), which creates fewer, fuller batches.</li>
+    <li><strong>Record Accumulator</strong> batches per topic-partition; controlled by <code>batch.size</code>, <code>linger.ms</code>, <code>buffer.memory</code>, <code>max.block.ms</code>.</li>
+    <li><strong>Compression</strong> (snappy, gzip, lz4, zstd) works on whole batches and saves network and disk.</li>
+    <li>The <strong>sender thread</strong> groups batches by leader into one ProduceRequest, handles acks/retries and completes the futures; <code>max.in.flight.requests.per.connection</code> &gt; 1 with retries can re-order messages.</li>
+    <li>Spring Boot setup: <code>spring-kafka</code>, <code>bootstrap-servers</code>, <code>TopicBuilder</code>, <code>KafkaTemplate.send()</code> with <code>whenComplete</code>, custom <code>Serializer&lt;Order&gt;</code>, and a second <code>KafkaTemplate</code> bean selected with <code>@Qualifier</code>.</li>
+  </ul>
+</div>

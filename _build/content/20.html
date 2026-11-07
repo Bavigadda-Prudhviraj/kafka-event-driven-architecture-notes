@@ -1,0 +1,295 @@
+<!--meta
+{
+  "lead": "Streams never end, so “how many orders in the last hour?” needs a time boundary: a window. The three notions of time (event time, record timestamp, stream time), a custom TimestampExtractor, and the three window types — tumbling, hopping and session — each traced record by record, with and without a grace period for late events, plus the exact TimeWindows and SessionWindows APIs.",
+  "date": "Saturday, 27 June 2026",
+  "related": [
+    { "n": 19, "why": "count and aggregate — the stateful operations that windowedBy plugs into." },
+    { "n": 14, "why": "The 'total revenue in the last 5 minutes' problem that motivated Kafka Streams." },
+    { "n": 15, "why": "State stores and changelog topics that hold the windowed counts." },
+    { "n": 17, "why": "SerDes for windowed stores and Windowed<K> keys." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="why"><span class="sec-num">1</span>Why Windows?</h2>
+<p>Kafka streams are <strong>infinite</strong>: new events keep arriving, with no start and no end. So what if the business asks: <strong>“How many orders did we receive in the last 1 hour?”</strong></p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <h4>Without a window</h4>
+<pre class="mini" style="background:#0f172a;color:#e2e8f0;padding:9px 11px;border-radius:8px;font-family:var(--mono);font-size:12px"><code>orders.groupByKey().count();</code></pre>
+    <div class="logviz"><div class="row"><span class="lab">Ord-1 events</span><div class="cells"><span class="cell">10:00</span><span class="cell">10:10</span><span class="cell">10:30</span><span class="cell">11:15</span><span class="cell">11:25</span></div></div></div>
+    <div class="table-wrap" style="margin:6px 0 0"><table><thead><tr><th>key</th><th>count</th></tr></thead><tbody><tr><td>Ord-1</td><td>5</td></tr></tbody></table></div>
+    <p>The KTable only knows “orders seen so far = 5”. It does not remember time, so it <strong>cannot</strong> answer “how many between 10:00 and 11:00?”.</p>
+  </div>
+  <div class="card">
+    <h4>With a window</h4>
+<pre class="mini" style="background:#0f172a;color:#e2e8f0;padding:9px 11px;border-radius:8px;font-family:var(--mono);font-size:12px"><code>orders.groupByKey().windowedBy(...).count();</code></pre>
+    <div class="table-wrap" style="margin:6px 0 0"><table><thead><tr><th>key</th><th>window start (incl.)</th><th>window end (excl.)</th><th>count</th></tr></thead><tbody><tr><td>Ord-1</td><td>10:00</td><td>11:00</td><td>3</td></tr><tr><td>Ord-1</td><td>11:00</td><td>12:00</td><td>2</td></tr></tbody></table></div>
+    <p>Now “how many between 10:00 and 11:00?” is a simple lookup of the right window.</p>
+  </div>
+</div>
+<div class="callout key"><span class="ci">&#128161;</span><div><p>A <strong>window</strong> is a time-based boundary used to group records from an infinite stream into <strong>finite chunks</strong>. Window start is <strong>inclusive</strong> and window end is <strong>exclusive</strong>: <code>[10:00, 11:00)</code>. The state store key becomes <code>Windowed&lt;K&gt;</code> = key + window.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="time"><span class="sec-num">2</span>Three Notions of Time</h2>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Event time</th><th>Kafka record timestamp</th><th>Stream time</th></tr></thead>
+    <tbody><tr>
+      <td>When the event <strong>actually happened</strong> in the real world, e.g. the <code>createdAt</code> field in the payload.</td>
+      <td>Every Kafka record has a timestamp. By default the <strong>producer</strong> assigns it before sending (CreateTime). If the topic uses <code>LogAppendTime</code>, the <strong>broker</strong> assigns it when the record is appended to the log. <strong>Kafka Streams windows use this by default.</strong></td>
+      <td>The <strong>highest record timestamp observed so far</strong> (per partition/task). It only moves forward and decides when windows close.</td>
+    </tr></tbody>
+  </table>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">event time vs record timestamp</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Record:
+  Key: "o1"
+  Value: {
+    "orderId": "o1",
+    "userId": "u1",
+    "amount": 500,
+    "createdAt": "2026-07-31T10:01:00Z"   ← event time
+  }
+Kafka metadata:
+  Timestamp = 2026-07-31T10:04:12Z         ← record timestamp</code></pre>
+  </div>
+  <div>
+    <p>Even though Kafka received the event at 10:04, the event time remains <code>10:01</code>.</p>
+    <p class="lbl" style="font-weight:700;margin:10px 0 4px">Stream time with an out-of-order event</p>
+    <div class="table-wrap" style="margin:0"><table><thead><tr><th>Arrives</th><th>Record ts</th><th>Stream time</th></tr></thead><tbody>
+      <tr><td>Order-1</td><td>10:00</td><td>10:00</td></tr>
+      <tr><td>Order-2</td><td>10:10</td><td>10:10</td></tr>
+      <tr><td>Order-3</td><td>11:00</td><td>11:00</td></tr>
+      <tr><td>Order-4</td><td>10:30 <em>(late)</em></td><td><strong>11:00</strong> — does not go back</td></tr>
+      <tr><td>Order-5</td><td>11:40</td><td>11:40</td></tr>
+    </tbody></table></div>
+  </div>
+</div>
+
+<h3 id="extractor">Using event time instead: TimestampExtractor</h3>
+<p>By default, windows use the record timestamp. To use the event time instead, provide a custom implementation of the framework's <code>TimestampExtractor</code> interface:</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">TimestampExtractor (Kafka Streams)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public interface TimestampExtractor {
+    long extract(ConsumerRecord&lt;Object, Object&gt; record, long partitionTime);
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderTimestampExtractor.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">public class OrderTimestampExtractor implements TimestampExtractor {
+
+    @Override
+    public long extract(ConsumerRecord&lt;Object, Object&gt; record, long partitionTime) {
+        if (record.value() instanceof Order order &amp;&amp; order.getCreatedAt() != null) {
+            return order.getCreatedAt().toInstant().toEpochMilli();
+        }
+        return partitionTime;   // fall back to the partition's current stream time
+    }
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">spring.kafka.streams.properties.default.timestamp.extractor=com.example.stream.OrderTimestampExtractor</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes cast <code>(Order) record.value()</code> and call <code>.to Instant()</code> (a typo). Two things to know: the extractor runs <strong>after deserialization</strong>, so <code>record.value()</code> is an <code>Order</code> only if the source uses an Order SerDe (otherwise it's a <code>String</code> and the cast throws). And it must never return a negative timestamp, so fall back to <code>partitionTime</code> when the field is missing, as above. A per-source extractor can also be set with <code>Consumed.with(...).withTimestampExtractor(...)</code>. <code>getCreatedAt()</code> is assumed to return a <code>ZonedDateTime</code>/<code>OffsetDateTime</code>.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="types"><span class="sec-num">3</span>Three Window Types</h2>
+<div class="chips"><span>1 · Tumbling — fixed, non-overlapping</span><span>2 · Hopping — fixed, overlapping</span><span>3 · Session — activity-based, no fixed size</span></div>
+
+<!-- ======================================================= -->
+<h2 id="tumbling"><span class="sec-num">4</span>Tumbling Windows</h2>
+<ul class="points">
+  <li><strong>Fixed size</strong>, no overlap.</li>
+  <li>Each record belongs to <strong>exactly 1</strong> window.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Window size = 10 min</span><span class="db">timeline</span></div>
+  <div class="diagram-body">
+<!--svg:tumblingBasic-->
+  </div>
+</div>
+<p>How the data looks in the KTable (window size 5 min). Suppose events for <code>Key-1</code> arrive at 10:02 and 10:13:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>key</th><th>window start (incl.)</th><th>window end (excl.)</th><th>count</th></tr></thead>
+    <tbody><tr><td>Key-1</td><td>10:00</td><td>10:05</td><td>1</td></tr><tr><td>Key-1</td><td>10:10</td><td>10:15</td><td>1</td></tr></tbody>
+  </table>
+</div>
+<p>There is <strong>no entry for 10:05–10:10</strong>, because no record belonged to that window: windows are created lazily, only when a record lands in them. Use cases: orders per 5 minutes, revenue per hour, API requests per minute.</p>
+
+<h3 id="grace">Does a window stay open for late events?</h3>
+<p>Say stream time is 11:00 and a delayed event with record timestamp 10:32 arrives. Is window <code>[10:30, 10:35)</code> updated? It depends on the <strong>grace period</strong>:</p>
+<div class="vs">
+  <div class="side a"><h4>Without grace period</h4><div class="sb"><p>The window is considered <strong>closed</strong> when <code>stream time &gt;= window end</code>. Late events for a closed window are <strong>dropped</strong>.</p></div></div>
+  <div class="side b"><h4>With grace period</h4><div class="sb"><p>The window is not closed immediately: it closes only when <code>stream time &gt;= window end + grace</code>. Late events within the grace period are still counted.</p></div></div>
+</div>
+<p>Example: window size 5 min; records arrive with timestamps 10:31, 10:32, 10:41, then <strong>10:33 (late)</strong>.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Arrives</th><th>Stream time</th><th>Without grace</th><th>With grace = 10 min</th></tr></thead>
+    <tbody>
+      <tr><td>10:31</td><td>10:31</td><td>[10:30,10:35) → 1</td><td>[10:30,10:35) → 1 · open till 10:45</td></tr>
+      <tr><td>10:32</td><td>10:32</td><td>[10:30,10:35) → 2</td><td>[10:30,10:35) → 2</td></tr>
+      <tr><td>10:41</td><td>10:41</td><td>[10:30,10:35) <strong>closed</strong> · [10:40,10:45) → 1</td><td>[10:30,10:35) still open (till 10:45) · [10:40,10:45) → 1</td></tr>
+      <tr><td>10:33 <em>(late)</em></td><td>10:41</td><td><span class="badge bad">discarded</span> — its window is closed</td><td><span class="badge ok">accepted</span> — [10:30,10:35) → <strong>3</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Grace keeps the window accepting records longer</span><span class="db">timeline</span></div>
+  <div class="diagram-body">
+<!--svg:tumblingGrace-->
+  </div>
+</div>
+
+<h3 id="tumbling-api">API</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">TimeWindows (tumbling)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">// no grace period
+TimeWindows.ofSizeWithNoGrace(Duration size)
+
+// with grace period
+TimeWindows.ofSizeAndGrace(Duration size, Duration afterWindowEnd)</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">orders per user per 5 minutes, 1 minute grace</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">KStream&lt;String, Order&gt; orders = builder.stream("orders",
+        Consumed.with(Serdes.String(), orderSerde));
+
+KTable&lt;Windowed&lt;String&gt;, Long&gt; counts = orders
+        .selectKey((orderId, order) -&gt; order.getUserId())
+        .groupByKey(Grouped.with(Serdes.String(), orderSerde))
+        .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1)))
+        .count(Materialized.&lt;String, Long, WindowStore&lt;Bytes, byte[]&gt;&gt;as("order-count-store")
+                .withKeySerde(Serdes.String())      // optional when defaults match
+                .withValueSerde(Serdes.Long()));</code></pre>
+</div>
+<p>The short form <code>.count(Materialized.as("order-count-store"))</code> also works when the default SerDes fit. Note the store type is a <code>WindowStore</code>, not a <code>KeyValueStore</code>, and the result key type is <code>Windowed&lt;String&gt;</code>. <code>Grouped.with(...)</code> is added because the re-keyed records go through a repartition topic with an <code>Order</code> value.</p>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>A windowed KTable emits an update for <strong>every</strong> record (10:31 → 1, 10:32 → 2, …). To emit only one final result per window after it closes, add <code>.suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))</code>. Windowed state is also retained only for a limited time (<code>Materialized.withRetention</code>, at least size + grace), so old windows are cleaned up automatically.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="hopping"><span class="sec-num">5</span>Hopping Windows</h2>
+<ul class="points">
+  <li><strong>Fixed size</strong>, and <strong>advanced by a fixed interval</strong> (the hop).</li>
+  <li>When the hop is smaller than the size, windows <strong>overlap</strong>, so each record may belong to <strong>multiple windows</strong>.</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Size = 10 min, advance by = 5 min</span><span class="db">timeline</span></div>
+  <div class="diagram-body">
+<!--svg:hoppingBasic-->
+  </div>
+  <div class="diagram-explain"><p>An event at 10:07 belongs to W1 <code>[10:00,10:10)</code> <strong>and</strong> W2 <code>[10:05,10:15)</code>. Each record is counted in size ÷ advance = 2 windows. Use cases: orders in the last hour updated every x minutes, moving traffic counts, rolling revenue.</p></div>
+</div>
+
+<h3 id="hopping-grace">Late events in hopping windows</h3>
+<p>Size 10 min, hop 5 min; records arrive at 10:27, 10:28, 10:41, then <strong>10:29 (late)</strong>. Relevant windows: <code>[10:20,10:30)</code>, <code>[10:25,10:35)</code>, <code>[10:30,10:40)</code>, <code>[10:35,10:45)</code>, <code>[10:40,10:50)</code>.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Arrives</th><th>Stream time</th><th>Without grace</th><th>With grace = 10 min</th></tr></thead>
+    <tbody>
+      <tr><td>10:27</td><td>10:27</td><td>[20,30) → 1 · [25,35) → 1</td><td>same</td></tr>
+      <tr><td>10:28</td><td>10:28</td><td>[20,30) → 2 · [25,35) → 2</td><td>same</td></tr>
+      <tr><td>10:41</td><td>10:41</td><td>[20,30) and [25,35) <strong>closed</strong> (10:41 ≥ 10:30, ≥ 10:35) · [35,45) → 1 · [40,50) → 1</td><td>[20,30) closed (10:41 ≥ 10:30 + 10) · [25,35) <strong>open till 10:45</strong> · [35,45) → 1 · [40,50) → 1</td></tr>
+      <tr><td>10:29 <em>(late)</em></td><td>10:41</td><td><span class="badge bad">discarded</span> — both its windows are closed</td><td>[20,30) closed → skipped · [25,35) open → <strong>3</strong> <span class="badge ok">accepted</span></td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">With grace: which windows still accept 10:29 at stream time 10:41</span><span class="db">timeline</span></div>
+  <div class="diagram-body">
+<!--svg:hoppingGrace-->
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>In the notes' “with grace” table, the closing check for <code>[10:25-10:35)</code> is written as “stream time ≥ 10:35 so closed”, but with 10 min grace it closes at 10:45 — which the next step of the notes correctly uses (“Open till 10:45”) to accept the late 10:29. Window <code>[10:30,10:40)</code> gets no records here (10:41 is past its end), so it never appears in the store.</p></div></div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">TimeWindows + advanceBy (hopping)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">// no grace period
+TimeWindows.ofSizeWithNoGrace(Duration size).advanceBy(Duration advance)
+// with grace period
+TimeWindows.ofSizeAndGrace(Duration size, Duration afterWindowEnd).advanceBy(Duration advance)
+
+KTable&lt;Windowed&lt;String&gt;, Long&gt; counts = orders
+        .selectKey((orderId, order) -&gt; order.getUserId())
+        .groupByKey(Grouped.with(Serdes.String(), orderSerde))
+        .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(5), Duration.ofMinutes(1))
+                .advanceBy(Duration.ofMinutes(1)))
+        .count(Materialized.as("order-count-store"));</code></pre>
+</div>
+<p>Here: 5-minute windows that start every minute, with 1 minute of grace. A tumbling window is just the special case <code>advanceBy == size</code>.</p>
+
+<!-- ======================================================= -->
+<h2 id="session"><span class="sec-num">6</span>Session Windows</h2>
+<ul class="points">
+  <li>Group events that occur <strong>close together in time</strong>.</li>
+  <li>A new session starts after a <strong>period of inactivity</strong> (the inactivity gap).</li>
+  <li>There is <strong>no window size</strong>: a session is as long as the activity lasts. Session start and end are the timestamps of its first and last record (both inclusive).</li>
+</ul>
+<p>Example: inactivity gap 5 min; records arrive at 10:27, 10:29, 10:41, then <strong>10:32 (late)</strong>.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Arrives</th><th>Stream time</th><th>Without grace</th><th>With grace = 14 min</th></tr></thead>
+    <tbody>
+      <tr><td>10:27</td><td>10:27</td><td>no existing session → [10:27–10:27] → 1</td><td>same</td></tr>
+      <tr><td>10:29</td><td>10:29</td><td>10:29 − 10:27 = 2 min &lt; 5 → same session → [10:27–10:29] → 2</td><td>same</td></tr>
+      <tr><td>10:41</td><td>10:41</td><td>10:41 − 10:29 = 12 min &gt; 5 → new session [10:41–10:41] → 1. The old session is closed (10:41 &gt; 10:29 + 5).</td><td>new session [10:41] → 1. Old session open till 10:29 + 5 + 14 = 10:48</td></tr>
+      <tr><td>10:32 <em>(late)</em></td><td>10:41</td><td>3 min after the 1st session's end, but that session is closed; 9 min before 10:41 → too far. <span class="badge bad">discarded</span></td><td>joins the 1st session, still open → [10:27–10:32] → <strong>3</strong>. 10:41 − 10:32 = 9 min &gt; 5, so no merge with the 2nd. <span class="badge ok">accepted</span></td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p><strong>When does a session close?</strong> A session ending at <em>t</em> can still grow while a new record within the gap could arrive, so Kafka Streams closes it when <code>stream time &gt; session end + inactivity gap + grace</code>. The notes compute the closing time as session end + grace (10:29 + 14 = 10:43 and 10:32 + 14 = 10:46); including the 5-minute gap gives 10:48 and 10:51. Without grace the notes' conclusion holds either way: 10:41 is past 10:29 + 5 = 10:34, so the first session is closed and 10:32 is dropped.</p></div></div>
+
+<h3 id="session-merge">Interesting case: a late event merges two sessions</h3>
+<p>Gap 5 min, grace 14 min; records arrive at 10:27, 10:29, <strong>10:36</strong>, then <strong>10:32 (late)</strong>.</p>
+<ol class="steps">
+  <li>10:27 → no session → <code>[10:27–10:27]</code>, count 1.</li>
+  <li>10:29 → 2 min after 10:27 → same session <code>[10:27–10:29]</code>, count 2.</li>
+  <li>10:36 → 7 min after 10:29 &gt; 5 → new session <code>[10:36]</code>, count 1. The first session is still within its grace period.</li>
+  <li>10:32 (late) → 3 min after the first session's end <strong>and</strong> 4 min before the second session's start. It connects both, so Kafka Streams <strong>merges</strong> them into <code>[10:27–10:36]</code>, count <strong>4</strong>.</li>
+</ol>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Session merge</span><span class="db">timeline</span></div>
+  <div class="diagram-body">
+<!--svg:sessionMerge-->
+  </div>
+  <div class="diagram-explain"><p>Merging is why session windows need a mergeable aggregation: <code>count()</code> handles it automatically, while <code>aggregate()</code> on a session window takes an extra <strong>Merger</strong> function that combines two partial aggregates. Use cases: user login sessions, how long a user browses, average session duration.</p></div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SessionWindows</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">// no grace period
+SessionWindows.ofInactivityGapWithNoGrace(Duration inactivityGap)
+// with grace period
+SessionWindows.ofInactivityGapAndGrace(Duration inactivityGap, Duration afterWindowEnd)
+
+KTable&lt;Windowed&lt;String&gt;, Long&gt; sessions = orders
+        .selectKey((orderId, order) -&gt; order.getUserId())
+        .groupByKey(Grouped.with(Serdes.String(), orderSerde))
+        .windowedBy(SessionWindows.ofInactivityGapAndGrace(Duration.ofMinutes(10), Duration.ofMinutes(2)))
+        .count(Materialized.as("store-name"));</code></pre>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="compare"><span class="sec-num">7</span>Comparison</h2>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th></th><th>Tumbling</th><th>Hopping</th><th>Session</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Size</strong></td><td>fixed</td><td>fixed</td><td>dynamic (activity)</td></tr>
+      <tr><td><strong>Overlap</strong></td><td>no</td><td>yes (if hop &lt; size)</td><td>no; sessions can merge</td></tr>
+      <tr><td><strong>Windows per record</strong></td><td>exactly 1</td><td>size ÷ hop</td><td>exactly 1</td></tr>
+      <tr><td><strong>API</strong></td><td><code>TimeWindows.ofSize…(size)</code></td><td><code>TimeWindows.ofSize…(size).advanceBy(hop)</code></td><td><code>SessionWindows.ofInactivityGap…(gap)</code></td></tr>
+      <tr><td><strong>Closes when</strong></td><td colspan="2">stream time ≥ window end + grace</td><td>stream time &gt; session end + gap + grace</td></tr>
+      <tr><td><strong>Typical use</strong></td><td>orders per 5 min, revenue per hour</td><td>rolling / moving metrics</td><td>user sessions, bursts of activity</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout key"><span class="ci">&#127881;</span><div>
+  <b class="ct">End of the series</b>
+  <p>This was the last chapter. From event-driven fundamentals through producers, consumers, transactions, Schema Registry and the Outbox pattern, to Kafka Streams topologies, state and windows — head back to the <a href="index.html">documentation home</a> for the full chapter list.</p>
+</div></div>

@@ -1,0 +1,234 @@
+<!--meta
+{
+  "lead": "The start of the Kafka Streams part. A plain Kafka consumer is built for stateless processing: each event on its own. Real systems need stateful processing — running aggregates, time windows and joins between topics — and this chapter shows why doing that by hand with in-memory maps or a database breaks down, and what a stream-processing framework has to provide instead.",
+  "date": "Wednesday, 3 June 2026",
+  "related": [
+    { "n": 15, "why": "Kafka Streams architecture — how it solves the problems listed here." },
+    { "n": 16, "why": "KStream, KTable and GlobalKTable for aggregations and joins." },
+    { "n": 20, "why": "Windowing — 'total revenue in the last 5 minutes' done properly." },
+    { "n": 6, "why": "The plain consumer and @KafkaListener used in the approaches below." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="recap"><span class="sec-num">1</span>Where We Are</h2>
+<p>So far we have built a very good understanding of:</p>
+<ul class="points">
+  <li>Kafka Producer</li>
+  <li>Kafka Cluster</li>
+  <li>Kafka Consumer and Consumer Groups</li>
+</ul>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The setup so far</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:clusterSetup-->
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Current flow</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    A["Producer publishes events"] --> B["Events stored in a topic partition"] --> C["Consumer reads events from the partition"] --> D["Processes them (e.g. send notification)"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    class A,B,C,D step
+</div>
+  </div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="stateless"><span class="sec-num">2</span>Stateless vs Stateful Processing</h2>
+<div class="vs">
+  <div class="side a">
+    <h4>Stateless (what a consumer does)</h4>
+    <div class="sb">
+      <ul>
+        <li>Each event is processed <strong>independently</strong> — no memory of previous events or messages.</li>
+        <li>The output depends on the <strong>current event only</strong>.</li>
+        <li>Nothing needs to be remembered from previous messages.</li>
+      </ul>
+      <p class="lbl">Example</p>
+      <p>Order placed → send a confirmation email.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Stateful (what we often need)</h4>
+    <div class="sb">
+      <ul>
+        <li>The output depends on <strong>previous events / messages too</strong>.</li>
+        <li>We must <strong>remember (maintain state)</strong> across messages.</li>
+      </ul>
+      <p class="lbl">Example</p>
+      <p>Order placed → add its amount to the customer's running total.</p>
+    </div>
+  </div>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p>Stateful processing <strong>breaks the plain Kafka consumer model</strong>, because the Consumer API is designed for stateless processing: it hands you records and offsets, but has no built-in place to keep, recover or share state.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="aggregation"><span class="sec-num">3</span>Real-World Problem 1: Real-Time Aggregation</h2>
+<div class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <h4>Real-time total revenue per customer</h4>
+    <div class="table-wrap" style="margin:6px 0 0"><table><thead><tr><th>Customer</th><th>Revenue</th></tr></thead><tbody><tr><td>Customer1</td><td>100 $</td></tr><tr><td>Customer2</td><td>150 $</td></tr></tbody></table></div>
+  </div>
+  <div class="card">
+    <h4>Real-time leaderboard</h4>
+    <div class="table-wrap" style="margin:6px 0 0"><table><thead><tr><th>User</th><th>Points</th></tr></thead><tbody><tr><td>UserC</td><td>50</td></tr><tr><td>UserA</td><td>35</td></tr><tr><td>UserB</td><td>15</td></tr></tbody></table></div>
+  </div>
+</div>
+<p>With a plain Kafka consumer, we might try one of two approaches.</p>
+
+<h3 id="approach-memory">Approach 1: State in memory</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">RevenueConsumer.java</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Component
+public class RevenueConsumer {
+
+    private final Map&lt;String, Double&gt; revenueMap = new ConcurrentHashMap&lt;&gt;();
+
+    @KafkaListener(topics = "order-events")
+    public void consume(OrderEvent event) {
+        revenueMap.merge(
+                event.getCustomerId(),
+                event.getAmount(),
+                Double::sum);
+    }
+}</code></pre>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="callout danger" style="margin:0"><span class="ci">&#128165;</span><div><b class="ct">1. Application crash</b><ul style="margin:6px 0 0"><li>The in-memory map is <strong>gone</strong>.</li><li>We need to <strong>replay from offset 0</strong> — millions of messages — to rebuild it. Meanwhile the committed offset has moved on, so the consumer must also be reset to the beginning.</li></ul></div></div>
+  <div class="callout danger" style="margin:0"><span class="ci">&#129513;</span><div><b class="ct">2. Multiple instances</b><ul style="margin:6px 0 0"><li>Each instance reads <strong>different partitions</strong>, so each holds only <strong>partial</strong> data.</li><li>After a rebalance, partitions move, and their state does not move with them.</li></ul></div></div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Two instances, two partial maps</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    P0["order-events P0 · Customer1 +60, Customer2 +100"] --> A["Instance A · map: Customer1=60, Customer2=100"]
+    P1["order-events P1 · Customer1 +40, Customer2 +50"] --> B["Instance B · map: Customer1=40, Customer2=50"]
+    A -.-> Q["Ask: total for Customer1? · A says 60, B says 40 · truth is 100"]
+    B -.-> Q
+    classDef part fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    classDef inst fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class P0,P1 part
+    class A,B inst
+    class Q bad
+</div>
+  </div>
+  <div class="diagram-explain"><p>The figures are only an illustration. If events are keyed by customer id, all of one customer's events land in one partition, which avoids the split. But the state still lives in one JVM's memory and is lost on a crash or a rebalance.</p></div>
+</div>
+
+<h3 id="approach-db">Approach 2: State in MySQL</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">RevenueConsumer.java — DB version</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@KafkaListener(topics = "order-events")
+public void consume(OrderEvent event) {
+    CustomerRevenue revenue = repository.findById(event.getCustomerId());
+    revenue.setAmount(revenue.getAmount() + event.getAmount());
+    repository.save(revenue);
+}</code></pre>
+</div>
+<div class="callout danger"><span class="ci">&#128011;</span><div>
+  <p><strong>Problem:</strong> every Kafka event → <code>SELECT</code> → <code>UPDATE</code>. At <strong>1,00,000 events / second</strong> (100,000) that is:</p>
+  <ul style="margin:6px 0 0">
+    <li>1,00,000 <code>SELECT</code> queries per second</li>
+    <li>1,00,000 <code>UPDATE</code> queries per second</li>
+  </ul>
+  <p>The <strong>database becomes the bottleneck</strong>. On top of that, a network round trip per event adds latency, and the DB update and the offset commit are two separate writes, so a crash can count an event twice (the <a href="13-outbox-pattern.html#problem">dual-write problem</a> again).</p>
+</div></div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>In Spring Data, <code>findById</code> returns an <code>Optional</code>, so real code would be <code>repository.findById(id).orElseGet(() -&gt; new CustomerRevenue(id, 0.0))</code>. The first event for a new customer would otherwise fail. The notes also say “events / sections”, meaning events per second.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="windows"><span class="sec-num">4</span>Real-World Problem 2: Window Operations</h2>
+<p><strong>Use case:</strong> total revenue in the <strong>last 5 minutes</strong>.</p>
+<div class="logviz">
+  <div class="row"><span class="lab">time</span>
+    <div class="cells"><span class="cell gone">10:00<small>+30 $</small></span><span class="cell gone">10:02<small>+20 $</small></span><span class="cell new">10:06<small>+50 $</small></span><span class="cell new">10:08<small>+25 $</small></span><span class="cell new">10:10<small>+10 $</small></span></div>
+    <span class="ptr t">window at 10:10 = 85 $</span>
+  </div>
+</div>
+<p>The crossed-out values are older than 5 minutes and must fall out of the total. The figures are illustrative. With a plain Kafka consumer:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Problem</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>We need to <strong>track timestamps manually</strong>.</td></tr>
+      <tr><td>2</td><td>We need to <strong>expire old entries manually</strong>.</td></tr>
+      <tr><td>3</td><td>With <strong>multiple instances</strong>, each one sees only partial window data.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>There are subtler issues too: should the window use the time the event <em>happened</em> or the time it was <em>read</em>, and what if an event arrives late? This is covered in <a href="20-kafka-streams-window.html">Kafka Streams Window</a>.</p>
+
+<!-- ======================================================= -->
+<h2 id="joins"><span class="sec-num">5</span>Real-World Problem 3: Joining Two Topics</h2>
+<p><strong>Use case:</strong> <code>order-events</code> has a <code>customer_id</code>; join it with <code>customer-profile</code> to fetch the customer name.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Problem with a plain consumer</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>We need to maintain a <strong>map of customer profiles</strong>.</td></tr>
+      <tr><td>2</td><td>If that in-memory map is lost because of an app crash, it must be <strong>rebuilt by replaying from offset 0</strong>.</td></tr>
+      <tr><td>3</td><td>With <strong>multiple consumer instances</strong>, each one holds only some partitions of both topics.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The lookup may live on another instance</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    subgraph CA["Consumer-A"]
+        A1["order-events-P0"]
+        A2["customer-profile-P0"]
+    end
+    subgraph CB["Consumer-B"]
+        B1["order-events-P1"]
+        B2["customer-profile-P1"]
+    end
+    A1 -- "order for CUST-7 arrives · profile of CUST-7 is in P1" --> B2
+    classDef part fill:#fff4ec,stroke:#ea580c,color:#7c2d12,stroke-width:1.5px
+    class A1,A2,B1,B2 part
+</div>
+  </div>
+  <div class="diagram-explain"><p>When an order event arrives at Consumer-A, the customer entry it needs may be maintained by Consumer-B. So we would need <strong>distributed state sharing</strong> between instances. A join only works locally if both topics are <strong>co-partitioned</strong>: the same key, the same partitioner and the same number of partitions, so that matching keys land in the same partition number. Otherwise the small table must be copied to every instance (what a <a href="16-kstream-ktable-globalktable.html">GlobalKTable</a> does).</p></div>
+</div>
+<p style="font-size:13.5px;color:var(--muted)">The notes write “consumer-profile” in a couple of places; the topic is <code>customer-profile</code>.</p>
+
+<!-- ======================================================= -->
+<h2 id="framework"><span class="sec-num">6</span>What We Would End Up Building</h2>
+<p>If we try to solve these problems by hand, we end up building a <strong>stream-processing framework</strong> ourselves, with:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Capability</th><th>Solves</th></tr></thead>
+    <tbody>
+      <tr><td><strong>State management</strong></td><td>Running totals and leaderboards without a DB round trip per event</td></tr>
+      <tr><td><strong>Windowing</strong></td><td>“Last 5 minutes”: timestamps and expiry handled for you</td></tr>
+      <tr><td><strong>Joins</strong></td><td>Enriching orders with customer profiles</td></tr>
+      <tr><td><strong>Crash recovery</strong></td><td>Rebuilding state without replaying from offset 0</td></tr>
+      <tr><td><strong>Scaling</strong></td><td>Dividing partitions, and the state that belongs to them, among worker instances</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">From consumer to stream processor</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    C["Plain consumer · stateless"] --> N["Needs: state · windows · joins · recovery · scaling"]
+    N --> S["Kafka Streams · a library inside your app"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    class C step
+    class N bad
+    class S ok
+</div>
+  </div>
+</div>
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <p>That framework already exists: <strong>Kafka Streams</strong>. It is a Java library (no separate cluster) that keeps state in local stores backed by Kafka changelog topics, so state survives crashes and moves with partitions. It provides KStream / KTable abstractions, windowing and joins out of the box. The following chapters cover it: <a href="15-kafka-streams-architecture.html">architecture</a>, <a href="16-kstream-ktable-globalktable.html">KStream / KTable / GlobalKTable</a>, <a href="17-kafka-streams-serdes.html">SerDes</a>, <a href="18-stateless-processing-nodes.html">stateless</a> and <a href="19-stateful-processing-nodes.html">stateful</a> processing nodes, and <a href="20-kafka-streams-window.html">windows</a>.</p>
+</div></div>

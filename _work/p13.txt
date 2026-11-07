@@ -1,0 +1,461 @@
+18. Outbox Pattern
+
+Tuesday, 28 April 2026 12:38PM
+    Print
+
+                             Before we go in deep with this EDA pattern: Lets first understand the PROBLEM
+
+                         @PostMapping("/api/orders")
+                         public ResponseEntity<String> createOrder(@RequestBody Order order)
+                         {
+
+                                      //Step1: Save to Database
+
+                            orderRepository.save(order);
+
+                                      //Step2: Publish event to Kafka
+
+                            kafkaTemplate.send("order-events", order.getOrderId(), order);
+
+                            return ResponseEntity.ok("Order created");
+                         }
+
+                                   Above code has one MAJOR FLAW:
+
+                                 We are writing to 2 separate independent systems:
+                                      a. DB
+                                      b. Kafka
+
+                                 There is no Transactions that spans both.
+
+                                 Failure Scenarios:
+                                  1. DB succeeds, Kafka Fails
+
+                                          orderRepository.save(order); //Saved to DB
+                                          kafkaTemplate.send("order-events"); //Kafka is down
+                                  Result:
+                                   · Order exists in DB, but NO event published.
+                                   · Payment service never gets notified
+                                   · Inventory never decremented
+                                  This is DATA INCONSISTENCY.
+
+                                  2. Kafka succeeds, DB Fails
+                                      kafkaTemplate.send("order-events"); //Kafka event published
+                                      orderRepository.save(order); //DB connection lost
+
+                                  Result:
+                               · Event published but order doesn't exist in DB
+                               · Payment service processes a non existent order.
+                               · Inventory decremented for order which does not exist in DB.
+
+                                  This is DATA INCONSISTENCY and more impact than Use-case#1
+
+This problem is known as DUAL WRITE problem
+and during interviews, solutions generally provided is:
+
+                      @Transactional + Manual Exception Throw                                               2PC (Two Phase
+                                                                                                            Commit)
+@Transactional
+public void createOrder(OrderRequest request) {                                                                       Coordinator
+
+    // Step 1: DB write                                                                                     Phase1:  Phase1:
+    orderRepository.save(order);                                                                            PREPARE  PREPARE
+
+    try {                                                                                                   DB: Yes Ready Kafka: Yes Ready
+     // Step 2: Kafka send but in try catch block, if kafka fails, DB is also Rollback
+     kafkaTemplate.send("order-events", event).get();
+    }
+             catch (Exception e) {                                                                   Phase2:                                     Phase2:
+                                                                                                     COMMIT                                      COMMIT
+             throw new RuntimeException("Kafka failed, rolling back!"); // rolls back DB
+
+Print     }
+
+       }
+
+                                                                                                     DB: COMMITTED KAFKA: COMMITTED
+
+          This might looks correct at first glance, But loop hole is:                                This might looks like a solution:
+
+           · What if Kafka Publish is success but we think it failed.                                But, 2PC to work all participants need to understand the protocol. And KAFKA does not
+                                                                                                     support 2PC.
+          Timeline:
+           10:00 DB write -> success                                                                 So this solution pro and cons does not even matter as Kafka can not participate in 2PC, as it do
+           10:05 kafkaTemplate.send() -> message sent to Kafka broker                                not understand PREPARE, COMMIT commands from coordinator.
+           10:06 Kafka broker receives message -> WRITES to partition
+           10:07 Kafka broker sends ACK back to your app
+           10:08 NETWORK ISSUE -> ACK packet lost in transit
+           10:09 Our app: "I never got ACK -> must have failed"
+           10:10 throw RuntimeException -> @Transactional rolls back DB
+
+          Result:
+            DB: Order DOES NOT exist (rolled back)
+            Kafka: Order event EXISTS
+
+                                                              Solution is: OUTBOX PATTERN
+
+                                                                  Idea is:
+             · Don't write directly to Kafka.
+             · Write to DB first and then a separate process read the DB and publish to kafka.
+
+             @Transactional                                                                          · Order Table
+             public void createOrder(OrderRequest request) {                                         · Outbox Table
+
+                 // Step 1: Order DB table write                                                             DB
+                 orderRepository.save(order);
+                                                                                                                                                 Separate
+                 // Step 2: Event details stored in DB table first, known as Outbox Table                                                        Process reads
+                 outboxTableRepository.save(eventDetails);                                                                                       Outbox Table
+
+             }
+
+                                                                                                     After successful publishing,
+
+                                                                                                     marks the row as              Publish to Kafka
+
+                                                                                                     "PUBLISHED" or delete it.
+
+                                                                        Outbox Table Schema:
+
+           · Its just a regular DB table in our application.
+           · Contains columns which are required to successfully publish an event.
+          Most Common Schema Sample:
+
+             Id Aggregate_type Event_type Aggregate_id payload Created_At Is_published
+
+             101  Order             ORDER_CREATED ORD-1                  {...}                false
+
+             Id: Unique Id for this event. As producer can publish multiple time same event. So this can be used for Idempotency.
+             Aggregate_type: What entity this event is about like "ORDER" or "PAYMENT" etc. Used to determine which Kafka topic to publish to.
+             Event_type: Tells what happened with entity like ORDER_CREATED, ORDER_CANCELLED etc.
+             Aggregate_id: This is used as message Key. As all related events should goes to the same partition, so this played a major role in
+             maintaining order.
+             Payload: the actual data.
+             Created_At: when the event was created.
+             Optional field:
+                                     Is_published: False -> not yet sent to Kafka.
+                                                      True -> sent to kafka. Can be cleaned later.
+
+Print
+
+                       Outbox Table is consumed in 2 ways:
+                            1. Polling: Is_published column is required.
+                            2. CDC (Change Data Capture): Is_published column is not required.
+
+                                                                        Polling:
+
+Outbox Table  Polls regularly this table and                                                        Kafka
+              looks for Unpublished events.
+
+                OrderController.java                                                OrderService.java                                                OrderRepository.java
+
+@RestController                                                   @Service                                                     @Repository
+@RequestMapping("/api/orders")                                    public class OrderService {                                  public interface OrderRepository extends JpaRepository<Order, Long> {
+public class OrderController {                                                                                                 }
+                                                                  @Autowired
+@Autowired                                                        private OrderRepository orderRepository;                                               OutboxRepository.java
+private OrderService orderService;
+                                                                  @Autowired                                                  @Repository
+@PostMapping                                                      private OutboxRepository outboxRepository;                  public interface OutboxRepository extends JpaRepository<OutboxEvent, String> {
+public String createOrder(@RequestBody Order order) {
+                                                                  @Transactional                                              @Query(value = """
+         orderService.createOrder(order);                         public Order createOrder(Order order) {                     SELECT * FROM outbox_events
+         return "Order created";                                                                                              WHERE published = false
+    }                                                                 // Step 1: save to orders table                         ORDER BY created_at ASC
+}                                                                     Order savedOrder = orderRepository.save(order);         LIMIT :batchSize
+                                                                                                                              """, nativeQuery = true)
+                                  No Kafka publish here, only DB      // Step 2: Create outbox event IN THE SAME TRANSACTION  List<OutboxEvent> findUnpublishedEvents(int batchSize);
+                                  tables touched, which can be        OutboxEvent outboxEvent = new OutboxEvent();            }
+                                  part of 1 transaction.              outboxEvent.setAggregateType("Order");
+                                                                      outboxEvent.setAggregateId(savedOrder.getOrderId());                              Order.java (Entity)
+                                                                      outboxEvent.setEventType("ORDER_CREATED");
+                                                                      // Payload: JSON string of the event data                @Entity
+                                                                      String payload = String.format(                          @Table(name = "orders")
+                                                                                                                               public class Order {
+                                                                               "{\"orderId\":\"%s\"," +
+                                                                               "\"quantity\":%d," +                                 @Id
+                                                                               "\"totalAmount\":%.2f}",                             @GeneratedValue(strategy = GenerationType.IDENTITY)
+                                                                               savedOrder.getOrderId(),                             private Long id;
+                                                                               savedOrder.getQuantity(),
+                                                                               savedOrder.getTotalAmount()                          @Column(name = "order_id")
+                                                                           );                                                       private String orderId;
+                                                                      outboxEvent.setPayload(payload);
+                                                                      outboxRepository.save(outboxEvent);                           @Column
+                                                                      return savedOrder;                                            private Integer quantity;
+                                                                    }
+                                                                  }                                                                 @Column(name = "total_amount")
+                                                                                                                                    private Double totalAmount;
+
+                               application.properties                                                                               // Getters and Setters
+                                                                                                                                }
+server.port=8085
+spring.application.name=outbox-polling-demo                                                                                                         OutboxEvent.java (Entity)
+
+# PostgreSQL Connection                                                                                                       @Entity
+spring.datasource.url=jdbc:postgresql://localhost:5432/orderdb                                                                @Table(name = "outbox_events")
+spring.datasource.username=postgres                                                                                           public class OutboxEvent {
+spring.datasource.password=postgres
+spring.datasource.driver-class-name=org.postgresql.Driver                                                                              @Id
+                                                                                                                                       @Column
+# JPA / Hibernate                                                                                                                      private String id;
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true                                                                                                               @Column(name = "aggregate_type", nullable = false)
+spring.jpa.properties.hibernate.format_sql=true                                                                                        private String aggregateType;
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+                                                                                                                                       @Column(name = "aggregate_id", nullable = false)
+# Kafka Producer Config                                                                                                                private String aggregateId;
+spring.kafka.bootstrap-servers=localhost:9092
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer                                            @Column(name = "event_type", nullable = false)
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer                                          private String eventType;
+spring.kafka.producer.acks=all
+                                                                                                                                       @Column(nullable = false, columnDefinition = "TEXT")
+# Outbox Poller Config (custom property)                                                                                               private String payload;
+outbox.polling.interval-ms=2000
+outbox.polling.batch-size=10                                                                                                           @Column(nullable = false)
+                                                                                                                                       private boolean published;
+
+                                                                                                                                                                     @Column(name = "created_at", nullable = false)
+                                                                                                                                                                     private Instant createdAt;
+
+                                                                                                                                                                     @Column(name = "published_at")
+                                                                                                                                                                     private Instant publishedAt;
+
+                                OutboxPoller.java (the poller)                                      This scheduler is just 1 example, of poller.                     public OutboxEvent() {
+                                                                                                    We can have separate application itself which                        this.id = UUID.randomUUID().toString();
+@Component                                                                                          keep polling outbox table.                                           this.published = false;
+public class OutboxPoller {                                                                         And once found the event can simply invoke the                       this.createdAt = Instant.now();
+                                                                                                    Publisher method.
+    @Autowired                                                                                                                                                       }
+    private OutboxRepository outboxRepository;                                                                                                                    }
+                                                                                                                                                                     // --- Getters and Setters ---
+       @Autowired
+       private KafkaTemplate<String, String> kafkaTemplate;
+
+Print  @Value("${outbox.polling.batch-size}")
+
+       private int batchSize;
+
+       @Scheduled(fixedRateString = "${outbox.polling.interval-ms}")                                     This poller job runs every 2 seconds
+       @Transactional                                                                                    Interval time configured in properties file.
+       public void pollAndPublish() {
+                                                                                                             Fetch events from outbox table.
+       // Step 1: Fetch unpublished events                                                                   In 1 go, it will fetch 10 records.
+       List<OutboxEvent> events = outboxRepository.findUnpublishedEvents(batchSize);                         Batch size configured in properties file.
+       if (events.isEmpty()) {
+                                                                                                           Publish to kafka
+           return;                                                                                          Update the published status to TRUE
+       }
+                                                                                                This break is important, as event1 is failed,
+                for (OutboxEvent event : events) {                                              we should not continue to publish event2 ,
+                    try {                                                                       event3 and so on
+                         String topic = event.getAggregateType().toLowerCase() + "-events";     As it will break ordering.
+                         kafkaTemplate.send(topic, event.getAggregateId(), event.getPayload())
+                                           .get();
+                         event.setPublished(true);
+                         event.setPublishedAt(Instant.now());
+                         outboxRepository.save(event);
+                    }
+                    catch (Exception e) {
+                             // BREAK to preserve ordering!
+                             // If event 1 fails, we must NOT skip to event 2
+                             break;
+                    }
+
+                }
+           }
+       }
+
+                                                                   Disadvantages of Polling:
+
+       1. Multi-Instance handling:
+       When we have multiple instance, means multiple POLLERS, which could lead to:
+        · Duplicate processing of Rows:
+
+           So need locking mechanism like "SELECT ... FOR UPDATE SKIP LOCKED"
+        · Ordering Risk:
+
+           what if 2 POLLERS pick different rows which could lead to break ordering.
+        · ShedLock:
+
+           To preserve ordering in multiple instance scenario, we need something like ShedLock technique.
+
+       2. Polling Gap:
+               Event created at 10:00:00 but Poll runs at 10:00:02
+               -> 2 sec delay
+
+       3. Constant DB load:
+           Even when there is no events, Poller has to continuously query DB.
+           This cause an extra CPU+IO overhead.
+
+       4. DB clean up:
+           Outbox Event table need to be clean up regularly, as its size will grow rapidly.
+
+       5. Duplicate processing:
+           Event published to kafka, but processed=True update failed.
+           So during next run, again same event might get published, so Consumer must be IDEMPOTENT.
+
+                            Another most scalable solution is: CDC (Change Data Capture)
+
+                                          CDC (Change Data Capture)
+
+                                        Debezium (Tool which implements CDC)
+                     CDC: It says don't ask the Database for changes, database will tell you.
+
+Print
+
+Outbox Table  WAL (Write-Ahead Logging):
+ WAL file     Before INSERT/UPDATE/DELETE first WAL file is written and flushed to disk.
+              Then Table get updated.
+Postgres      This help Postgres in case recovery.
+
+              Also the same WAL file is used for Replication to followers.
+
+              Similarly,
+              In MySQL its Binlog file which is use for replication to followers
+
+              CDC reads get these log files only from DB.
+
+        Step1: Download Postgres and start the server
+
+                https://www.postgresql.org/download/
+
+pgAdmin (UI for postgres, automatically comes when we download Postgres)
+
+While downloading,
+it ask us to provide
+the password,
+same need to be used here
+
+                                                    Run:
+                                                    ALTER SYSTEM SET wal_level = 'logical';
+                                                     and Restart Postgres:
+
+                                      Need to change from Replica to Logical for CDC to work.
+                                      Replica: in WAL data is stored in Binary form
+                                      page5, offset 120 -> changed from X to Y
+                                      But this is of no use for CDC.
+                                      CDC need more info like which table, column etc.
+                                      Logical: in WAL data is still in Binary form + some extra metadata for decoding.
+                                      Table = order
+                                      Row id = 1
+                                      Column "Amount" changed from 100 to 200
+                                      Now CDC can publish event properly.
+                                           Step2: Create our DB
+
+Print
+
+                                       CREATE DATABASE outbox_cdc;
+
+                                              Step3: Create our tables:
+
+                                 CREATE TABLE orders (
+                                    id SERIAL PRIMARY KEY,
+                                    order_id VARCHAR(255) UNIQUE NOT NULL,
+                                    quantity INT NOT NULL,
+                                    total_amount DOUBLE PRECISION NOT NULL,
+                                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+                                 );
+
+                                 CREATE TABLE outbox_events (
+                                    id VARCHAR(36) PRIMARY KEY,
+                                    aggregate_type VARCHAR(255) NOT NULL,
+                                    aggregate_id VARCHAR(255) NOT NULL,
+                                    event_type VARCHAR(255) NOT NULL,
+                                    payload TEXT NOT NULL,
+                                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+                                 );
+
+                                                 Step4: Create Publication:
+
+                               CREATE PUBLICATION cdc_publication FOR TABLE public.outbox_events;
+
+                                   Now PostgreSQL knows:
+                                   INSERT into orders -> NOT in publication -> skip
+                                   INSERT into outbox_events -> IN publication -> stream it
+                                   UPDATE users -> NOT in publication -> skip
+
+Step5: Now Download CDC tool (Debezium Postgres) plugin and add it in Kafka Connect
+
+                      Postgres
+                      DB
+
+Broker1      Broker2  Debezium
+                      Postgres Plugin
+
+                      Kafka Connect
+
+Controller1  Controller2
+
+Download Debezium Postgres plugin:
+
+https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/3.5.0.Final/
+Download this file:
+debezium-connector-postgres-3.5.0.Final-plugin.tar.gz
+
+Now extract this Debezium plugin in "plugins" folder inside our kafka directory:
+Print
+
+                                    Now update the Kafka Connect configuration "connect-standalone.properties":
+
+                                                                                   Add this:
+                                                                                   plugin.path=/Users/shrayanshjain/Downloads/kafka_2.13-4.2.0/plugins
+
+                                             Now the last part, which connect both Debezium plugin and DB:
+
+                                                  "debezium-postgres-connector.properties"
+
+                                       Create file: kafka/config/debezium-postgres-connector.properties
+
+                                # unique name for this connector
+                                name=outbox-connector
+                                # Which Debezium plugin to use (Postgres, MySql etc.)
+                                connector.class=io.debezium.connector.postgresql.PostgresConnector
+                                # Database connection
+                                database.hostname=localhost
+                                database.port=5432
+                                database.user=postgres
+                                database.password=cdctest
+                                database.dbname=outbox_cdc
+                                # {prefix}.{schema}.{table}
+                                topic.prefix=cdc
+                                # Only watch the outbox_events table (ignore orders table)
+                                table.include.list=public.outbox_events
+                                # Replication slot name (Postgres will create this)
+                                slot.name=debezium_slot
+                                # Postgres used this field and it decodes the WAL before it send to Debezium
+                                plugin.name=pgoutput
+                                # Start with a snapshot of existing data, then stream
+                                snapshot.mode=initial
+                                publication.autocreate.mode=disabled
+                                publication.name=cdc_publication
+                                #any name we can give to transform : event router
+                                transforms=outbox
+                                 #debezium in build class for event routing
+                                transforms.outbox.type=io.debezium.transforms.outbox.EventRouter
+                                 #unique field in outbox_events table, so that will be used as Kafka message id
+                                transforms.outbox.table.field.event.id=id
+                                #which column to use for key
+                                transforms.outbox.table.field.event.key=aggregate_id
+
+Print
+
+                                #which column to use for payload
+                                transforms.outbox.table.field.event.payload=payload
+                                #read column aggregate_type
+                                transforms.outbox.route.by.field=aggregate_type
+                                #in topic, we can add suffix
+                                transforms.outbox.route.topic.replacement=${routedByValue}-events
+
+        When we start the Kafka Connect server -> Debezium registers itself as a follower at runtime, using the replication protocol.
+
+       Start:
+        · Controller
+        · Broker
+        · Kafka Connect :
+       bin/connect-standalone.sh config/connect-standalone.properties config/debezium-postgres-connector.properties
+
+                                                                                       DEMO:
+
+                                                                                                       PUBLISHED TO KAFKA in topic "order-events"

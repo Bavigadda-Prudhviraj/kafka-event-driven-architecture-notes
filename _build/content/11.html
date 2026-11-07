@@ -1,0 +1,358 @@
+<!--meta
+{
+  "lead": "How consumers read transactional data. Covers the three states a transaction can be in on the broker (ongoing, committed, aborted), the Last Stable Offset (LSO), read_uncommitted vs read_committed isolation, how aborted records are filtered using the .txnindex file, and how Exactly-Once Semantics (EOS) makes read → process → write → commit atomic with sendOffsetsToTransaction.",
+  "date": "Monday, 30 March 2026",
+  "related": [
+    { "n": 10, "why": "The producer side: transaction ids, coordinator, PID + epoch, control records." },
+    { "n": 9, "why": "Offset commits and ack-modes that EOS replaces for read-process-write." },
+    { "n": 2, "why": "Segments and index files — .txnindex lives next to .log, .index and .timeindex." },
+    { "n": 13, "why": "The Outbox pattern, for when the write goes to a database instead of Kafka." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="three-cases"><span class="sec-num">1</span>Three Transaction States the Broker Can Hold</h2>
+<p>The broker has the records. For a transactional producer there are 3 possible cases, and the log shows each one clearly. (These are the <code>order-events</code> / <code>payment-events</code> records from <a href="10-transactions-producer.html#logs">Transactions (Producer)</a>.)</p>
+
+<h3 id="case-ongoing">1. Transaction status: ONGOING</h3>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events — no control record yet</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774875887784 size: 243 magic: 2 compresscodec: snappy crc: 1578994549 isvalid: true
+| offset: 0 CreateTime: 1774875887784 keySize: 4 valueSize: 113 sequence: 0 headerKeys: [__TypeId__] key: O-33 payload: {"orderId":"O-33","customerId":"CUST-2","productId":"PROD-3","quantity":1,"totalAmount":99.99,"status":"CREATED"}</code></pre>
+</div>
+<p>There is <strong>no control record</strong> for it yet, which means the transaction is still <strong>ONGOING</strong>.</p>
+
+<h3 id="case-commit">2. Transaction status: COMMIT</h3>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">payment-events — data + COMMIT marker</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774875888100 size: 216 magic: 2 compresscodec: snappy crc: 2150642178 isvalid: true
+| offset: 0 CreateTime: 1774875888100 keySize: 8 valueSize: 82 sequence: 0 headerKeys: [__TypeId__] key: PAY-O-33 payload: {"paymentId":"PAY-O-33","customerId":"CUST-2","totalAmount":99.99,"status":"PAID"}
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: true deleteHorizonMs: OptionalLong.empty position: 216 CreateTime: 1774875888151 size: 78 magic: 2 compresscodec: none crc: 3247449494 isvalid: true
+| offset: 1 CreateTime: 1774875888151 keySize: 4 valueSize: 6 sequence: -1 headerKeys: [] endTxnMarker: COMMIT coordinatorEpoch: 0</code></pre>
+</div>
+
+<h3 id="case-abort">3. Transaction status: ABORT</h3>
+<p>Just like COMMIT, there is a control record entry for ABORT:</p>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events — data + ABORT marker</span><span class="lang">log</span></div>
+<pre><code data-lang="log">baseOffset: 0 lastOffset: 0 count: 1 baseSequence: 0 lastSequence: 0 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1774901083813 size: 243 magic: 2 compresscodec: snappy crc: 172206083 isvalid: true
+| offset: 0 CreateTime: 1774901083813 keySize: 4 valueSize: 113 sequence: 0 headerKeys: [__TypeId__] key: O-33 payload: {"orderId":"O-33","customerId":"CUST-2","productId":"PROD-3","quantity":1,"totalAmount":99.99,"status":"CREATED"}
+baseOffset: 1 lastOffset: 1 count: 1 baseSequence: -1 lastSequence: -1 producerId: 0 producerEpoch: 0 partitionLeaderEpoch: 0 isTransactional: true isControl: true deleteHorizonMs: OptionalLong.empty position: 243 CreateTime: 1774901084304 size: 78 magic: 2 compresscodec: none crc: 3109029820 isvalid: true
+| offset: 1 CreateTime: 1774901084304 keySize: 4 valueSize: 6 sequence: -1 headerKeys: [] endTxnMarker: ABORT coordinatorEpoch: 0</code></pre>
+</div>
+<div class="logviz">
+  <div class="row"><span class="lab">ONGOING</span><div class="cells"><span class="cell open">offset 0<small>O-33</small></span></div><span class="ptr">no marker yet</span></div>
+  <div class="row"><span class="lab">COMMIT</span><div class="cells"><span class="cell new">offset 0<small>PAY-O-33</small></span><span class="cell ctl">offset 1<small>COMMIT</small></span></div></div>
+  <div class="row"><span class="lab">ABORT</span><div class="cells"><span class="cell bad">offset 0<small>O-33</small></span><span class="cell ctl">offset 1<small>ABORT</small></span></div></div>
+</div>
+<p>The data record is <strong>physically in the log in all three cases</strong>. What the consumer gets to see depends on its <a href="#isolation">isolation level</a> and on the <a href="#lso">LSO</a>.</p>
+
+<!-- ======================================================= -->
+<h2 id="lso"><span class="sec-num">2</span>LSO — Last Stable Offset</h2>
+<div class="callout key"><span class="ci">&#128204;</span><div>
+  <p><strong>LSO</strong> = the offset of the <strong>first message that belongs to an OPEN (ongoing) transaction</strong>.</p>
+  <p>A <code>read_committed</code> consumer <strong>cannot read past the LSO</strong>, even if there are committed or non-transactional records after it. The LSO is maintained by the broker and kept <strong>in memory</strong>.</p>
+</div></div>
+<p><strong>Example</strong> — topic <code>order-events</code>, partition P2:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events P2 log</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Offset0: [PID=5, epoch=0, isTransactional=true]                 {record-1}   TXN-1
+Offset1: [PID=5, epoch=0, isTransactional=true]                 {record-2}   TXN-1
+Offset2: [PID=8, epoch=1, isTransactional=true]                 {record-1}   TXN-2 (open)
+Offset3: [PID=5, epoch=0, isTransactional=true, isControl=true] {COMMIT}     TXN-1 committed
+Offset4: [PID=9, epoch=0, isTransactional=true]                 {record-1}   TXN-3
+Offset5: [PID=9, epoch=0, isTransactional=true, isControl=true] {COMMIT}     TXN-3 committed</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">LSO = 2: the first record of the still-open TXN-2</span><span class="db">HTML visualisation</span></div>
+  <div class="diagram-body" style="text-align:left">
+    <div class="logviz">
+      <div class="row"><span class="lab">order-events P2</span>
+        <div class="cells">
+          <span class="cell new">0<small>TXN-1</small></span><span class="cell new">1<small>TXN-1</small></span><span class="cell open">2<small>TXN-2 open</small></span><span class="cell ctl">3<small>COMMIT 1</small></span><span class="cell new">4<small>TXN-3</small></span><span class="cell ctl">5<small>COMMIT 3</small></span>
+        </div>
+        <span class="ptr v">LSO = 2</span>
+      </div>
+    </div>
+  </div>
+  <div class="diagram-explain"><p>Colours: <span style="color:var(--teal)">teal</span> = committed data, <span style="color:#92600a">amber</span> = open transaction, <span style="color:#5b21b6">purple</span> = control record. TXN-3 is already committed, but it sits <strong>after</strong> the LSO, so a <code>read_committed</code> consumer has to wait for TXN-2 to finish.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="isolation"><span class="sec-num">3</span>Consumer Isolation Level</h2>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># read_uncommitted (default) | read_committed
+spring.kafka.consumer.properties.isolation.level=read_committed</code></pre>
+</div>
+<div class="vs">
+  <div class="side a">
+    <h4>read_uncommitted (default)</h4>
+    <div class="sb">
+      <p>Reads everything <strong>except control records</strong> (<code>isControl=true</code>):</p>
+      <ul>
+        <li>Ongoing transactional records</li>
+        <li>Committed transactional records</li>
+        <li>Aborted transactional records</li>
+        <li>Non-transactional records</li>
+      </ul>
+      <p class="lbl">For the example above, the consumer reads</p>
+      <ul>
+        <li>Offset0 — part of committed TXN-1</li>
+        <li>Offset1 — part of committed TXN-1</li>
+        <li>Offset2 — open (ongoing) TXN-2</li>
+        <li>Offset4 — part of committed TXN-3</li>
+      </ul>
+      <p class="lbl">Skips</p>
+      <ul>
+        <li>Offset3 — control record for TXN-1</li>
+        <li>Offset5 — control record for TXN-3</li>
+      </ul>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>read_committed</h4>
+    <div class="sb">
+      <ul>
+        <li>Reads <strong>committed</strong> transactional records</li>
+        <li>Reads <strong>non-transactional</strong> records</li>
+        <li><strong>Skips aborted</strong> transactional records</li>
+        <li><strong>Stops at the LSO</strong></li>
+        <li>Skips control records (<code>isControl=true</code>)</li>
+      </ul>
+      <p class="lbl">For the example above, the consumer reads</p>
+      <ul>
+        <li>Offset0 — part of committed TXN-1</li>
+        <li>Offset1 — part of committed TXN-1</li>
+      </ul>
+      <p>LSO = 2, so the consumer cannot read Offset2, because that transaction is still open.</p>
+      <p><strong>Notice:</strong> even though TXN-3 is committed, the consumer cannot read it because of the LSO. This ensures the consumer <strong>never sees partially completed transactions</strong>, preserving both <strong>ordering</strong> and <strong>atomicity</strong>.</p>
+    </div>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>For <code>read_committed</code>, the broker only returns data <strong>up to the LSO</strong>. Control records do come back inside the fetched batches, but the consumer client uses them and drops them, so your listener never receives them under either isolation level.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="aborted"><span class="sec-num">4</span>How read_committed Skips ABORTED Records</h2>
+<p>This is interesting: aborted records are <strong>not filtered at the broker</strong>; they are filtered in the <strong>consumer</strong>. But how does the consumer know which offsets to skip? Let's extend the example:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order-events P2 log (extended)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">Offset0: [PID=5, epoch=0, isTransactional=true]                 {record-1}
+Offset1: [PID=5, epoch=0, isTransactional=true]                 {record-2}
+Offset2: [PID=8, epoch=1, isTransactional=true]                 {record-1}
+Offset3: [PID=5, epoch=0, isTransactional=true, isControl=true] {COMMIT}
+Offset4: [PID=9, epoch=0, isTransactional=true]                 {record-1}
+Offset5: [PID=9, epoch=0, isTransactional=true, isControl=true] {COMMIT}
+Offset6: [PID=8, epoch=1, isTransactional=true, isControl=true] {ABORT}
+Offset7: [PID=8, epoch=1, isTransactional=true]                 {record-1}
+Offset8: [PID=8, epoch=1, isTransactional=true, isControl=true] {COMMIT}</code></pre>
+</div>
+<p>For a <code>read_committed</code> consumer, the broker returns these data records (the control records at offsets 3, 5, 6 and 8 are skipped):</p>
+<div class="logviz">
+  <div class="row"><span class="lab">returned</span>
+    <div class="cells">
+      <span class="cell new">0<small>PID 5 · committed</small></span><span class="cell new">1<small>PID 5 · committed</small></span><span class="cell bad">2<small>PID 8 · aborted</small></span><span class="cell new">4<small>PID 9 · committed</small></span><span class="cell new">7<small>PID 8 · committed</small></span>
+    </div>
+  </div>
+  <div class="row"><span class="lab">control (skipped)</span>
+    <div class="cells">
+      <span class="cell ctl">3<small>COMMIT</small></span><span class="cell ctl">5<small>COMMIT</small></span><span class="cell ctl">6<small>ABORT</small></span><span class="cell ctl">8<small>COMMIT</small></span>
+    </div>
+  </div>
+</div>
+<p><strong>Notice:</strong> Offset2 and Offset7 have the <strong>same PID and epoch</strong> (PID=8, epoch=1). Only Offset2 should be skipped, not Offset7. So PID + epoch alone is not enough.</p>
+
+<h3 id="txnindex">The answer: the <code>.txnindex</code> file</h3>
+<p>For every <strong>ABORTED</strong> transaction, the broker maintains an entry in a separate index file next to the segment, e.g. <code>00000000000000000000.txnindex</code>:</p>
+<div class="grid grid-2" style="align-items:center">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">00000000000000000000.txnindex (conceptual)</span><span class="lang">json</span></div>
+<pre><code data-lang="json">[
+  {
+    "PID": 8,
+    "Epoch": 1,
+    "First offset Index": 2,
+    "Control record offset (last offset)": 6
+  }
+]</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">partition directory order-events-0/</span><span class="lang">text</span></div>
+<pre><code data-lang="text">00000000000000000000.index
+00000000000000000000.log
+00000000000000000000.timeindex
+00000000000000000000.txnindex
+leader-epoch-checkpoint
+partition.metadata</code></pre>
+  </div>
+</div>
+<p>The consumer uses this information to work out which records are aborted and skips them:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Offset</th><th>PID / epoch</th><th>Decision</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>5 / 0</td><td><span class="badge ok">Accepted</span></td><td>PID and epoch do not match the aborted entry</td></tr>
+      <tr><td>1</td><td>5 / 0</td><td><span class="badge ok">Accepted</span></td><td>PID and epoch do not match</td></tr>
+      <tr><td>2</td><td>8 / 1</td><td><span class="badge bad">Skipped</span></td><td>PID=8, epoch=1 <strong>and</strong> offset 2 is within the range [2 – 6]</td></tr>
+      <tr><td>4</td><td>9 / 0</td><td><span class="badge ok">Accepted</span></td><td>PID and epoch do not match</td></tr>
+      <tr><td>7</td><td>8 / 1</td><td><span class="badge ok">Accepted</span></td><td>PID=8, epoch=1 but offset 7 is <strong>not</strong> in the range [2 – 6]</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">How the aborted list reaches the consumer</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Consumer (read_committed)
+    participant B as Broker (leader order-events P2)
+    C->>B: FetchRequest (isolation = read_committed)
+    Note over B: read records up to the LSO &lt;br/&gt; look up .txnindex for aborted txns in this range
+    B-->>C: FetchResponse: records 0-7 + abortedTransactions [PID 8 from offset 2]
+    Note over C: batch of PID 8 at offset 2 is inside an aborted range: drop &lt;br/&gt; ABORT marker at offset 6 closes the range &lt;br/&gt; PID 8 at offset 7 is after it: keep
+    Note over C: return offsets 0, 1, 4, 7 to poll()
+</div>
+  </div>
+  <div class="diagram-explain"><p>Strictly, the consumer does not open the file itself. The broker reads <code>.txnindex</code> and sends the <strong>aborted transactions list</strong> (producer id + first offset) in the FetchResponse. The consumer then drops that producer's records from the first offset until it meets the matching ABORT control record.</p></div>
+</div>
+
+<h3 id="txnindex-dump">Dumping a real <code>.txnindex</code></h3>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump the txnindex — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker3-logs/order-events-0/00000000000000000000.txnindex
+Dumping /tmp/broker3-logs/order-events-0/00000000000000000000.txnindex
+version: 0 producerId: 0 firstOffset: 0 lastOffset: 1 lastStableOffset: 2</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">dump the txnindex — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker3-logs/order-events-0/00000000000000000000.txnindex
+Dumping C:/kafka-data/broker3-logs/order-events-0/00000000000000000000.txnindex
+version: 0 producerId: 0 firstOffset: 0 lastOffset: 1 lastStableOffset: 2</code></pre>
+</div>
+</div>
+<p>This is the entry for the aborted <code>O-33</code> transaction shown in <a href="#case-abort">case 3</a>: producer 0's records from <strong>offset 0</strong> up to the ABORT marker at <strong>offset 1</strong> are aborted, and the LSO at that point was <strong>2</strong>.</p>
+
+<!-- ======================================================= -->
+<h2 id="eos"><span class="sec-num">5</span>Exactly-Once Semantics (EOS) for Read-Process-Write</h2>
+<p>Remember the consumer-side problem from <a href="10-transactions-producer.html#problem-duplicate">Transactions (Producer)</a>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Duplicate processing (read-process-write)</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant B as Broker
+    participant C as Consumer
+    C->>B: poll()
+    B-->>C: Record (offset 50)
+    Note over C: Processed record
+    C->>B: Publish another event send()
+    C--xB: Offset commit (crash before it lands)
+    C->>B: poll()
+    B-->>C: Record (offset 50) again
+    Note over C: Processed record again
+    C->>B: Publish another event send() → duplicate
+</div>
+  </div>
+</div>
+<div class="callout key"><span class="ci">&#127919;</span><div>
+  <p>This is the core <strong>EOS (Exactly-Once Semantics)</strong> problem: <strong>read → process → write → commit offset</strong>. It happens because <strong>write</strong> and <strong>commit offset</strong> are separate steps, so a crash between them causes duplicate writes. “Exactly once” means no duplicates.</p>
+  <p><strong>EOS = read_committed consumer + idempotency + transaction.</strong> In simple terms, EOS makes the write and the offset-commit step <strong>atomic</strong>: on any failure, neither the write nor the offset commit happens.</p>
+</div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Write and offset commit inside one transaction</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    R["Read · poll() order-events"] --> P["Process · business logic"]
+    subgraph TX["One Kafka transaction"]
+        W["Write · send to payment-events"]
+        O["Commit offset · sendOffsetsToTransaction"]
+    end
+    P --> W --> O
+    O --> Q{"Commit OK?"}
+    Q -- "Yes" --> Y["Output visible and offset saved together"]
+    Q -- "No" --> N["Abort: output discarded, offset not moved · record re-read"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class R,P,W,O,Q step
+    class Y ok
+    class N bad
+</div>
+  </div>
+  <div class="diagram-explain"><p>The consumed offset is written to <code>__consumer_offsets</code> <strong>as part of the producer's transaction</strong>. If the transaction aborts, the payment event is never visible to <code>read_committed</code> consumers, and the offset is not committed, so the record is simply processed again. Downstream consumers must use <code>read_committed</code>, otherwise they could still see the aborted output.</p></div>
+</div>
+
+<h3 id="implementation">Implementation</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># ... (other consumer properties)
+
+spring.kafka.consumer.properties.isolation.level=read_committed
+spring.kafka.consumer.enable-auto-commit=false
+
+spring.kafka.producer.transaction-id-prefix=order-serv-
+spring.kafka.producer.acks=all
+spring.kafka.producer.properties.enable.idempotence=true</code></pre>
+</div>
+<p>The notes write the last line as <code>spring.kafka.producer.enable-idempotence=true</code>; the pass-through form above works on any Spring Boot version. Setting <code>transaction-id-prefix</code> already forces idempotence and <code>acks=all</code>, so those two lines mostly document the intent.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderEventListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderEventListener {
+
+    @Autowired
+    private KafkaTemplate&lt;String, Object&gt; kafkaTemplate;
+
+    @KafkaListener(topics = "order-events", groupId = "order-group")
+    public void process(ConsumerRecord&lt;String, Object&gt; record, Consumer&lt;?, ?&gt; consumer) {
+
+        kafkaTemplate.executeInTransaction(ops -&gt; {
+
+            // 1. READ happened and a record is received in this method
+            String key = record.key();
+            Object value = record.value();
+
+            // 2. PROCESS, any business logic here if you want
+            Object result = value;
+
+            // 3. WRITE (to another topic)
+            ops.send("payment-events", key, result);
+
+            // 4. SEND OFFSET TO TRANSACTION: we are just buffering the offsets
+            //    which need to be committed when this txn is committed
+            Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets = new HashMap&lt;&gt;();
+            offsets.put(
+                    new TopicPartition(record.topic(), record.partition()),
+                    new OffsetAndMetadata(record.offset() + 1)
+            );
+
+            ops.sendOffsetsToTransaction(offsets, consumer.groupMetadata());
+
+            return null;
+        });
+    }
+}</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div>
+  <b class="ct">Changes from the notes</b>
+  <ul style="margin:6px 0 0">
+    <li><code>result</code> was used without being declared; it is now set in the PROCESS step.</li>
+    <li><code>record.offset() + 1</code> is correct: the committed offset is always the <strong>next</strong> offset to read.</li>
+    <li>The notes call <code>sendOffsetsToTransaction(offsets, "order-group")</code>. The <code>String</code> group-id overload is deprecated; passing <code>consumer.groupMetadata()</code> (Spring injects the <code>Consumer</code> parameter) also lets the broker fence zombie consumers. The group id must match the listener's group.</li>
+  </ul>
+</div></div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p><strong>Alternative:</strong> instead of calling <code>executeInTransaction</code> yourself, configure the listener container with a <code>KafkaTransactionManager</code>. The container then starts the transaction before calling your listener, any <code>kafkaTemplate.send()</code> inside joins it, and the container sends the offsets to the transaction automatically. Your listener contains only business code.</p></div></div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>Transactional records are always written to the log; COMMIT or ABORT <strong>control records</strong> close each transaction.</li>
+    <li>The <strong>LSO</strong> is the first offset of the oldest open transaction; <code>read_committed</code> consumers never read past it.</li>
+    <li><code>read_uncommitted</code> (default) sees everything except control records; <code>read_committed</code> sees only committed and non-transactional data.</li>
+    <li>Aborted records are filtered <strong>in the consumer</strong>, using the aborted ranges the broker keeps in <code>.txnindex</code>.</li>
+    <li><strong>EOS</strong> = read_committed + idempotence + transaction, with <code>sendOffsetsToTransaction</code> making write + commit atomic.</li>
+  </ul>
+</div></div>

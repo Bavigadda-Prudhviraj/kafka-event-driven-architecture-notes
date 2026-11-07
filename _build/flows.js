@@ -1,0 +1,80 @@
+// Step-through flows rendered by assets/widgets.js (W.steps). Embedded into every page as window.KD_FLOWS.
+// lanes: actors shown as columns. Each step: label, text (caption), optional message arrow from→to (lane index),
+// optional `at` (lanes to highlight), optional `set` {laneIndex: html} = what that lane now holds (persists to later steps),
+// kind: 'ok' | 'bad' | 'b' (styling of the arrow).
+module.exports = {
+  consumerRead: {
+    title: 'Consumer read flow (the 13 steps, request by request)',
+    lanes: [{ name: 'Consumer' }, { name: 'Any broker' }, { name: 'Broker3 · Group Coordinator' }, { name: '__consumer_offsets P23' }, { name: 'Broker2 · Leader order-events P2' }],
+    steps: [
+      { label: 'Start', at: [0], text: 'The consumer starts and wants to join the group <code>notification-service</code>.', set: { 0: 'group.id = notification-service' } },
+      { label: 'Find the offsets partition', at: [0], text: '<code>hash("notification-service") % 50 = 23</code>: the group’s data lives in partition 23 of <code>__consumer_offsets</code>.', set: { 0: 'group.id = notification-service<br>offsets partition = 23' } },
+      { label: 'Metadata', from: 0, to: 1, msg: 'Metadata request', text: 'The consumer asks any bootstrap broker for metadata: which broker leads which partition.' },
+      { label: 'Metadata response', from: 1, to: 0, msg: 'P23 leader = Broker3 · order-events P2 leader = Broker2', kind: 'b', text: 'Now the consumer knows the leader of P23 is Broker3, so Broker3 is its <b>Group Coordinator</b>.', set: { 0: 'coordinator = Broker3' } },
+      { label: 'Join group', from: 0, to: 2, msg: 'JoinGroup (notification-service, topic order-events)', text: 'The consumer asks the Group Coordinator to join the group for topic <code>order-events</code>.' },
+      { label: 'Assignment', at: [2], text: 'The coordinator assigns partitions to members: Consumer1 → P0, Consumer2 → P1, Consumer3 → P2. Our consumer gets <b>Partition-2</b>.', set: { 2: 'C1→P0 · C2→P1 · C3→P2' } },
+      { label: 'Assignment replicated', from: 2, to: 3, msg: 'write group state', text: 'Broker3 waits until the followers of <code>__consumer_offsets</code> P23 have the update (internally like acks=all), then replies.' },
+      { label: 'Assigned', from: 2, to: 0, msg: 'You own order-events P2', kind: 'ok', text: 'The consumer now owns <code>order-events</code> Partition-2.', set: { 0: 'owns order-events P2' } },
+      { label: 'Last committed offset?', from: 0, to: 2, msg: 'OffsetFetch (P2)', text: 'Where did this group stop reading Partition-2?' },
+      { label: 'Look it up', from: 2, to: 3, msg: 'key: group_topic_partition', text: 'The coordinator reads key <code>notificationGroupId_order-events_Partition-2</code> from <code>__consumer_offsets</code>.', set: { 3: 'committed offset = 100' } },
+      { label: 'Offset 100', from: 2, to: 0, msg: 'committed offset = 100', kind: 'b', text: 'Offset 100 has been processed, so reading continues at <b>101</b>.', set: { 0: 'owns order-events P2<br>next offset = 101' } },
+      { label: 'Fetch', from: 0, to: 4, msg: 'Fetch P2 from offset 101 (max bytes …)', text: 'The consumer fetches from the <b>leader</b> of Partition-2, Broker2.' },
+      { label: 'Records', from: 4, to: 0, msg: 'records 101 – 501', kind: 'b', text: 'Broker2 returns records 101–501.' },
+      { label: 'Process', at: [0], text: 'The consumer processes the events (business logic).', set: { 0: 'owns order-events P2<br>processed up to 501' } },
+      { label: 'Commit', from: 0, to: 2, msg: 'OffsetCommit P2 = 501', text: 'After processing, the consumer commits the offset (manual / batch-wise).' },
+      { label: 'Stored', from: 2, to: 3, msg: 'write offset 501', kind: 'ok', text: 'The coordinator writes <code>(group, topic, partition) → 501</code> to P23 and acknowledges.', set: { 3: 'committed offset = 501' } },
+      { label: 'Repeat', at: [0, 4], text: 'Continuous polling: back to the fetch step with offset 502. On a restart, the consumer resumes from 501.' },
+    ],
+  },
+
+  twoPhaseCommit: {
+    title: 'Two-phase commit of a Kafka transaction',
+    lanes: [{ name: 'Producer (order-serv-0)' }, { name: 'Transaction Coordinator' }, { name: '__transaction_state P23' }, { name: 'Broker-1 · order-events P2' }, { name: 'Broker-2 · payment-events P1' }],
+    steps: [
+      { label: 'Begin', at: [0], text: '<code>beginTransaction()</code> — no network call yet. The producer already has PID 5, epoch 0.', set: { 0: 'PID 5 · epoch 0' } },
+      { label: 'Register P2', from: 0, to: 1, msg: 'AddPartitionsToTxn order-events P2', text: 'Before the first write to a partition, the producer registers it with the coordinator.' },
+      { label: 'ONGOING', from: 1, to: 2, msg: 'state ONGOING [order-events P2]', text: 'The coordinator records the transaction as ONGOING with one partition.', set: { 2: 'ONGOING<br>[order-events P2]' } },
+      { label: 'Write order', from: 0, to: 3, msg: 'send(order) · PID 5, epoch 0', text: 'The order record is written to order-events P2 — but read_committed consumers cannot see it yet.', set: { 3: 'order (uncommitted)' } },
+      { label: 'Register P1', from: 0, to: 1, msg: 'AddPartitionsToTxn payment-events P1', text: 'First write to payment-events P1, so it is registered too.', set: { 2: 'ONGOING<br>[order-events P2, payment-events P1]' } },
+      { label: 'Write payment', from: 0, to: 4, msg: 'send(payment) · PID 5, epoch 0', text: 'The payment record is written to payment-events P1.', set: { 4: 'payment (uncommitted)' } },
+      { label: 'Commit', from: 0, to: 1, msg: 'EndTxn(COMMIT)', text: '<code>commitTransaction()</code> asks the coordinator to commit.' },
+      { label: 'Phase 1: PREPARE', from: 1, to: 2, msg: 'PREPARE_COMMIT', kind: 'bad', text: '<b>Point of no return.</b> Once PREPARE_COMMIT is replicated to all ISR of P23, the commit will finish no matter what — even if brokers crash.', set: { 2: 'PREPARE_COMMIT' } },
+      { label: 'Phase 2: marker', from: 1, to: 3, msg: 'COMMIT marker', kind: 'ok', text: 'The coordinator writes a COMMIT <b>control record</b> into order-events P2.', set: { 3: 'order + COMMIT marker ✓' } },
+      { label: 'Phase 2: marker', from: 1, to: 4, msg: 'COMMIT marker', kind: 'ok', text: '…and into payment-events P1. Both records are now visible to read_committed consumers — together.', set: { 4: 'payment + COMMIT marker ✓' } },
+      { label: 'Complete', from: 1, to: 2, msg: 'COMPLETE_COMMIT', kind: 'ok', text: 'All markers are written; the coordinator records the final state.', set: { 2: 'COMPLETE_COMMIT' } },
+      { label: 'Done', from: 1, to: 0, msg: 'success', kind: 'ok', text: 'The producer gets success (in the real protocol, as soon as PREPARE_COMMIT is durable). Abort works the same way, with ABORT markers.' },
+    ],
+  },
+
+  zombieFencing: {
+    title: 'Zombie fencing with PID + epoch',
+    lanes: [{ name: 'Producer1 (txn T1)' }, { name: 'Transaction Coordinator' }, { name: 'Producer2 (txn T1)' }],
+    steps: [
+      { label: 'Init', from: 0, to: 1, msg: 'InitProducerId("T1")', text: 'Producer1 starts with <code>transactional.id = T1</code>.' },
+      { label: 'PID + epoch', from: 1, to: 0, msg: 'PID 5, epoch 0', kind: 'b', text: 'The coordinator maps T1 → PID 5, epoch 0.', set: { 0: 'PID 5 · epoch 0', 1: 'T1: PID 5 · epoch 0 · EMPTY' } },
+      { label: 'Transaction', from: 0, to: 1, msg: 'begin · send(order-events P0, payment-events P2)', text: 'Producer1 begins a transaction and writes to two partitions.', set: { 1: 'T1: PID 5 · epoch 0 · ONGOING' } },
+      { label: 'Pause', at: [0], kind: 'bad', text: 'Producer1 hits a long GC pause or network partition. It is considered dead.', set: { 0: 'PID 5 · epoch 0<br>⏸ frozen' } },
+      { label: 'Replacement', from: 2, to: 1, msg: 'InitProducerId("T1")', text: 'A new instance, Producer2, starts with the <b>same</b> transactional.id T1.' },
+      { label: 'Fence', at: [1], text: 'The coordinator finds T1, <b>aborts</b> the open transaction and <b>bumps the epoch</b> to 1.', set: { 1: 'T1: PID 5 · epoch 1 · EMPTY<br>old txn ABORTED' } },
+      { label: 'New epoch', from: 1, to: 2, msg: 'PID 5, epoch 1', kind: 'b', text: 'Producer2 gets the same PID but the new epoch.', set: { 2: 'PID 5 · epoch 1' } },
+      { label: 'Zombie wakes up', from: 0, to: 1, msg: 'COMMIT (PID 5, epoch 0)', text: 'Producer1 resumes and tries to commit its old transaction.', set: { 0: 'PID 5 · epoch 0 (zombie)' } },
+      { label: 'Rejected', from: 1, to: 0, msg: 'ProducerFencedException', kind: 'bad', text: 'Epoch 0 is older than the current epoch 1 → the zombie is <b>fenced</b>. Its writes are never committed, so there are no duplicates.' },
+      { label: 'Safe', from: 2, to: 1, msg: 'begin / send / commit (epoch 1)', kind: 'ok', text: 'Only Producer2 can write for T1 now. This is why every instance needs its own <b>stable</b> transactional.id.' },
+    ],
+  },
+
+  windowGrace: {
+    title: 'A tumbling window closing — with and without grace',
+    lanes: [{ name: 'Arriving record' }, { name: 'Stream time' }, { name: 'Window [10:30, 10:35) · no grace' }, { name: 'Same window · grace 10 min' }],
+    steps: [
+      { label: 'Record 10:31', from: 0, to: 2, msg: '10:31 → [10:30, 10:35)', text: 'Window size 5 min. The record at 10:31 opens window [10:30, 10:35) in both setups.', set: { 0: 'record @ 10:31', 1: '10:31', 2: 'count 1 · open', 3: 'count 1 · open until 10:45' } },
+      { label: 'Record 10:32', from: 0, to: 2, msg: '10:32 → same window', text: 'Still inside the window: both counts become 2.', set: { 0: 'record @ 10:32', 1: '10:32', 2: 'count 2 · open', 3: 'count 2 · open until 10:45' } },
+      { label: 'Record 10:41', at: [0, 1], text: 'A record at 10:41 belongs to [10:40, 10:45). Stream time jumps to <b>10:41</b>.', set: { 0: 'record @ 10:41', 1: '10:41' } },
+      { label: 'Window closes', at: [2], kind: 'bad', text: 'Without grace, the window closes when stream time ≥ window end (10:35). 10:41 ≥ 10:35 → <b>closed</b>.', set: { 2: 'count 2 · CLOSED' } },
+      { label: 'Grace keeps it open', at: [3], text: 'With 10 min grace it closes only at 10:35 + 10 = <b>10:45</b>. Stream time 10:41 &lt; 10:45 → still open.', set: { 3: 'count 2 · open until 10:45' } },
+      { label: 'Late record 10:33', from: 0, to: 2, msg: '10:33 (late)', kind: 'bad', text: 'A delayed record with timestamp 10:33 arrives. Stream time stays 10:41 (it never goes back). Without grace its window is closed → <b>dropped</b>.', set: { 0: 'late record @ 10:33', 2: 'count 2 · CLOSED · 10:33 dropped' } },
+      { label: 'Accepted with grace', from: 0, to: 3, msg: '10:33 (late)', kind: 'ok', text: 'With grace the window is still open → the late record is <b>counted</b>: count 3.', set: { 3: 'count 3 · open until 10:45' } },
+      { label: 'Finally closed', at: [1, 3], text: 'When stream time reaches 10:45, this window closes too; anything later for it is dropped. Grace trades a later final result for fewer lost late records.', set: { 1: '≥ 10:45', 3: 'count 3 · CLOSED' } },
+    ],
+  },
+};

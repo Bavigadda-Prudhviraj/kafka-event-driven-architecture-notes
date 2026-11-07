@@ -1,0 +1,779 @@
+<!--meta
+{
+  "lead": "The dual-write problem — saving to a database and publishing to Kafka are two independent writes with no transaction spanning both — why @Transactional tricks and 2PC do not fix it, and how the Outbox pattern does. Build both variants end to end: a polling publisher with Spring @Scheduled, and Change Data Capture with Postgres logical WAL, Debezium in Kafka Connect and the EventRouter transform.",
+  "date": "Tuesday, 28 April 2026",
+  "related": [
+    { "n": 10, "why": "Kafka transactions — atomic across Kafka topics, but not across a database." },
+    { "n": 5, "why": "Idempotent producers; outbox consumers must be idempotent too." },
+    { "n": 3, "why": "The controllers and brokers that Kafka Connect and Debezium run against." },
+    { "n": 1, "why": "Event-driven architecture and why services communicate through events." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="problem"><span class="sec-num">1</span>The Problem: Dual Writes</h2>
+<p>Before going deep into this EDA pattern, let's first understand the problem:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderController.java — the naive version</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@PostMapping("/api/orders")
+public ResponseEntity&lt;String&gt; createOrder(@RequestBody Order order) {
+
+    // Step1: Save to Database
+    orderRepository.save(order);
+
+    // Step2: Publish event to Kafka
+    kafkaTemplate.send("order-events", order.getOrderId(), order);
+
+    return ResponseEntity.ok("Order created");
+}</code></pre>
+</div>
+<div class="callout danger"><span class="ci">&#10060;</span><div><p><strong>Major flaw:</strong> we are writing to <strong>2 separate, independent systems</strong> — a) the DB and b) Kafka — and there is <strong>no transaction that spans both</strong>.</p></div></div>
+<div class="vs">
+  <div class="side a">
+    <h4>Scenario 1: DB succeeds, Kafka fails</h4>
+    <div class="sb">
+<pre class="mini"><code>orderRepository.save(order);        // Saved to DB
+kafkaTemplate.send("order-events"); // Kafka is down</code></pre>
+      <ul>
+        <li>The order exists in the DB, but <strong>no event</strong> is published.</li>
+        <li>The payment service is never notified.</li>
+        <li>Inventory is never decremented.</li>
+      </ul>
+      <p>This is <strong>data inconsistency</strong>.</p>
+    </div>
+  </div>
+  <div class="side b">
+    <h4>Scenario 2: Kafka succeeds, DB fails</h4>
+    <div class="sb">
+<pre class="mini"><code>kafkaTemplate.send("order-events"); // Kafka event published
+orderRepository.save(order);        // DB connection lost</code></pre>
+      <ul>
+        <li>The event is published, but the order does <strong>not</strong> exist in the DB.</li>
+        <li>The payment service processes a non-existent order.</li>
+        <li>Inventory is decremented for an order that does not exist.</li>
+      </ul>
+      <p>Also <strong>data inconsistency</strong>, with even more impact than scenario 1.</p>
+    </div>
+  </div>
+</div>
+<p>This is known as the <strong>DUAL WRITE problem</strong>. In interviews, two solutions are commonly suggested. Neither works.</p>
+
+<h3 id="transactional-trick">Attempt 1: @Transactional + manual exception</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">rollback the DB if Kafka fails</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Transactional
+public void createOrder(OrderRequest request) {
+
+    // Step 1: DB write
+    orderRepository.save(order);
+
+    try {
+        // Step 2: Kafka send in a try-catch; if Kafka fails, the DB is also rolled back
+        kafkaTemplate.send("order-events", event).get();
+    }
+    catch (Exception e) {
+        throw new RuntimeException("Kafka failed, rolling back!"); // rolls back DB
+    }
+}</code></pre>
+</div>
+<p>This looks correct at first glance. The loophole: what if the Kafka publish <strong>succeeded</strong>, but we <strong>think it failed</strong>?</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">The lost-ACK timeline</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant App as Our app (@Transactional)
+    participant DB as Database
+    participant K as Kafka broker
+    App->>DB: 10:00 DB write → success (not yet committed)
+    App->>K: 10:05 kafkaTemplate.send()
+    Note over K: 10:06 receives message → WRITES to partition
+    K--xApp: 10:07 ACK sent · 10:08 NETWORK ISSUE, ACK lost
+    Note over App: 10:09 "I never got ACK → must have failed"
+    App->>DB: 10:10 throw RuntimeException → rollback
+    Note over DB,K: DB: order does NOT exist (rolled back) &lt;br/&gt; Kafka: order event EXISTS
+</div>
+  </div>
+  <div class="diagram-explain"><p>We end up in scenario 2 — the worse one. The application simply cannot tell “Kafka failed” apart from “Kafka succeeded but the answer got lost”.</p></div>
+</div>
+
+<h3 id="two-pc">Attempt 2: 2PC (Two-Phase Commit)</h3>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">What 2PC would need</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+sequenceDiagram
+    participant C as Coordinator
+    participant DB as DB
+    participant K as Kafka
+    Note over C,K: Phase 1: PREPARE
+    C->>DB: PREPARE
+    DB-->>C: Yes, ready
+    C->>K: PREPARE
+    K-->>C: Yes, ready (✗ not supported)
+    Note over C,K: Phase 2: COMMIT
+    C->>DB: COMMIT
+    C->>K: COMMIT
+    Note over DB,K: DB: COMMITTED · KAFKA: COMMITTED
+</div>
+  </div>
+  <div class="diagram-explain"><p>This might look like a solution. But for 2PC to work, <strong>all participants</strong> must understand the protocol, and <strong>Kafka does not support 2PC</strong> (XA): it does not understand PREPARE / COMMIT commands from an external coordinator. So its pros and cons do not even matter. Kafka's own transactions (<a href="10-transactions-producer.html">Transactions (Producer)</a>) are atomic only across Kafka partitions, not across a database.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="outbox"><span class="sec-num">2</span>Solution: The Outbox Pattern</h2>
+<div class="callout key"><span class="ci">&#128161;</span><div>
+  <b class="ct">The idea</b>
+  <ul style="margin:6px 0 0">
+    <li><strong>Don't write directly to Kafka.</strong></li>
+    <li>Write to the <strong>DB first</strong> — the business row <em>and</em> the event, in <strong>one local DB transaction</strong>.</li>
+    <li>A <strong>separate process</strong> reads the event from the DB and publishes it to Kafka.</li>
+  </ul>
+</div></div>
+<div class="grid grid-2" style="align-items:center">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">one DB transaction</span><span class="lang">java</span></div>
+<pre><code data-lang="java">@Transactional
+public void createOrder(OrderRequest request) {
+
+    // Step 1: Order DB table write
+    orderRepository.save(order);
+
+    // Step 2: Event details stored in a DB table first,
+    //         known as the Outbox Table
+    outboxTableRepository.save(eventDetails);
+}</code></pre>
+  </div>
+  <div class="mermaid">
+flowchart TD
+    A["@Transactional createOrder"] --> DB["DB · Order table + Outbox table"]
+    DB --> P["Separate process reads the Outbox table"]
+    P --> K["Publish to Kafka"]
+    K --> M["Mark the row PUBLISHED, or delete it"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef k fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class A,DB,P,M step
+    class K k
+  </div>
+</div>
+<p>Both rows commit or roll back together, because they are in the same database. If Kafka is down, the event simply waits in the outbox table until the publisher can deliver it.</p>
+
+<h3 id="schema">Outbox table schema</h3>
+<p>It is just a regular DB table in our application, containing the columns required to publish an event. The most common schema:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Id</th><th>Aggregate_type</th><th>Event_type</th><th>Aggregate_id</th><th>Payload</th><th>Created_At</th><th>Is_published</th></tr></thead>
+    <tbody><tr><td>101</td><td>Order</td><td>ORDER_CREATED</td><td>ORD-1</td><td>{...}</td><td>…</td><td>false</td></tr></tbody>
+  </table>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Column</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>Id</code></td><td>Unique id of this event. The same event can be published more than once, so consumers use it for <strong>idempotency</strong>.</td></tr>
+      <tr><td><code>Aggregate_type</code></td><td>Which entity the event is about, like <code>ORDER</code> or <code>PAYMENT</code>. Used to decide <strong>which Kafka topic</strong> to publish to.</td></tr>
+      <tr><td><code>Event_type</code></td><td>What happened to the entity: <code>ORDER_CREATED</code>, <code>ORDER_CANCELLED</code>, etc.</td></tr>
+      <tr><td><code>Aggregate_id</code></td><td>Used as the <strong>message key</strong>, so all events of one entity go to the same partition. This plays a major role in maintaining <strong>order</strong>.</td></tr>
+      <tr><td><code>Payload</code></td><td>The actual data.</td></tr>
+      <tr><td><code>Created_At</code></td><td>When the event was created.</td></tr>
+      <tr><td><code>Is_published</code> (optional)</td><td><code>false</code> → not yet sent to Kafka · <code>true</code> → sent, can be cleaned up later.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>The outbox table is consumed in <strong>2 ways</strong>:</p>
+<ol class="steps">
+  <li><strong><a href="#polling">Polling</a></strong> — the <code>Is_published</code> column is required.</li>
+  <li><strong><a href="#cdc">CDC (Change Data Capture)</a></strong> — the <code>Is_published</code> column is not required.</li>
+</ol>
+
+<!-- ======================================================= -->
+<h2 id="polling"><span class="sec-num">3</span>Approach 1: Polling Publisher</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Polling</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    T["Outbox table"] -- "polls regularly, looks for unpublished events" --> P["Poller"]
+    P --> K["Kafka"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef k fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class T,P step
+    class K k
+</div>
+  </div>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderController.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    @Autowired
+    private OrderService orderService;
+
+    @PostMapping
+    public String createOrder(@RequestBody Order order) {
+        orderService.createOrder(order);
+        return "Order created";
+    }
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderRepository.java / OutboxRepository.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Repository
+public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+}
+
+@Repository
+public interface OutboxRepository extends JpaRepository&lt;OutboxEvent, String&gt; {
+
+    @Query(value = """
+            SELECT * FROM outbox_events
+            WHERE published = false
+            ORDER BY created_at ASC
+            LIMIT :batchSize
+            """, nativeQuery = true)
+    List&lt;OutboxEvent&gt; findUnpublishedEvents(int batchSize);
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderService.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Service
+public class OrderService {
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Autowired
+    private OutboxRepository outboxRepository;
+
+    @Transactional
+    public Order createOrder(Order order) {
+
+        // Step 1: save to orders table
+        Order savedOrder = orderRepository.save(order);
+
+        // Step 2: Create outbox event IN THE SAME TRANSACTION
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setAggregateType("Order");
+        outboxEvent.setAggregateId(savedOrder.getOrderId());
+        outboxEvent.setEventType("ORDER_CREATED");
+
+        // Payload: JSON string of the event data
+        String payload = String.format(
+                "{\"orderId\":\"%s\"," +
+                "\"quantity\":%d," +
+                "\"totalAmount\":%.2f}",
+                savedOrder.getOrderId(),
+                savedOrder.getQuantity(),
+                savedOrder.getTotalAmount()
+        );
+        outboxEvent.setPayload(payload);
+        outboxRepository.save(outboxEvent);
+        return savedOrder;
+    }
+}</code></pre>
+</div>
+<p>No Kafka publish here: only DB tables are touched, so both writes can be part of <strong>one transaction</strong>. In real code, build the payload with an <code>ObjectMapper</code> instead of <code>String.format</code>, which does not escape quotes in values.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">Order.java (Entity)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "order_id")
+    private String orderId;
+
+    @Column
+    private Integer quantity;
+
+    @Column(name = "total_amount")
+    private Double totalAmount;
+
+    // Getters and Setters
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OutboxEvent.java (Entity)</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Entity
+@Table(name = "outbox_events")
+public class OutboxEvent {
+
+    @Id
+    @Column
+    private String id;
+
+    @Column(name = "aggregate_type", nullable = false)
+    private String aggregateType;
+
+    @Column(name = "aggregate_id", nullable = false)
+    private String aggregateId;
+
+    @Column(name = "event_type", nullable = false)
+    private String eventType;
+
+    @Column(nullable = false, columnDefinition = "TEXT")
+    private String payload;
+
+    @Column(nullable = false)
+    private boolean published;
+
+    @Column(name = "created_at", nullable = false)
+    private Instant createdAt;
+
+    @Column(name = "published_at")
+    private Instant publishedAt;
+
+    public OutboxEvent() {
+        this.id = UUID.randomUUID().toString();
+        this.published = false;
+        this.createdAt = Instant.now();
+    }
+
+    // --- Getters and Setters ---
+}</code></pre>
+  </div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8085
+spring.application.name=outbox-polling-demo
+
+# PostgreSQL Connection
+spring.datasource.url=jdbc:postgresql://localhost:5432/orderdb
+spring.datasource.username=postgres
+spring.datasource.password=postgres
+spring.datasource.driver-class-name=org.postgresql.Driver
+
+# JPA / Hibernate
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
+
+# Kafka Producer Config
+spring.kafka.bootstrap-servers=localhost:9092
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.acks=all
+
+# Outbox Poller Config (custom property)
+outbox.polling.interval-ms=2000
+outbox.polling.batch-size=10</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Port <strong>8085</strong> is also the Schema Registry port from <a href="12-schema-registry.html">Schema Registry</a>; use another port if both run at once. <code>@Scheduled</code> only runs when <code>@EnableScheduling</code> is on a configuration class.</p></div></div>
+
+<h3 id="poller">The poller</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OutboxPoller.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OutboxPoller {
+
+    @Autowired
+    private OutboxRepository outboxRepository;
+
+    @Autowired
+    private KafkaTemplate&lt;String, String&gt; kafkaTemplate;
+
+    @Value("${outbox.polling.batch-size}")
+    private int batchSize;
+
+    @Scheduled(fixedRateString = "${outbox.polling.interval-ms}")
+    @Transactional
+    public void pollAndPublish() {
+
+        // Step 1: Fetch unpublished events
+        List&lt;OutboxEvent&gt; events = outboxRepository.findUnpublishedEvents(batchSize);
+        if (events.isEmpty()) {
+            return;
+        }
+
+        for (OutboxEvent event : events) {
+            try {
+                String topic = event.getAggregateType().toLowerCase() + "-events";
+                kafkaTemplate.send(topic, event.getAggregateId(), event.getPayload())
+                             .get();
+                event.setPublished(true);
+                event.setPublishedAt(Instant.now());
+                outboxRepository.save(event);
+            }
+            catch (Exception e) {
+                // BREAK to preserve ordering!
+                // If event 1 fails, we must NOT skip to event 2
+                break;
+            }
+        }
+    }
+}</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">One poll cycle</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    S["@Scheduled: runs every 2 s (outbox.polling.interval-ms)"] --> F["Fetch up to 10 unpublished events, oldest first (batch-size)"]
+    F --> E{"Any events?"}
+    E -- "No" --> R["Return"]
+    E -- "Yes" --> L["Next event: topic = aggregateType + '-events', key = aggregateId"]
+    L --> P{"send().get() OK?"}
+    P -- "Yes" --> U["published = true, publishedAt = now"]
+    U --> L
+    P -- "No" --> B["BREAK: keep order, retry on next run"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    class S,F,E,L,P step
+    class U,R ok
+    class B bad
+</div>
+  </div>
+  <div class="diagram-explain">
+    <ul>
+      <li>The poller job runs every <strong>2 seconds</strong>; the interval comes from the properties file.</li>
+      <li>In one go it fetches <strong>10 records</strong>; the batch size also comes from the properties file.</li>
+      <li>For each event: publish to Kafka, then update the published status to <code>true</code>.</li>
+      <li>The <strong>break is important</strong>: if event 1 failed, we must not go on to publish event 2, event 3 and so on, because that would break ordering.</li>
+    </ul>
+    <p>This scheduler is just one example of a poller. A separate application could equally keep polling the outbox table and call the publisher.</p>
+  </div>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>With <code>Order</code> as the aggregate type, <code>"Order".toLowerCase() + "-events"</code> gives the topic <code>order-events</code>. <code>@Transactional</code> on the poller means the <code>published = true</code> updates are committed only when the whole batch finishes, so a crash mid-batch re-publishes those events on the next run. That is one more reason the consumer must be idempotent.</p></div></div>
+
+<h3 id="polling-cons">Disadvantages of polling</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>#</th><th>Problem</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>Multi-instance handling</strong></td><td>Multiple instances mean multiple pollers, which can cause:<br>• <strong>Duplicate processing</strong> of rows — needs locking like <code>SELECT … FOR UPDATE SKIP LOCKED</code>.<br>• <strong>Ordering risk</strong> — two pollers picking different rows can break ordering.<br>• To preserve ordering across instances, use a technique like <strong>ShedLock</strong> (only one instance runs the job at a time).</td></tr>
+      <tr><td>2</td><td><strong>Polling gap</strong></td><td>Event created at 10:00:00, but the poll runs at 10:00:02 → a 2 s delay.</td></tr>
+      <tr><td>3</td><td><strong>Constant DB load</strong></td><td>Even with no events, the poller keeps querying the DB: extra CPU + IO overhead.</td></tr>
+      <tr><td>4</td><td><strong>DB clean-up</strong></td><td>The outbox table must be cleaned up regularly, because it grows rapidly.</td></tr>
+      <tr><td>5</td><td><strong>Duplicate publishing</strong></td><td>The event is published to Kafka, but the <code>published = true</code> update fails. On the next run the same event is published again, so the <strong>consumer must be IDEMPOTENT</strong>.</td></tr>
+    </tbody>
+  </table>
+</div>
+<p>A more scalable solution is <strong>CDC (Change Data Capture)</strong>.</p>
+
+<!-- ======================================================= -->
+<h2 id="cdc"><span class="sec-num">4</span>Approach 2: CDC with Debezium</h2>
+<div class="callout key"><span class="ci">&#128225;</span><div><p><strong>CDC</strong> says: <em>don't ask the database for changes — the database will tell you.</em> <strong>Debezium</strong> is a tool that implements CDC.</p></div></div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <h4>WAL (Write-Ahead Logging) in Postgres</h4>
+    <ul>
+      <li>Before an INSERT / UPDATE / DELETE, the change is first written to the <strong>WAL file</strong> and flushed to disk. Then the table is updated.</li>
+      <li>This helps Postgres with <strong>recovery</strong>.</li>
+      <li>The same WAL is used for <strong>replication to followers</strong>.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>MySQL: the binlog</h4>
+    <p>MySQL uses its <strong>binlog</strong> file for replication in the same way.</p>
+    <p>CDC simply reads <strong>these log files</strong> from the DB, so tables are never queried.</p>
+  </div>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">CDC outbox architecture</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:cdcArchitecture-->
+  </div>
+</div>
+
+<h3 id="cdc-step1">Step 1: Install Postgres and enable logical WAL</h3>
+<p>Download Postgres from <code>https://www.postgresql.org/download/</code>. <strong>pgAdmin</strong> (a UI for Postgres) comes with it. The installer asks for a password; use the same one in pgAdmin:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>pgAdmin “Let's connect to the server”</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Server Name</td><td>LocalPostgres</td></tr>
+      <tr><td>Host name/address</td><td>localhost</td></tr>
+      <tr><td>Port</td><td>5432</td></tr>
+      <tr><td>Database / User</td><td>postgres / postgres</td></tr>
+      <tr><td>Password</td><td>the one chosen during install</td></tr>
+      <tr><td>Connection parameters</td><td>sslmode = prefer · connect_timeout = 10</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code terminal" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">psql — before</span><span class="lang">sql</span></div>
+<pre><code data-lang="text">postgres=# SHOW wal_level;
+ wal_level
+-----------
+ replica
+(1 row)
+
+postgres=# ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM</code></pre>
+  </div>
+  <div class="code terminal" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">psql — after restarting Postgres</span><span class="lang">sql</span></div>
+<pre><code data-lang="text">psql (18.2, server 16.13)
+Type "help" for help.
+
+postgres=# SHOW wal_level;
+ wal_level
+-----------
+ logical
+(1 row)</code></pre>
+  </div>
+</div>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">restart Postgres — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ brew services restart postgresql@16
+$ sudo systemctl restart postgresql</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">restart Postgres — Windows (Command Prompt as Administrator)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; net stop postgresql-x64-16
+&gt; net start postgresql-x64-16</code></pre>
+</div>
+</div>
+<p>On macOS use the <code>brew</code> line (Homebrew install) and on Linux the <code>systemctl</code> line. On Windows the service name includes the major version; check it in <em>services.msc</em>.</p>
+<div class="vs">
+  <div class="side a">
+    <h4>wal_level = replica</h4>
+    <div class="sb"><p>The WAL stores physical changes in binary form, e.g. <em>page 5, offset 120 → changed from X to Y</em>. That is of no use to CDC, which needs to know <strong>which table, which column</strong>, etc.</p></div>
+  </div>
+  <div class="side b">
+    <h4>wal_level = logical</h4>
+    <div class="sb"><p>Still binary, plus <strong>extra metadata for decoding</strong>: <em>Table = order, Row id = 1, column “Amount” changed from 100 to 200</em>. Now CDC can publish proper events. Changing <code>wal_level</code> needs a <strong>restart</strong>.</p></div>
+  </div>
+</div>
+
+<h3 id="cdc-step2">Steps 2–4: Database, tables and publication</h3>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">SQL (pgAdmin query tool)</span><span class="lang">sql</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="text">-- Step 2: Create our DB
+CREATE DATABASE outbox_cdc;
+
+-- Step 3: Create our tables (connect to outbox_cdc first)
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(255) UNIQUE NOT NULL,
+    quantity INT NOT NULL,
+    total_amount DOUBLE PRECISION NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE outbox_events (
+    id VARCHAR(36) PRIMARY KEY,
+    aggregate_type VARCHAR(255) NOT NULL,
+    aggregate_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Step 4: Create Publication
+CREATE PUBLICATION cdc_publication FOR TABLE public.outbox_events;</code></pre>
+</div>
+<p>Note there is <strong>no <code>published</code> column</strong> — CDC does not need it. With the publication, PostgreSQL now knows:</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Change</th><th>In publication?</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>INSERT into <code>orders</code></td><td>No</td><td>skip</td></tr>
+      <tr><td>INSERT into <code>outbox_events</code></td><td>Yes</td><td><strong>stream it</strong></td></tr>
+      <tr><td>UPDATE <code>users</code></td><td>No</td><td>skip</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="cdc-step5">Step 5: Add the Debezium plugin to Kafka Connect</h3>
+<p>Download <code>debezium-connector-postgres-3.5.0.Final-plugin.tar.gz</code> from <code>https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/3.5.0.Final/</code> and extract it into a <code>plugins</code> folder inside the Kafka directory:</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka_2.13-4.2.0/</span><span class="lang">text</span></div>
+<pre><code data-lang="text">kafka_2.13-4.2.0/
+├── bin/
+├── config/
+├── libs/
+├── LICENSE
+├── licenses/
+├── logs/
+├── NOTICE
+├── plugins/
+│   └── debezium-connector-postgres/
+└── site-docs/</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka_2.13-4.2.0/config/</span><span class="lang">text</span></div>
+<pre><code data-lang="text">broker.properties  broker1/2/3.properties
+connect-console-sink.properties
+connect-console-source.properties
+connect-distributed.properties
+connect-file-sink.properties
+connect-file-source.properties
+connect-log4j2.yaml
+connect-mirror-maker.properties
+connect-standalone.properties          ← edit
+consumer.properties
+controller.properties  controller1/2.properties
+debezium-postgres-connector.properties ← create
+log4j2.yaml  producer.properties
+server.properties  tools-log4j2.yaml  trogdor.conf</code></pre>
+  </div>
+</div>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">extract the plugin — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ mkdir -p plugins
+$ tar -xzf debezium-connector-postgres-3.5.0.Final-plugin.tar.gz -C plugins</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">extract the plugin — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; mkdir plugins
+&gt; tar -xzf debezium-connector-postgres-3.5.0.Final-plugin.tar.gz -C plugins</code></pre>
+</div>
+</div>
+<p>Then point Kafka Connect at that folder in <code>config/connect-standalone.properties</code>:</p>
+<div class="os-tabs">
+<div class="code" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">connect-standalone.properties — macOS / Linux</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">plugin.path=/Users/&lt;you&gt;/Downloads/kafka_2.13-4.2.0/plugins</code></pre>
+</div>
+<div class="code" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">connect-standalone.properties — Windows</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">plugin.path=C:/kafka_2.13-4.2.0/plugins</code></pre>
+</div>
+</div>
+
+<h3 id="connector-config">Step 6: The connector configuration</h3>
+<p>The last part connects the Debezium plugin to the DB. Create <code>config/debezium-postgres-connector.properties</code>:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">config/debezium-postgres-connector.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># unique name for this connector
+name=outbox-connector
+# Which Debezium plugin to use (Postgres, MySql etc.)
+connector.class=io.debezium.connector.postgresql.PostgresConnector
+# Database connection
+database.hostname=localhost
+database.port=5432
+database.user=postgres
+database.password=cdctest
+database.dbname=outbox_cdc
+# {prefix}.{schema}.{table}
+topic.prefix=cdc
+# Only watch the outbox_events table (ignore orders table)
+table.include.list=public.outbox_events
+# Replication slot name (Postgres will create this)
+slot.name=debezium_slot
+# Postgres uses this plugin to decode the WAL before it sends it to Debezium
+plugin.name=pgoutput
+# Start with a snapshot of existing data, then stream
+snapshot.mode=initial
+publication.autocreate.mode=disabled
+publication.name=cdc_publication
+# any name we can give to the transform: event router
+transforms=outbox
+# debezium built-in class for event routing
+transforms.outbox.type=io.debezium.transforms.outbox.EventRouter
+# unique field in outbox_events table, used as the Kafka message id
+transforms.outbox.table.field.event.id=id
+# which column to use for the key
+transforms.outbox.table.field.event.key=aggregate_id
+# which column to use for the payload
+transforms.outbox.table.field.event.payload=payload
+# read column aggregate_type
+transforms.outbox.route.by.field=aggregate_type
+# in the topic name, we can add a suffix
+transforms.outbox.route.topic.replacement=${routedByValue}-events</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">What the EventRouter does with one outbox row</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    R["outbox_events row · id evt-005 · aggregate_type Order · aggregate_id ORD-055 · payload {...}"] --> E["EventRouter (SMT)"]
+    E --> T["Topic: routedByValue + '-events' = order-events"]
+    E --> K["Key: aggregate_id = ORD-055"]
+    E --> V["Value: payload column"]
+    E --> H["Header 'id': evt-005"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sr fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    class R,T,K,V,H step
+    class E sr
+</div>
+  </div>
+  <div class="diagram-explain"><p>Without the transform, Debezium would publish a large change-event envelope (<code>before</code>/<code>after</code>/<code>source</code>…) to a topic named <code>{topic.prefix}.{schema}.{table}</code> = <code>cdc.public.outbox_events</code>. The EventRouter turns each outbox row into a clean business event on the topic named by <code>aggregate_type</code>. In the demo below, the row with <code>aggregate_type = 'Order'</code> lands in <code>order-events</code>; if your topic names are case-sensitive, store the aggregate type exactly as the topic should read (e.g. <code>order</code>).</p></div>
+</div>
+
+<h3 id="cdc-start">Step 7: Start everything</h3>
+<p>When Kafka Connect starts, Debezium registers itself <strong>at runtime as a replication follower</strong> of Postgres, using the replication protocol. Start, in order:</p>
+<ol class="steps">
+  <li>The controllers</li>
+  <li>The brokers</li>
+  <li>Kafka Connect, with the Debezium connector</li>
+</ol>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">start Kafka Connect — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/connect-standalone.sh config/connect-standalone.properties config/debezium-postgres-connector.properties</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">start Kafka Connect — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\connect-standalone.bat config\connect-standalone.properties config\debezium-postgres-connector.properties</code></pre>
+</div>
+</div>
+
+<h3 id="demo">Demo</h3>
+<p>Insert a row into the outbox table:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">pgAdmin query</span><span class="lang">sql</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="text">INSERT INTO outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
+VALUES ('evt-005', 'Order', 'ORD-055', 'ORDER_CREATED',
+        '{"orderId":"ORD-055","customerId":"CUST-001","amount":299.99}');</code></pre>
+</div>
+<p>It is <strong>published to Kafka in topic <code>order-events</code></strong> without any application code:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">check the topic — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ bin/kafka-dump-log.sh --deep-iteration --print-data-log --files /tmp/broker1-logs/order-events-0/00000000000000000000.log</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">check the topic — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; bin\windows\kafka-dump-log.bat --deep-iteration --print-data-log --files C:/kafka-data/broker1-logs/order-events-0/00000000000000000000.log</code></pre>
+</div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">kafka-dump-log output</span><span class="lang">log</span></div>
+<pre><code data-lang="log">Dumping /tmp/broker1-logs/order-events-0/00000000000000000000.log
+Log starting offset: 0
+baseOffset: 0 lastOffset: 0 count: 1 baseSequence: -1 lastSequence: -1 producerId: -1 producerEpoch: -1 partitionLeaderEpoch: 0 isTransactional: false isControl: false deleteHorizonMs: OptionalLong.empty position: 0 CreateTime: 1777473454277 size: 163 magic: 2 compresscodec: none crc: 213752922 isvalid: true
+| offset: 0 CreateTime: 1777473454277 keySize: 9 valueSize: 73 sequence: -1 headerKeys: [id] key: "ORD-055" payload: "{\"orderId\":\"ORD-055\",\"customerId\":\"CUST-001\",\"amount\":299.99}"</code></pre>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Log field</th><th>Came from</th></tr></thead>
+    <tbody>
+      <tr><td><code>key: "ORD-055"</code></td><td><code>aggregate_id</code> (<code>table.field.event.key</code>)</td></tr>
+      <tr><td><code>payload: "{\"orderId\":…}"</code></td><td><code>payload</code> column (<code>table.field.event.payload</code>)</td></tr>
+      <tr><td><code>headerKeys: [id]</code></td><td><code>id</code> column → header <code>id = evt-005</code> (<code>table.field.event.id</code>), for consumer idempotency</td></tr>
+      <tr><td>topic <code>order-events</code></td><td><code>aggregate_type</code> + <code>-events</code> (<code>route.by.field</code> / <code>route.topic.replacement</code>)</td></tr>
+      <tr><td><code>producerId: -1</code></td><td>Kafka Connect's producer is not idempotent / transactional here</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>Key and payload appear as <strong>quoted JSON strings</strong> because Kafka Connect's default <code>JsonConverter</code> writes them as JSON string values. Setting <code>key.converter</code> / <code>value.converter</code> to <code>org.apache.kafka.connect.storage.StringConverter</code> in <code>connect-standalone.properties</code> publishes the raw text instead.</p></div></div>
+
+<div class="vs">
+  <div class="side a">
+    <h4>Polling</h4>
+    <div class="sb"><ul><li>Simple, only application code</li><li>Needs <code>published</code> column and clean-up</li><li>Polling delay + constant DB queries</li><li>Hard with multiple instances (locks, ShedLock)</li></ul></div>
+  </div>
+  <div class="side b">
+    <h4>CDC (Debezium)</h4>
+    <div class="sb"><ul><li>Near real time, reads the WAL — no table polling</li><li>No <code>published</code> column</li><li>Ordering preserved by the log itself</li><li>Extra infrastructure: logical WAL, Kafka Connect, Debezium</li></ul></div>
+  </div>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p>Both approaches are <strong>at-least-once</strong>: after a crash, a poller or Debezium can publish an event again. Consumers must deduplicate, for example using the event <code>id</code>. Also, a replication slot keeps WAL on disk until Debezium confirms it, so a stopped connector makes the Postgres WAL grow; drop unused slots.</p></div></div>

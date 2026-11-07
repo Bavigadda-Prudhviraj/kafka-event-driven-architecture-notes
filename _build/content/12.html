@@ -1,0 +1,569 @@
+<!--meta
+{
+  "lead": "Why schema-less JSON breaks in production — added, removed, renamed and retyped fields, and many consumers with different needs — and how a Schema Registry adds a contract. Set up Confluent Schema Registry, define an Avro .avsc schema, follow the producer's first send (schema registration, schema id, wire format), see an incompatible change rejected, read events with KafkaAvroDeserializer, and learn every compatibility level.",
+  "date": "Tuesday, 14 April 2026",
+  "related": [
+    { "n": 4, "why": "The producer pipeline — the serializer is Stage 1, where Avro plugs in." },
+    { "n": 7, "why": "JSON deserialization, __TypeId__ headers and type mapping that Avro replaces." },
+    { "n": 8, "why": "What happens on the consumer when deserialization fails." },
+    { "n": 17, "why": "Kafka Streams SerDes, including Avro SerDes backed by the registry." }
+  ]
+}
+-->
+
+<!-- ======================================================= -->
+<h2 id="problem"><span class="sec-num">1</span>The Problem: JSON Has No Contract</h2>
+<p>Until now, this is what we have done, and our producer and consumer are working fine:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Today: same Order.java on both sides</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    PV["Order.java · Version1 · orderId, customerId, quantity, totalAmount"] --> P["Producer · JsonSerializer"]
+    P -- "bytes" --> K["Kafka"]
+    K -- "bytes" --> C["Consumer · JsonDeserializer"]
+    C --> CV["Order.java · Version1 · orderId, customerId, quantity, totalAmount"]
+    classDef cls fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef k fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class PV,CV,P,C cls
+    class K k
+</div>
+  </div>
+</div>
+<p>But here is how 5 production use-cases can break this.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Use case</th><th>Producer (Order.java V2)</th><th>Consumer (Order.java V1)</th><th>What happens</th></tr></thead>
+    <tbody>
+      <tr><td><strong>1. Add a field</strong></td><td>adds <code>String shippingAddress</code></td><td>has no knowledge of <code>shippingAddress</code></td><td>Jackson <strong>may ignore</strong> the unknown field. In strict mode it throws a runtime exception instead.</td></tr>
+      <tr><td><strong>2. Remove a field</strong></td><td>removes <code>totalAmount</code></td><td>expects <code>totalAmount</code></td><td>Jackson assigns a default: <strong>primitive → default value</strong> (0, 0.0), <strong>object → null</strong>. Business logic silently runs on a 0 — <strong>too risky</strong>.</td></tr>
+      <tr><td><strong>3. Rename a field</strong></td><td><code>totalAmount</code> → <code>amount</code></td><td>expects <code>totalAmount</code></td><td>The producer sends the amount, but the consumer looks for the old name and gets 0.0: <strong>silent loss of data</strong>.</td></tr>
+      <tr><td><strong>4. Change a type</strong></td><td><code>quantity</code> becomes <code>String</code></td><td>expects <code>int quantity</code></td><td>Jackson throws <code>JsonMappingException</code> (a value like <code>"two"</code> cannot become an int).</td></tr>
+      <tr><td><strong>5. Many consumers</strong></td><td colspan="2">Consumer1 wants all fields · Consumer2 only orderId + totalAmount · Consumer3 only orderId + shippingAddress</td><td>Chaos: the producer keeps changing fields for one consumer without knowing whether it breaks another.</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">use case 1 — strict mode</span><span class="lang">java</span></div>
+<pre><code data-lang="java">ObjectMapper mapper = new ObjectMapper();
+mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true);</code></pre>
+</div>
+<div class="callout warn"><span class="ci">&#9888;</span><div><p>The root cause in all 5 cases: <strong>JSON is schema-less</strong>. The producer can send any JSON — without any version, validation or compatibility check — and there is no <strong>contract</strong> between producer and consumer about the event schema.</p></div></div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>The notes' use case 2 still lists <code>totalAmount</code> in the producer's Version2 class — a copy slip; in that use case the field is removed. Plain <code>new ObjectMapper()</code> already defaults <code>FAIL_ON_UNKNOWN_PROPERTIES</code> to <code>true</code>; Spring Boot's auto-configured mapper and Spring Kafka's <code>JsonDeserializer</code> turn it off, which is why unknown fields are usually ignored.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="solution"><span class="sec-num">2</span>Solution: Schema Registry</h2>
+<div class="grid grid-2" style="align-items:start">
+  <div class="card">
+    <h4>Schema</h4>
+    <p>A formal definition of the structure of your data. Common formats:</p>
+    <ul>
+      <li><strong>Avro</strong> (most popular with Kafka)</li>
+      <li>Protobuf</li>
+      <li>JSON Schema</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>Schema Registry</h4>
+    <ul>
+      <li>Maintains schemas and their <strong>versions</strong>.</li>
+      <li>On any change to a schema, it performs a <strong>compatibility check</strong>.</li>
+    </ul>
+  </div>
+</div>
+<p>At a very high level, a Schema Registry brings <strong>validation before the producer sends (publishes) an event</strong>:</p>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Validate first, then publish</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart LR
+    S["send(topic: order-events, key: O-1, value: Order obj)"] --> P["Producer · Serializer"]
+    P -- "Order schema about to use" --> SR["Schema Registry · Validate"]
+    SR --> Q{"OK?"}
+    Q -- "OK, if compatible" --> K["Kafka"]
+    Q -- "Validation failed" --> X["Throw exception"]
+    K -- "bytes" --> C["Consumer · Deserializer · Order.java"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sr fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef bad fill:#fdecea,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px
+    classDef k fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class S,P,C,Q step
+    class SR sr
+    class X bad
+    class K k
+</div>
+  </div>
+  <div class="diagram-explain"><p>But <strong>how</strong>? Let's go deeper, step by step.</p></div>
+</div>
+
+<!-- ======================================================= -->
+<h2 id="step1"><span class="sec-num">3</span>Step 1: Download and Run Schema Registry</h2>
+<p>There are many providers — <strong>Confluent Schema Registry</strong> (most popular), AWS Glue Schema Registry, Azure Schema Registry, etc. We proceed with <strong>Confluent</strong>.</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">download and unpack — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ curl -O https://packages.confluent.io/archive/8.2/confluent-community-8.2.0.tar.gz
+$ tar -xzf confluent-community-8.2.0.tar.gz</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">download and unpack — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; curl -O https://packages.confluent.io/archive/8.2/confluent-community-8.2.0.tar.gz
+&gt; tar -xzf confluent-community-8.2.0.tar.gz</code></pre>
+</div>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">confluent-8.2.0/ (folder layout)</span><span class="lang">text</span></div>
+<pre><code data-lang="text">confluent-8.2.0/
+├── bin/
+├── etc/
+│   ├── confluent-common/
+│   ├── kafka/
+│   ├── kafka-rest/
+│   ├── ksqldb/
+│   ├── rest-utils/
+│   └── schema-registry/
+│       ├── connect-avro-distributed.properties
+│       ├── connect-avro-standalone.properties
+│       ├── log4j2.yaml
+│       └── schema-registry.properties      ← edit this
+├── lib/
+├── README
+├── share/
+└── src/</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">confluent-8.2.0/etc/schema-registry/schema-registry.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># schema registry port number
+listeners=http://0.0.0.0:8085
+# bootstrap servers to connect with Kafka brokers
+kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092,PLAINTEXT://localhost:9192
+kafkastore.topic=_schemas</code></pre>
+</div>
+<p>Schema Registry keeps its data in a Kafka topic (<code>_schemas</code>), so <strong>start the controllers and brokers first</strong> (<a href="03-cluster-setup.html">Cluster Setup</a>), then start Schema Registry:</p>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">start Schema Registry and check it — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ confluent-8.2.0/bin/schema-registry-start confluent-8.2.0/etc/schema-registry/schema-registry.properties
+$ curl http://localhost:8085/subjects
+[]</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">start Schema Registry and check it — Windows</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; wsl confluent-8.2.0/bin/schema-registry-start confluent-8.2.0/etc/schema-registry/schema-registry.properties
+&gt; curl http://localhost:8085/subjects
+[]</code></pre>
+</div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p><strong>On Windows:</strong> Confluent Platform does not ship Windows <code>.bat</code> scripts for Schema Registry. Run it under <strong>WSL2</strong> as shown (WSL forwards <code>localhost</code>, so the brokers on Windows and <code>curl</code> both work), or use the Docker image: <code>docker run -p 8085:8081 -e SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=host.docker.internal:9092 -e SCHEMA_REGISTRY_HOST_NAME=schema-registry confluentinc/cp-schema-registry:8.2.0</code>. With Docker, the brokers must advertise an address the container can reach. An empty list <code>[]</code> means it is up with no subjects yet.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step2"><span class="sec-num">4</span>Step 2: Producer Creates the Contract (Schema)</h2>
+<p>In an <code>.avsc</code> file we define the schema. It is the <strong>contract</strong> between producer and consumer.</p>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">src/main/avro/order.avsc</span><span class="lang">json</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="json">{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.eda.schema",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "productId", "type": "string" },
+    { "name": "quantity", "type": "int" },
+    { "name": "totalAmount", "type": "double" }
+  ]
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">generated com.eda.schema.Order (simplified)</span><span class="lang">java</span></div>
+<pre><code data-lang="java">public class Order extends SpecificRecordBase {
+
+    String orderId;
+    String customerId;
+    String productId;
+    int quantity;
+    double totalAmount;
+
+    Schema getSchema() { . . . }
+}</code></pre>
+  </div>
+</div>
+<ul class="points">
+  <li><code>"type": "record"</code> — think of a record as an <strong>object</strong>.</li>
+  <li>This <code>.avsc</code> is used to <strong>generate a Java class</strong> named <code>Order</code> in package <code>com.eda.schema</code>.</li>
+  <li>It is not a normal POJO: it has extra functionality like <code>getSchema()</code>, which the serializer uses.</li>
+</ul>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">pom.xml</span><span class="lang">xml</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="xml">&lt;!-- calls Schema Registry via REST + the Avro serialization logic --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;io.confluent&lt;/groupId&gt;
+    &lt;artifactId&gt;kafka-avro-serializer&lt;/artifactId&gt;
+    &lt;version&gt;${confluent.version}&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- parses the .avsc schema --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.apache.avro&lt;/groupId&gt;
+    &lt;artifactId&gt;avro&lt;/artifactId&gt;
+    &lt;version&gt;${avro.version}&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- generates Java code from .avsc during compile --&gt;
+&lt;plugin&gt;
+    &lt;groupId&gt;org.apache.avro&lt;/groupId&gt;
+    &lt;artifactId&gt;avro-maven-plugin&lt;/artifactId&gt;
+    &lt;version&gt;${avro.version}&lt;/version&gt;
+    &lt;executions&gt;
+        &lt;execution&gt;
+            &lt;phase&gt;generate-sources&lt;/phase&gt;
+            &lt;goals&gt;
+                &lt;goal&gt;schema&lt;/goal&gt;
+            &lt;/goals&gt;
+            &lt;configuration&gt;
+                &lt;sourceDirectory&gt;${project.basedir}/src/main/avro&lt;/sourceDirectory&gt;
+                &lt;outputDirectory&gt;${project.build.directory}/generated-sources/avro&lt;/outputDirectory&gt;
+            &lt;/configuration&gt;
+        &lt;/execution&gt;
+    &lt;/executions&gt;
+&lt;/plugin&gt;</code></pre>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p><code>kafka-avro-serializer</code> is published in <strong>Confluent's Maven repository</strong>, not Maven Central, so add <code>&lt;repository&gt;&lt;id&gt;confluent&lt;/id&gt;&lt;url&gt;https://packages.confluent.io/maven/&lt;/url&gt;&lt;/repository&gt;</code> to the pom. The plugin reads <code>.avsc</code> files from the source directory and writes Java classes to the output directory.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step3"><span class="sec-num">5</span>Step 3: Producer's First send()</h2>
+<p><code>mvn clean compile</code> generates the Java <code>Order</code> class from the <code>.avsc</code>. Then:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">first send</span><span class="lang">text</span></div>
+<pre><code data-lang="text">send(
+  topic: "order-events",
+  key  : "O-1",
+  value: Order obj (generated from .avsc)
+           orderId = "O-1", customerId = "C-1", quantity = 5, totalAmount = 55.0
+)</code></pre>
+</div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">KafkaAvroSerializer on the first send</span><span class="db">architecture diagram</span></div>
+  <div class="diagram-body">
+<!--svg:avroFirstSend-->
+  </div>
+  <div class="diagram-explain">
+    <ol class="steps">
+      <li><code>orderObj.getSchema()</code> → the serializer generates a <strong>hash</strong> of the schema.</li>
+      <li>It looks in its <strong>cache</strong>: do I already have a Schema ID for this schema hash?</li>
+      <li><strong>No</strong> → it makes an HTTP call to the registry, passing the <strong>subject</strong> <code>order-events-value</code> and the schema. The subject is not present yet, so the registry adds it to the <code>_schemas</code> topic.</li>
+      <li>The registry returns <strong>Schema ID 1001</strong>.</li>
+      <li>The serializer puts <em>schema hash → Schema ID</em> into its cache. Next time it skips steps 3–5.</li>
+      <li>It serializes the value into the Avro wire format.</li>
+      <li>After the remaining stages (partitioner etc.), the record is published to Kafka.</li>
+    </ol>
+  </div>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Schema ID</th><th>Subject</th><th>Version</th><th>Schema</th><th>Compatibility</th></tr></thead>
+    <tbody><tr><td>1001</td><td>order-events-value</td><td>1</td><td>orderId: string, customerId: string, productId: string, quantity: int, totalAmount: double</td><td>BACKWARD</td></tr></tbody>
+  </table>
+</div>
+
+<h3 id="wire-format">Wire format: <code>[magic byte][schema ID][payload]</code></h3>
+<div class="logviz">
+  <div class="row"><span class="lab">bytes</span>
+    <div class="cells"><span class="cell ctl">0<small>1 byte · magic</small></span><span class="cell open">1001<small>4 bytes · schema id</small></span><span class="cell new">O-1 · C-1 · 5 · 55.0<small>N bytes · Avro binary payload</small></span></div>
+  </div>
+</div>
+<ul class="points">
+  <li><strong>1 byte, magic byte</strong> — always 0. It tells the deserializer the version of the wire protocol, so it knows how to interpret the rest of the bytes.</li>
+  <li><strong>4 bytes, Schema ID.</strong></li>
+  <li><strong>N bytes, Avro payload</strong> — contains only the <strong>values</strong> in binary form, <strong>no field names</strong>. <code>[0][1001][O-1 C-1 5 55.0]</code> is just a representation of that.</li>
+</ul>
+<p><strong>Why does this work?</strong> With the Schema ID, the consumer can fetch the schema and learn the fields. The values are stored in the same order as the fields.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">producer application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8083
+spring.application.name=schema-registry-producer
+
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.producer.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+spring.kafka.producer.value-serializer=io.confluent.kafka.serializers.KafkaAvroSerializer
+spring.kafka.producer.properties.schema.registry.url=http://localhost:8085</code></pre>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The subject name comes from the default <strong>TopicNameStrategy</strong>: <code>&lt;topic&gt;-value</code> for values (and <code>&lt;topic&gt;-key</code> for keys). The notes mix <code>order-event</code> and <code>order-events</code>; the topic used in the code and in the error below is <code>order-events</code>, so the subject is <code>order-events-value</code>. Real schema ids are small numbers (1, 2, …); 1001 is just an example.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="step4"><span class="sec-num">6</span>Step 4: A Second send() With a Changed Schema</h2>
+<p>Change <code>quantity</code> from <code>int</code> to <code>string</code>, run <code>mvn clean compile</code>, and publish again. This time the producer sends the quantity as a String:</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">order.avsc — quantity changed from int to string</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.eda.schema",
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "productId", "type": "string" },
+    { "name": "quantity", "type": "string" },
+    { "name": "totalAmount", "type": "double" }
+  ]
+}</code></pre>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">POST http://localhost:8083/api/avro/orders</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{
+  "orderId": "O-101",
+  "customerId": "C-1",
+  "productId": "P-1",
+  "quantity": "2",
+  "totalAmount": 250.0
+}</code></pre>
+  </div>
+  <div class="code" style="margin:0">
+    <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">response</span><span class="lang">json</span></div>
+<pre><code data-lang="json">{
+  "timestamp": "2026-04-14T14:40:45.650+00:00",
+  "status": 500,
+  "error": "Internal Server Error",
+  "path": "/api/avro/orders"
+}</code></pre>
+  </div>
+</div>
+<div class="code log">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">producer log — rejected by the registry</span><span class="lang">log</span></div>
+<pre><code data-lang="log">io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException: Schema being registered is incompatible with an earlier schema for subject "order-events-value", details: [{errorType:'TYPE_MISMATCH', description:'The type (path '/fields/3/type') of a field in the new schema does not match with the old schema', additionalInfo:'reader type: STRING not compatible with writer type: INT'}, {oldSchemaVersion: 1}, {oldSchema: '{"type":"record","name":"Order","namespace":"com.eda.schema","fields":[{"name":"orderId","type":"string"},{"name":"customerId","type":"string"},{"name":"productId","type":"string"},{"name":"quantity","type":"int"},{"name":"totalAmount","type":"double"}]}'}, {validateFields: 'false', compatibility: 'BACKWARD'}]; error code: 40901
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.sendHttpRequest(RestService.java:484) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.lambda$httpRequest$0(RestService.java:656) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RetryExecutor.retry(RetryExecutor.java:53) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.httpRequest(RestService.java:656) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.registerSchema(RestService.java:889) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.registerSchema(RestService.java:873) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.rest.RestService.registerSchema(RestService.java:865) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient.registerAndGetId(CachedSchemaRegistryClient.java:403) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient.registerWithResponse(CachedSchemaRegistryClient.java:547) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.schemaregistry.client.CachedSchemaRegistryClient.registerWithResponse(CachedSchemaRegistryClient.java:520) ~[kafka-schema-registry-client-8.2.0.jar:na]
+    at io.confluent.kafka.serializers.AbstractKafkaSchemaSerDe.registerWithResponse(AbstractKafkaSchemaSerDe.java:555) ~[kafka-schema-serializer-8.2.0.jar:na]
+    at io.confluent.kafka.serializers.AbstractKafkaAvroSerializer.serializeImpl(AbstractKafkaAvroSerializer.java:124) ~[kafka-avro-serializer-8.2.0.jar:na]
+    at io.confluent.kafka.serializers.KafkaAvroSerializer.serialize(KafkaAvroSerializer.java:68) ~[kafka-avro-serializer-8.2.0.jar:na]
+    at org.apache.kafka.clients.producer.KafkaProducer.doSend(KafkaProducer.java:1046) ~[kafka-clients-3.9.1.jar:na]
+    at org.apache.kafka.clients.producer.KafkaProducer.send(KafkaProducer.java:993) ~[kafka-clients-3.9.1.jar:na]
+    at org.springframework.kafka.core.DefaultKafkaProducerFactory$CloseSafeProducer.send(DefaultKafkaProducerFactory.java:1103) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.core.KafkaTemplate.doSend(KafkaTemplate.java:852) ~[spring-kafka-3.3.10.jar:3.3.10]
+    at org.springframework.kafka.core.KafkaTemplate.observeSend(KafkaTemplate.java:820) ~[spring-kafka-3.3.10.jar:3.3.10]
+    ...</code></pre>
+</div>
+<div class="callout key"><span class="ci">&#128269;</span><div><p><strong>Reading the error:</strong> field <code>/fields/3</code> is <code>quantity</code> (0-based). Under <strong>BACKWARD</strong> compatibility the new schema must be able to read old data: a <strong>reader</strong> expecting <code>STRING</code> cannot read data written as <code>INT</code>. Error code <strong>40901</strong> = incompatible schema. The failure happens inside <code>KafkaAvroSerializer.serialize</code>, in Stage 1 of the producer pipeline, so <strong>nothing reaches Kafka</strong>.</p></div></div>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">Second send: hash changed → registry runs a compatibility check</span><span class="db">sequence diagram</span></div>
+  <div class="diagram-body">
+<div class="mermaid wide">
+sequenceDiagram
+    participant P as Producer (Avro Serializer)
+    participant SR as Schema Registry
+    participant SC as _schemas topic
+    Note over P: 1. getSchema() → hash &lt;br/&gt; type changed, so the hash is different now
+    Note over P: 2. cache lookup: no Schema ID for this hash
+    P->>SR: 3. register (subject order-events-value, new schema)
+    SR->>SC: 4. fetch subject order-events-value
+    SC-->>SR: 5. version 1 (quantity: int) · BACKWARD
+    Note over SR: 6. subject present → compatibility check
+    alt check passes
+        SR->>SC: store id 1002 · version 2
+        SR-->>P: Schema ID 1002
+    else check fails (our case)
+        SR-->>P: 409 · error code 40901
+        Note over P: RestClientException, send() fails
+    end
+</div>
+  </div>
+</div>
+<p>What is this compatibility check? We cover it <a href="#compatibility">after the complete flow</a>, once we have seen the consumer side too.</p>
+
+<!-- ======================================================= -->
+<h2 id="step5"><span class="sec-num">7</span>Step 5: Consumer Reads the Event</h2>
+<div class="diagram">
+  <div class="diagram-head"><span class="dt">KafkaAvroDeserializer</span><span class="db">flowchart</span></div>
+  <div class="diagram-body">
+<div class="mermaid">
+flowchart TD
+    K["Kafka"] -- "1. give me data · 2. bytes" --> D["3. KafkaAvroDeserializer · read Schema ID"]
+    D --> Q{"Cache: schema for this id?"}
+    Q -- "NO" --> F["Fetch schema by id from Schema Registry"]
+    F --> PC["Put into cache: Schema ID → schema"]
+    PC --> R
+    Q -- "YES" --> R["For each field in the schema, read its value from the payload"]
+    R --> S{"specific.avro.reader?"}
+    S -- "false (default)" --> G["Return GenericRecord"]
+    S -- "true" --> O["Find com.eda.schema.Order · return Order object"]
+    classDef step fill:#eef4ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef sr fill:#f4efff,stroke:#7c3aed,color:#4c1d95,stroke-width:1.5px
+    classDef ok fill:#e8f7f5,stroke:#0f9d8f,color:#0b4f48,stroke-width:1.5px
+    classDef k fill:#111a2e,stroke:#ea580c,color:#fff,stroke-width:2px
+    class D,Q,R,S step
+    class F,PC sr
+    class G,O ok
+    class K k
+</div>
+  </div>
+  <div class="diagram-explain">
+    <h4>How the payload is decoded</h4>
+    <p>The payload only contains values, in the same order as the fields of the registry schema: <code>[O-1 C-1 5 55.0]</code> (conceptually). The deserializer knows, for a string, how many bytes to read; for an int, how many bytes; and so on:</p>
+    <div class="table-wrap" style="margin:8px 0 0">
+      <table>
+        <thead><tr><th>Schema field</th><th>Value read</th></tr></thead>
+        <tbody><tr><td>1st: orderId</td><td>O-1</td></tr><tr><td>2nd: customerId</td><td>C-1</td></tr><tr><td>3rd: quantity</td><td>5</td></tr><tr><td>4th: totalAmount</td><td>55.0</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<div class="grid grid-2" style="align-items:start">
+  <div>
+    <h4>Default: GenericRecord</h4>
+    <p>Fields are accessed by name:</p>
+    <div class="code" style="margin:0">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">GenericRecord access</span><span class="lang">java</span></div>
+<pre><code data-lang="java">GenericRecord record = consumerRecord.value();
+String orderId = record.get("orderId").toString(); // O-1</code></pre>
+    </div>
+  </div>
+  <div>
+    <h4>With <code>specific.avro.reader=true</code></h4>
+    <p>The deserializer sees <code>name: Order</code> and <code>namespace: com.eda.schema</code> in the registry schema and looks for the class <code>com.eda.schema.Order</code> (auto-generated from the consumer's <code>.avsc</code>). If found, it maps each registry field to the consumer's field — <code>orderId</code> → <code>orderId</code>, <code>customerId</code> → <code>customerId</code>, … — and returns an <code>Order</code> object.</p>
+  </div>
+</div>
+<p>The consumer uses the <strong>same dependencies and Avro plugin</strong> as the producer (<code>kafka-avro-serializer</code> also brings the deserializer) and the <strong>same <code>order.avsc</code></strong>.</p>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">consumer application.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties">server.port=8084
+spring.application.name=schema-registry-consumer
+
+spring.kafka.bootstrap-servers=localhost:9092,localhost:9192
+spring.kafka.consumer.group-id=order-avro-consumer-group
+spring.kafka.consumer.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+spring.kafka.consumer.value-deserializer=io.confluent.kafka.serializers.KafkaAvroDeserializer
+spring.kafka.consumer.properties.schema.registry.url=http://localhost:8085
+
+# required if we want GenericRecord to be converted to the specific Java object,
+# else the Avro deserializer will return GenericRecord only
+spring.kafka.consumer.properties.specific.avro.reader=true</code></pre>
+</div>
+<div class="code">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">OrderAvroListener.java</span><span class="lang">java</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="java">@Component
+public class OrderAvroListener {
+
+    @KafkaListener(topics = "order-events")
+    public void consumeOrder(ConsumerRecord&lt;String, Order&gt; record) {
+
+        Order order = record.value();
+        System.out.println("orderId:" + order.getOrderId());
+    }
+}</code></pre>
+</div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p>Avro decodes with <strong>two schemas</strong>: the <em>writer's</em> schema (fetched from the registry by id) and the <em>reader's</em> schema (the consumer's generated class). Fields are matched <strong>by name</strong>, so a consumer on an older or newer version still works as long as the two are compatible — which is exactly what the registry's compatibility check guarantees.</p></div></div>
+
+<!-- ======================================================= -->
+<h2 id="compatibility"><span class="sec-num">8</span>Compatibility Levels</h2>
+<p>Back to the open question: how does the registry decide whether the schema the producer is about to publish is compatible? Every subject has a <strong>compatibility level</strong> (we saw <code>BACKWARD</code> in the <code>_schemas</code> table):</p>
+<div class="chips"><span>BACKWARD (default)</span><span>FORWARD</span><span>FULL</span><span>BACKWARD_TRANSITIVE</span><span>FORWARD_TRANSITIVE</span><span>FULL_TRANSITIVE</span><span>NONE</span></div>
+
+<h3 id="backward">BACKWARD (default) — new consumer reads old events</h3>
+<p>The registry thinks from this perspective: if a consumer on <strong>V2</strong> pulls a message written with <strong>V1</strong>, it must not crash.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Change V1 → V2</th><th>V2 schema</th><th>Allowed?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Add a field <strong>with default</strong></td><td><code>{ "name": "orderId", "type": "int" }, { "name": "status", "type": "string", "default": "PENDING" }</code></td><td><span class="badge ok">SAFE</span></td><td>Old messages have no <code>status</code>, so the default is used.</td></tr>
+      <tr><td>Add a field <strong>without default</strong></td><td><code>{ "name": "orderId", "type": "int" }, { "name": "status", "type": "string" }</code></td><td><span class="badge bad">NOT ALLOWED</span></td><td><code>status</code> is missing in old messages and there is no default.</td></tr>
+      <tr><td>Remove a field</td><td><code>{ "name": "orderId", "type": "int" }</code> (V1 also had <code>status</code>)</td><td><span class="badge ok">SAFE</span></td><td><code>status</code> in old messages is extra and is ignored.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="forward">FORWARD — old consumer reads new events</h3>
+<p>Here the perspective is reversed: if a consumer on <strong>V1</strong> pulls a message written with <strong>V2</strong>, it must not crash.</p>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Change V1 → V2</th><th>Schemas</th><th>Allowed?</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Add a field</td><td>V2 adds <code>{ "name": "status", "type": "string" }</code></td><td><span class="badge ok">SAFE</span></td><td><code>status</code> in new messages is extra; the old consumer ignores it.</td></tr>
+      <tr><td>Remove a field <strong>with default</strong></td><td>V1 had <code>{ "name": "status", "type": "string", "default": "PENDING" }</code>; V2 removes it</td><td><span class="badge ok">SAFE</span></td><td>The old consumer expects <code>status</code>; it is missing, so its default is used.</td></tr>
+      <tr><td>Remove a field <strong>without default</strong></td><td>V1 had <code>{ "name": "status", "type": "string" }</code>; V2 removes it</td><td><span class="badge bad">NOT ALLOWED</span></td><td>The old consumer expects <code>status</code> and has no default.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3 id="full">FULL and the TRANSITIVE variants</h3>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Level</th><th>Checks</th><th>Against</th></tr></thead>
+    <tbody>
+      <tr><td><code>BACKWARD</code></td><td>new schema can read data written with the old schema</td><td>the latest version</td></tr>
+      <tr><td><code>FORWARD</code></td><td>old schema can read data written with the new schema</td><td>the latest version</td></tr>
+      <tr><td><code>FULL</code></td><td>both BACKWARD and FORWARD rules</td><td>the latest version</td></tr>
+      <tr><td><code>BACKWARD_TRANSITIVE</code></td><td>BACKWARD rules</td><td><strong>all</strong> previous versions</td></tr>
+      <tr><td><code>FORWARD_TRANSITIVE</code></td><td>FORWARD rules</td><td><strong>all</strong> previous versions</td></tr>
+      <tr><td><code>FULL_TRANSITIVE</code></td><td>both</td><td><strong>all</strong> previous versions</td></tr>
+      <tr><td><code>NONE</code></td><td>no check</td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="callout note"><span class="ci">&#9998;</span><div><p>In the notes, <em>“do not just compare with the last version, but all previous versions”</em> is written next to FULL; it actually describes the <strong>_TRANSITIVE</strong> levels. FULL (non-transitive) compares only with the latest version. “TRASITIVE” is spelled TRANSITIVE. Under FULL, only adding or removing fields <strong>that have defaults</strong> is allowed.</p></div></div>
+<div class="callout tip"><span class="ci">&#128161;</span><div><p><strong>Which to pick?</strong> With BACKWARD, upgrade <strong>consumers first</strong>, then producers. With FORWARD, upgrade <strong>producers first</strong>. With FULL, either order works. Always giving new fields a <code>default</code> keeps most changes legal under every level.</p></div></div>
+
+<h3 id="set-level">How to set the compatibility level</h3>
+<div class="grid grid-2" style="align-items:start">
+  <div>
+    <h4>Global (fallback for subjects without their own level)</h4>
+    <div class="code" style="margin:0">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">schema-registry.properties</span><span class="lang">properties</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="properties"># schema registry port number
+listeners=http://0.0.0.0:8085
+# bootstrap servers to connect with Kafka brokers
+kafkastore.bootstrap.servers=PLAINTEXT://localhost:9092,PLAINTEXT://localhost:9192
+kafkastore.topic=_schemas
+
+schema.compatibility.level=FORWARD</code></pre>
+    </div>
+  </div>
+  <div>
+    <h4>Per subject (REST API override)</h4>
+    <div class="code" style="margin:0">
+      <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">REST</span><span class="lang">text</span></div>
+<pre><code data-lang="text">PUT /config/order-events-value
+{
+  "compatibility": "FULL"
+}</code></pre>
+    </div>
+  </div>
+</div>
+<div class="os-tabs">
+<div class="code terminal" data-os="mac">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">set and read a subject's level — macOS / Linux</span><span class="lang">bash</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="bash">$ curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" --data '{"compatibility": "FULL"}' http://localhost:8085/config/order-events-value
+{"compatibility":"FULL"}
+$ curl http://localhost:8085/subjects/order-events-value/versions
+[1]</code></pre>
+</div>
+<div class="code terminal" data-os="win">
+  <div class="code-head"><span class="dots"><i></i><i></i><i></i></span><span class="fname">set and read a subject's level — Windows (Command Prompt)</span><span class="lang">cmd</span><button class="copy-btn">Copy</button></div>
+<pre><code data-lang="cmd">&gt; curl -X PUT -H "Content-Type: application/vnd.schemaregistry.v1+json" --data "{\"compatibility\": \"FULL\"}" http://localhost:8085/config/order-events-value
+{"compatibility":"FULL"}
+&gt; curl http://localhost:8085/subjects/order-events-value/versions
+[1]</code></pre>
+</div>
+</div>
+<div class="callout note"><span class="ci">&#8505;</span><div><p>The notes use <code>compatibility.level=FORWARD</code>. Current Confluent versions name the property <code>schema.compatibility.level</code>; the old name is deprecated. The global level can also be changed at runtime with <code>PUT /config</code>.</p></div></div>
+
+<div class="callout key"><span class="ci">&#9989;</span><div>
+  <b class="ct">Summary</b>
+  <ul style="margin:6px 0 0">
+    <li>Plain JSON has no contract: added, removed, renamed or retyped fields fail silently or at runtime on the consumer.</li>
+    <li>Schema Registry stores versioned schemas per <strong>subject</strong> (<code>order-events-value</code>) in the <code>_schemas</code> topic and checks every new version.</li>
+    <li>The producer's serializer registers the schema once, caches the id and writes <code>[0][schema id][Avro values]</code>.</li>
+    <li>Incompatible changes are rejected <strong>before publishing</strong> (error 40901).</li>
+    <li>The consumer fetches the writer schema by id, decodes the values in order, and returns a GenericRecord or the generated class.</li>
+    <li>The compatibility level (BACKWARD default, FORWARD, FULL, *_TRANSITIVE, NONE) decides which changes are legal.</li>
+  </ul>
+</div></div>
